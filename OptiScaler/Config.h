@@ -456,6 +456,21 @@ class Config
     CustomOptional<float> FsrAccAddPerFrame { 0.333f };
     CustomOptional<float> FsrMinDisOccAcc { -0.333f };
 
+    // FSR-RR (FFX Denoiser / FSR Ray Regeneration)
+    CustomOptional<int> FfxDenoiserIndex { 0 };
+    CustomOptional<int> FfxDenoiserMode { 0 };
+    CustomOptional<uint64_t> FfxDenoiserDebugMode { 0 };
+
+    CustomOptional<float> FfxDenoiserHistRejection { 1.0f };
+    CustomOptional<float> FfxDenoiserCrossBlNormStr { 0.7f };
+    CustomOptional<float> FfxDenoiserStabilityBias { 0.7f };
+    CustomOptional<float> FfxDenoiserMaxRadiance { 2e4f };
+    CustomOptional<float> FfxDenoiserRadianceClip { 40.0f };
+    CustomOptional<float> FfxDenoiserGaussKernRelax { 0.5f };
+
+    CustomOptional<float> FfxDenoiserCorrelationBias { 1.0f };
+    CustomOptional<float> FfxDenoiserFloorIsolation { 1.0f };
+
     // FSR4
     CustomOptional<FSR4Support> Fsr4ForceModel { FSR4Support::None };
     CustomOptional<uint32_t, NoDefault> Fsr4Preset;

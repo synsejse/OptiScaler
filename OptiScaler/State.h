@@ -139,6 +139,9 @@ class State
     FGNvngxReplacement activeFgNvngx = FGNvngxReplacement::None;
 
     // Streamline FG inputs
+    // Last constants seen by the slSetConstants hook, used as a camera fallback by FSR-RR
+    sl::Constants slLastConstants = {};
+
     Sl_Inputs_Dx12 slFGInputs = {};
     Sl1_Inputs_Dx12 s_sl1FGInputs {};
 
@@ -257,6 +260,17 @@ class State
     std::vector<const char*> ffxFGVersionNames {};
     std::vector<uint64_t> ffxFGVersionIds {};
     std::optional<uint32_t> currentFsr4Preset {};
+
+    // FSR Ray Regeneration (FFX Denoiser)
+    std::vector<const char*> ffxDenoiserVersionNames {};
+    std::vector<uint64_t> ffxDenoiserVersionIds {};
+    feature_version ffxDenoiserUpscalerVersion {};
+
+    std::vector<int> ffxDenoiserModes {};
+    std::unordered_map<int, const char*> ffxDenoiserModeNames {};
+
+    std::vector<uint64_t> ffxDenoiserDebugModes {};
+    std::unordered_map<uint64_t, const char*> ffxDenoiserDebugModeNames {};
 
     // Linux checks
     bool isRunningOnLinux = false;

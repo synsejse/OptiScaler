@@ -31,6 +31,17 @@ inline constexpr CString FSR_Reactive = "FSR.reactive";
 
 } // namespace OptiKeys
 
+/**
+ * @brief User facing strings used internally by OptiScaler
+ */
+namespace OptiTexts
+{
+using CString = const char[];
+
+// User friendly name for FSR-RR backend
+inline constexpr CString FSR_RR_Name = "FSR Ray Regeneration";
+} // namespace OptiTexts
+
 typedef enum API
 {
     NotSelected = 0,
@@ -63,6 +74,9 @@ enum class Upscaler
     DLSS, // "dlss", used for the DLSS upscaler backend
 
     DLSSD, // "dlssd", used for the DLSS-D/Ray Reconstruction upscaler+denoiser backend
+
+    FSRD, // "fsr-rr", FSR Ray Regeneration denoiser + FSR upscaler, used as a DLSS-D replacement
+
     Reset
 };
 

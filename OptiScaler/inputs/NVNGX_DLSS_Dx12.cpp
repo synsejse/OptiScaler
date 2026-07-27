@@ -16,6 +16,7 @@
 #include <imgui/ImGuiNotify.hpp>
 
 #include <hooks/D3D12_Hooks.h>
+#include <proxies/FfxApi_Proxy.h>
 
 #include <dxgi1_4.h>
 #include <shared_mutex>
@@ -606,6 +607,10 @@ static Upscaler GetUpscalerBackend()
     if (Config::Instance()->Dx12Upscaler.has_value())
         upscaler = Config::Instance()->Dx12Upscaler.value();
 
+    // FSR Ray Regeneration is only valid for NVSDK_NGX_Feature_RayReconstruction
+    if (upscaler == Upscaler::FSRD)
+        upscaler = Upscaler::FFX;
+
     return upscaler;
 }
 
@@ -645,8 +650,18 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
     }
     else
     {
-        upscalerBackend = Upscaler::DLSSD;
-        LOG_INFO("Creating DLSSD (Ray Reconstruction) feature");
+        // Ray Reconstruction. Nvidia hardware uses the native DLSS-D path, everything else uses
+        // FSR Ray Regeneration when the FFX denoiser module is available.
+        if (IdentifyGpu::getPrimaryGpu().vendorId == VendorId::Nvidia)
+        {
+            upscalerBackend = Upscaler::DLSSD;
+            LOG_INFO("Creating DLSSD (Ray Reconstruction) feature");
+        }
+        else
+        {
+            upscalerBackend = Upscaler::FSRD;
+            LOG_INFO("Creating FSR_RR (Ray Regeneration) feature");
+        }
     }
 
     // Root signature restoration setup
@@ -891,11 +906,37 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
 {
     LOG_DEBUG("for ({0})", (int) FeatureDiscoveryInfo->FeatureID);
 
-    const bool isUpscaling = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling;
+    bool isOptiFeature = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling;
     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
 
-    if (isUpscaling || (isFG && dlssgAdjacent))
+    // FSR Ray Regen check
+    if (!isOptiFeature && IdentifyGpu::getPrimaryGpu().vendorId != VendorId::Nvidia &&
+        (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction))
+    {
+        if (!FfxApiProxy::IsDenoiserReady())
+            FfxApiProxy::InitFfxDx12();
+
+        /* Somewhat flawed check. ffxQuery can't be used for RR to check support because
+        this runs before the D3D12Device* is captured, and the newer FFX APIs require it
+        to validate support. Slightly inconvenient, but actually a non-issue.
+
+        InitNGXParameters() executes later, after the device is available, so full validation
+        can be done there. All this does is allow the game to actually check the params
+        instead of failing early.
+        */
+        if (FfxApiProxy::IsSRReady() && FfxApiProxy::IsDenoiserReady())
+        {
+            isOptiFeature = true;
+            LOG_DEBUG("Reporting support for DLSSD -> FSR Ray Regeneration");
+        }
+        else
+        {
+            LOG_DEBUG("DLSSD -> FSR Ray Regeneration not supported");
+        }
+    }
+
+    if (isOptiFeature || (isFG && dlssgAdjacent))
     {
         if (OutSupported == nullptr)
         {

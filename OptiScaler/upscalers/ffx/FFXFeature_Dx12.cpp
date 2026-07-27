@@ -578,6 +578,9 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
         params.upscaleSize.height = TargetHeight();
     }
 
+    // Lets derived features (FSR-RR) swap in their own inputs after everything else is set up
+    OverrideUpscaleDispatch(params);
+
     LOG_DEBUG("Dispatch!!");
     auto result = FfxApiProxy::D3D12_Dispatch(&_context, &params.header);
 
