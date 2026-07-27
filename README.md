@@ -1,3 +1,6 @@
+> [!NOTE]
+> This fork adds an experimental **FSR Ray Regeneration backend for Cyberpunk 2077**, modernizing the FidelityFX SDK 2.1.1 implementation so its denoiser can run independently alongside SDK 2.3 upscaling components. It is intended for feature testing and is not an official upstream OptiScaler release.
+
 <div align="center">
 
   ![Logo](https://github.com/user-attachments/assets/c7dad5da-0b29-4710-8a57-b58e4e407abd)
