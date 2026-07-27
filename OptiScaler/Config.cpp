@@ -263,6 +263,17 @@ bool Config::Reload(std::filesystem::path iniPath)
             FsrUseMaskForTransparency.set_from_config(readBool("FSR", "UseReactiveMaskForTransparency"));
             DlssReactiveMaskBias.set_from_config(readFloat("FSR", "DlssReactiveMaskBias"));
 
+            // FSR-RR
+            FfxDenoiserMode.set_from_config(readInt("FSR-RR", "DenoiserMode"));
+            FfxDenoiserHistRejection.set_from_config(readFloat("FSR-RR", "HistoryRejection"));
+            FfxDenoiserCrossBlNormStr.set_from_config(readFloat("FSR-RR", "CrossBilateralNormalStrength"));
+            FfxDenoiserStabilityBias.set_from_config(readFloat("FSR-RR", "TemporalStabilityBias"));
+            FfxDenoiserMaxRadiance.set_from_config(readFloat("FSR-RR", "MaxRadiance"));
+            FfxDenoiserRadianceClip.set_from_config(readFloat("FSR-RR", "RadianceClipDeviation"));
+            FfxDenoiserGaussKernRelax.set_from_config(readFloat("FSR-RR", "GaussianKernelRelaxation"));
+            FfxDenoiserCorrelationBias.set_from_config(readFloat("FSR-RR", "CorrelationBias"));
+            FfxDenoiserFloorIsolation.set_from_config(readFloat("FSR-RR", "FloorIsolation"));
+
             if (auto v = readEnum<FSR4Support>("FSR", "Fsr4ForceModel"))
                 Fsr4ForceModel.set_from_config(*v);
             else
@@ -1081,6 +1092,25 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FsrUseMaskForTransparency.value_for_config()).c_str());
         ini.SetValue("FSR", "DlssReactiveMaskBias",
                      GetFloatValue(Instance()->DlssReactiveMaskBias.value_for_config()).c_str());
+
+        // FSR-RR
+        ini.SetValue("FSR-RR", "DenoiserMode", GetIntValue(Instance()->FfxDenoiserMode.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "HistoryRejection",
+                     GetFloatValue(Instance()->FfxDenoiserHistRejection.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "CrossBilateralNormalStrength",
+                     GetFloatValue(Instance()->FfxDenoiserCrossBlNormStr.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "TemporalStabilityBias",
+                     GetFloatValue(Instance()->FfxDenoiserStabilityBias.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "MaxRadiance",
+                     GetFloatValue(Instance()->FfxDenoiserMaxRadiance.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "RadianceClipDeviation",
+                     GetFloatValue(Instance()->FfxDenoiserRadianceClip.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "GaussianKernelRelaxation",
+                     GetFloatValue(Instance()->FfxDenoiserGaussKernRelax.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "CorrelationBias",
+                     GetFloatValue(Instance()->FfxDenoiserCorrelationBias.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "FloorIsolation",
+                     GetFloatValue(Instance()->FfxDenoiserFloorIsolation.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4ForceModel", GetIntValue(Instance()->Fsr4ForceModel.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4Preset", GetIntValue(Instance()->Fsr4Preset.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4EnableWatermark",

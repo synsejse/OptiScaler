@@ -93,6 +93,7 @@ class MenuCommon
     // ffx
     inline static int _ffxUpscalerIndex = -1;
     inline static int _ffxFGIndex = -1;
+    inline static int _ffxDenoiserMode = -1;
 
     // output scaling
     inline static float _ssRatio = 0.0f;

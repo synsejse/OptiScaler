@@ -7,6 +7,7 @@
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
 #include <framegen/nvngx/Nvngx_FG.h>
+#include <proxies/FfxApi_Proxy.h>
 
 /// @brief Calculates the resolution scaling ratio override based on the provided quality level and current
 /// configuration.
@@ -794,8 +795,25 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams)
             InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
         }
 
-        InParams->Set("SuperSamplingDenoising.Available", 0);
-        InParams->Set("SuperSamplingDenoising.FeatureInitResult", 0);
+        // FSR Ray Regeneration can stand in for DLSS-D on non-Nvidia hardware
+        unsigned int ssDenoiseAvailable = 0;
+
+        if (State::Instance().currentD3D12Device != nullptr)
+        {
+            if (!FfxApiProxy::IsDenoiserReady())
+                FfxApiProxy::InitFfxDx12();
+
+            ssDenoiseAvailable =
+                (FfxApiProxy::IsSRReady() && FfxApiProxy::IsDenoiserReady() && FfxApiProxy::VersionDx12_RR().major > 0)
+                    ? 1u
+                    : 0u;
+
+            if (ssDenoiseAvailable)
+                LOG_DEBUG("Setting DLSSD flags for FSR Ray Regeneration");
+        }
+
+        InParams->Set("SuperSamplingDenoising.Available", ssDenoiseAvailable);
+        InParams->Set("SuperSamplingDenoising.FeatureInitResult", ssDenoiseAvailable);
     }
 
     // not ideal as it doesn't take different APIs into account

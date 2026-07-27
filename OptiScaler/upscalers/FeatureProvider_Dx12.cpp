@@ -11,6 +11,7 @@
 #include "upscalers/fsr2/FSR2Feature_Dx12.h"
 #include "upscalers/fsr2_212/FSR2Feature_Dx12_212.h"
 #include "upscalers/ffx/FFXFeature_Dx12.h"
+#include "upscalers/ffx/FSRDFeature_Dx12.h"
 #include "upscalers/xess/XeSSFeature_Dx12.h"
 #include "FeatureProvider_Dx11.h"
 #include <misc/IdentifyGpu.h>
@@ -22,6 +23,20 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
     Config& cfg = *Config::Instance();
     auto primaryGpu = IdentifyGpu::getPrimaryGpu();
     ScopedSkipHeapCapture skipHeapCapture {};
+
+    // FSR Ray Regeneration is only ever created for NVSDK_NGX_Feature_RayReconstruction and must never
+    // fall back to a plain upscaler or be written back as the configured Dx12 upscaler.
+    if (upscaler == Upscaler::FSRD)
+    {
+        if (!FfxApiProxy::IsDenoiserReady())
+        {
+            LOG_ERROR("FFX denoiser module is not available, can't create FSR Ray Regeneration");
+            return false;
+        }
+
+        *feature = std::make_unique<FSRDFeatureDx12>(handleId, parameters);
+        return (*feature)->ModuleLoaded();
+    }
 
     switch (upscaler)
     {
@@ -102,6 +117,10 @@ bool FeatureProvider_Dx12::ChangeFeature(Upscaler upscaler, ID3D12Device* device
 
     if (!state.changeBackend[handleId])
         return false;
+
+    // Ray Reconstruction features are not allowed to change type, they can only init/reinit
+    if (contextData->feature != nullptr && contextData->feature->GetUpscalerType() == Upscaler::FSRD)
+        state.newBackend = Upscaler::FSRD;
 
     const bool dlssOnNonCapable = !IdentifyGpu::getPrimaryGpu().dlssCapable && state.newBackend == Upscaler::DLSS;
     if (state.newBackend == Upscaler::Reset || dlssOnNonCapable)
@@ -195,7 +214,7 @@ bool FeatureProvider_Dx12::ChangeFeature(Upscaler upscaler, ID3D12Device* device
         {
             LOG_ERROR("init failed with {0} feature", UpscalerDisplayName(state.newBackend));
 
-            if (state.newBackend != Upscaler::DLSSD)
+            if (state.newBackend != Upscaler::DLSSD && state.newBackend != Upscaler::FSRD)
             {
                 if (cfg.Dx12Upscaler == Upscaler::DLSS)
                 {
