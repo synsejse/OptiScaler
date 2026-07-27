@@ -78,6 +78,9 @@ std::string UpscalerDisplayName(Upscaler upscaler, API api)
 
     case Upscaler::DLSSD:
         return "DLSSD";
+
+    case Upscaler::FSRD:
+        return OptiTexts::FSR_RR_Name;
     }
 
     return "????";
@@ -94,6 +97,7 @@ bool IsFsr(Upscaler upscaler)
     case Upscaler::FSR21_on12:
     case Upscaler::FSR22_on12:
     case Upscaler::FFX_on12:
+    case Upscaler::FSRD:
         return true;
     default:
         return false;
@@ -102,6 +106,9 @@ bool IsFsr(Upscaler upscaler)
 
 std::string UpscalerShortName(Upscaler upscaler)
 {
+    if (upscaler == Upscaler::FSRD)
+        return "FSR-RR";
+
     if (IsFsr(upscaler))
         return "FSR";
 
@@ -148,6 +155,8 @@ std::string UpscalerToCode(Upscaler upscaler)
         return "dlssd";
     case Upscaler::FSR31: // DX11 only
         return "fsr31";
+    case Upscaler::FSRD: // Not user selectable, only used for Ray Reconstruction
+        return "fsr-rr";
     default: // Upscaler::Reset and unknown
         return "";
     }
@@ -162,7 +171,7 @@ Upscaler CodeToUpscaler(const std::string& code)
         { "fsr22", Upscaler::FSR22 }, { "fsr22_12", Upscaler::FSR22_on12 },
         { "ffx", Upscaler::FFX },     { "ffx_12", Upscaler::FFX_on12 },
         { "dlss", Upscaler::DLSS },   { "dlssd", Upscaler::DLSSD },
-        { "fsr31", Upscaler::FSR31 },
+        { "fsr31", Upscaler::FSR31 }, { "fsr-rr", Upscaler::FSRD },
     };
 
     auto it = mapping.find(code);

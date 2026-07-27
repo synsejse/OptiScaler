@@ -863,6 +863,9 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
 
     State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
 
+    // Used as a fallback camera/matrix source by FSR Ray Regeneration
+    State::Instance().slLastConstants = values;
+
     return o_slSetConstants(values, frame, viewport);
 }
 

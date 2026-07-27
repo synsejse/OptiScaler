@@ -2284,6 +2284,11 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         ImGui::PushItemWidth(180.0f * menuResScale);
 
         const bool usesDlssd = currentFeature->GetUpscalerType() == Upscaler::DLSSD;
+        const bool usesFsrRR = currentFeature->GetUpscalerType() == Upscaler::FSRD;
+
+        // Ray Reconstruction backends can't be swapped for a plain upscaler
+        const bool usesRayReconstruction = usesDlssd || usesFsrRR;
+
         const bool usesDx12CompatLayer = currentFeature->IsWithDx12();
 
         switch (state.api)
@@ -2320,7 +2325,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
             spoofingText = config->DxgiSpoofing.value_or_default() ? "On" : "Off";
             ImGui::Text("| Spoof: %s", spoofingText.c_str());
 
-            if (!usesDlssd)
+            if (!usesRayReconstruction)
                 AddDx12Backends(currentBackend);
 
             break;
@@ -2356,7 +2361,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
 
         ImGui::PopItemWidth();
 
-        if (!usesDlssd)
+        if (!usesRayReconstruction)
         {
             ImGui::SameLine(0.0f, 6.0f);
 
@@ -2495,14 +2500,15 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         }
 
         // FFX -----------------
-        if (!usesDlssd && (currentBackend == Upscaler::FFX || currentBackend == Upscaler::FFX_on12))
+        if (!usesDlssd && (currentBackend == Upscaler::FFX || currentBackend == Upscaler::FFX_on12 ||
+                           currentBackend == Upscaler::FSRD))
         {
             ImGui::SeparatorText("FFX Settings");
 
             if (_ffxUpscalerIndex < 0)
                 _ffxUpscalerIndex = config->FfxUpscalerIndex.value_or_default();
 
-            if (currentBackend == Upscaler::FFX ||
+            if (currentBackend == Upscaler::FFX || currentBackend == Upscaler::FSRD ||
                 currentBackend == Upscaler::FFX_on12 && state.ffxUpscalerVersionNames.size() > 0)
             {
                 ImGui::PushItemWidth(135.0f * menuResScale);
@@ -2533,7 +2539,13 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                     MARK_ALL_BACKENDS_CHANGED();
                 }
 
-                auto majorFsrVersion = currentFeature->Version().major;
+                feature_version fsrUpscalerVersion = currentFeature->Version();
+
+                // FSR-RR reports the denoiser version, the upscaler version is tracked separately
+                if (currentBackend == Upscaler::FSRD)
+                    fsrUpscalerVersion = state.ffxDenoiserUpscalerVersion;
+
+                auto majorFsrVersion = fsrUpscalerVersion.major;
 
                 if (majorFsrVersion >= 4)
                 {
@@ -2793,6 +2805,137 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                         ImGui::Spacing();
                     }
                 }
+            }
+        }
+
+        // FSR Ray Regeneration -----------------
+        if (currentBackend == Upscaler::FSRD)
+        {
+            if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())
+            {
+                if (!state.ffxDenoiserModes.empty())
+                {
+                    if (_ffxDenoiserMode == -1)
+                        _ffxDenoiserMode = config->FfxDenoiserMode.value_or_default();
+
+                    const char* currentEnum = state.ffxDenoiserModeNames[_ffxDenoiserMode];
+
+                    if (ImGui::BeginCombo("Denoiser Mode", currentEnum))
+                    {
+                        for (const int mode : state.ffxDenoiserModes)
+                        {
+                            bool isSelected = mode == _ffxDenoiserMode;
+
+                            if (ImGui::Selectable(state.ffxDenoiserModeNames[mode], &isSelected))
+                                _ffxDenoiserMode = mode;
+
+                            if (isSelected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+
+                        ImGui::EndCombo();
+                    }
+                    ShowHelpMarker("Sets the denoising mode. "
+                                   "Higher modes are generally higher quality, but more demanding.");
+
+                    ImGui::SameLine();
+
+                    if (ImGui::Button("Change Mode") && _ffxDenoiserMode != config->FfxDenoiserMode.value_or_default())
+                    {
+                        config->FfxDenoiserMode = _ffxDenoiserMode;
+                        state.newBackend = currentBackend;
+                        MARK_ALL_BACKENDS_CHANGED();
+                    }
+                }
+
+                if (float v = config->FfxDenoiserHistRejection.value_or_default();
+                    ImGui::SliderFloat("History Rejection", &v, 0, 1))
+                    config->FfxDenoiserHistRejection = v;
+
+                if (float v = config->FfxDenoiserCrossBlNormStr.value_or_default();
+                    ImGui::SliderFloat("Cross Bilateral Normal Strength", &v, 0, 1))
+                    config->FfxDenoiserCrossBlNormStr = v;
+
+                if (float v = config->FfxDenoiserStabilityBias.value_or_default();
+                    ImGui::SliderFloat("Temporal Stability Bias", &v, 0, 1))
+                    config->FfxDenoiserStabilityBias = v;
+
+                if (float v = config->FfxDenoiserMaxRadiance.value_or_default();
+                    ImGui::SliderFloat("Max Radiance", &v, 10, 1e5f))
+                    config->FfxDenoiserMaxRadiance = v;
+
+                if (float v = config->FfxDenoiserRadianceClip.value_or_default();
+                    ImGui::SliderFloat("Radiance Clip Deviation", &v, 1, 500))
+                    config->FfxDenoiserRadianceClip = v;
+
+                if (float v = config->FfxDenoiserGaussKernRelax.value_or_default();
+                    ImGui::SliderFloat("Gaussian Kernel Relaxation", &v, 0, 1))
+                    config->FfxDenoiserGaussKernRelax = v;
+
+                ImGui::SeparatorText("Debug");
+
+                if (!state.ffxDenoiserDebugModes.empty())
+                {
+                    uint64_t ffxDenoiseDebugMode = config->FfxDenoiserDebugMode.value_or_default();
+                    const char* currentEnum = state.ffxDenoiserDebugModeNames[ffxDenoiseDebugMode];
+
+                    if (ImGui::BeginCombo("Debug View", currentEnum))
+                    {
+                        static char filter[255] = "";
+
+                        // Auto focus search
+                        if (ImGui::IsWindowAppearing())
+                            ImGui::SetKeyboardFocusHere();
+
+                        ImGui::InputTextWithHint("##Filter", "Search...", filter, IM_ARRAYSIZE(filter));
+                        ImGui::Separator();
+
+                        // Checks if the entry with the given name matches the filter - case insensitive
+                        const auto GetIsInFilter = [](std::string_view haystack, std::string_view needle) -> bool
+                        {
+                            if (needle.empty())
+                                return true;
+                            else
+                            {
+                                const auto charPredicate = [](unsigned char a, unsigned char b)
+                                { return std::tolower(a) == std::tolower(b); };
+
+                                const auto& result = std::search(haystack.begin(), haystack.end(), needle.begin(),
+                                                                 needle.end(), charPredicate);
+
+                                return result != haystack.end();
+                            }
+                        };
+
+                        // Debug view list - these are getting slightly out of hand
+                        for (const uint64_t dbgMode : state.ffxDenoiserDebugModes)
+                        {
+                            const char* name = state.ffxDenoiserDebugModeNames[dbgMode];
+
+                            // If it's not in the filter, don't show it
+                            if (!GetIsInFilter(name, filter))
+                                continue;
+
+                            bool isSelected = (dbgMode == ffxDenoiseDebugMode);
+
+                            if (ImGui::Selectable(name, isSelected))
+                                config->FfxDenoiserDebugMode = dbgMode;
+
+                            if (isSelected)
+                                ImGui::SetItemDefaultFocus();
+                        }
+
+                        ImGui::EndCombo();
+                    }
+                }
+
+                if (float v = config->FfxDenoiserCorrelationBias.value_or_default();
+                    ImGui::SliderFloat("Correlation Bias", &v, 0, 1))
+                    config->FfxDenoiserCorrelationBias = v;
+
+                if (float v = config->FfxDenoiserFloorIsolation.value_or_default();
+                    ImGui::SliderFloat("Floor Isolation", &v, 0, 1))
+                    config->FfxDenoiserFloorIsolation = v;
             }
         }
 

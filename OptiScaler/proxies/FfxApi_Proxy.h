@@ -15,6 +15,7 @@
 
 #include "ffx_api.h"
 #include <detours/detours.h>
+#include <fsr-rr/ffx_denoiser.h>
 #include <ffx_framegeneration.h>
 #include <ffx_upscale.h>
 
@@ -1090,7 +1091,8 @@ class FfxApiProxy
         {
             ffxQueryDescGetVersions versionQuery {};
             versionQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-            versionQuery.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+            versionQuery.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER;
+            versionQuery.device = State::Instance().currentD3D12Device;
             uint64_t versionCount = 0;
             versionQuery.outputCount = &versionCount;
 

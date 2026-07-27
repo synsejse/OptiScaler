@@ -7,11 +7,16 @@
 
 class FFXFeatureDx12 : public FFXFeature, public IFeature_Dx12
 {
-  private:
+  protected:
     NVSDK_NGX_Parameter* SetParameters(NVSDK_NGX_Parameter* InParameters);
 
-  protected:
     bool InitFFX(const NVSDK_NGX_Parameter* InParameters);
+
+    /**
+     * @brief Hook invoked right before the upscaler dispatch, after all inputs have been gathered from the
+     * NGX parameter table. Allows derived features (e.g. FSR Ray Regeneration) to substitute inputs.
+     */
+    virtual void OverrideUpscaleDispatch(ffxDispatchDescUpscale& params) {}
 
   public:
     FFXFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters);
@@ -21,7 +26,7 @@ class FFXFeatureDx12 : public FFXFeature, public IFeature_Dx12
     bool QueryProviders(ID3D12Device* device);
 
     feature_version Version() override { return FFXFeature::Version(); }
-    Upscaler GetUpscalerType() const final { return Upscaler::FFX; }
+    Upscaler GetUpscalerType() const override { return Upscaler::FFX; }
 
     bool IsWithDx12() final { return false; }
 

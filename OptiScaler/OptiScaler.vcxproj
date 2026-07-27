@@ -331,6 +331,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="hooks\CommandBuffer_StateTracker.h" />
     <ClInclude Include="inputs\FG\Streamline_Inputs_Sl1_Dx12.h" />
     <ClInclude Include="include\device_info\device_info.hpp" />
+    <ClInclude Include="include\fsr-rr\ffx_denoiser.h" />
     <ClInclude Include="inputs\FG\Upscaler_Inputs_Dx11wDx12.h" />
     <ClInclude Include="low_latency\input\input_common.h" />
     <ClInclude Include="low_latency\input\input_reflex.h" />
@@ -412,6 +413,13 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\render_ui\RUI_Dx12.h" />
     <ClInclude Include="shaders\resource_copy\precompile\rc_Shader_Vk.h" />
     <ClInclude Include="shaders\resource_copy\RC_Vk.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\FSRDPreprocessor_Dx12.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderData.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderUtils.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDFloor_Shader.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDFloorSeed_Shader.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDInputConv_Shader.h" />
+    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDOutputComp_Shader.h" />
     <ClInclude Include="shaders\Shader_Dx12.h" />
     <ClInclude Include="shaders\Shader_Dx12Utils.h" />
     <ClInclude Include="shaders\Shader_Vk.h" />
@@ -502,6 +510,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\fsr31\FSR31Feature_Dx11.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Dx11On12.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Dx12.h" />
+    <ClInclude Include="upscalers\ffx\FSRDFeature_Dx12.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h" />
     <ClInclude Include="inputs\FfxApi_Dx12.h" />
     <ClInclude Include="inputs\FSR2_Dx12.h" />
@@ -656,6 +665,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="shaders\Shader_Common.cpp" />
     <ClCompile Include="shaders\render_ui\RUI_Dx12.cpp" />
     <ClCompile Include="shaders\resource_copy\RC_Vk.cpp" />
+    <ClCompile Include="shaders\fsrd_preprocess\FSRDPreprocessor_Dx12.cpp" />
     <ClCompile Include="shaders\Shader_Dx12.cpp" />
     <ClCompile Include="shaders\Shader_Vk.cpp" />
     <ClCompile Include="spoofing\Dxgi_Spoofing.cpp" />
@@ -745,6 +755,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\fsr31\FSR31Feature_Dx11.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx11On12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx12.cpp" />
+    <ClCompile Include="upscalers\ffx\FSRDFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Vk.cpp" />
     <ClCompile Include="upscalers\IFeature_Dx11.cpp" />
     <ClCompile Include="upscalers\IFeature_Dx11wDx12.cpp" />
