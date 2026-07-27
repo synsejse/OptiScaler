@@ -180,26 +180,22 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         float3 prevViewSpacePos = mul(PrevViewMatrix, float4(worldSpacePos, 1.0f)).xyz;
         prevViewSpacePos.z = abs(prevViewSpacePos.z);
         
-        const float depthDelta = (viewSpacePos.z - prevViewSpacePos.z);
+        const float depthDelta = (prevViewSpacePos.z - viewSpacePos.z);
     
         // FSR-RR requires Linear Depth Delta in Blue channel
         const float2 motionIn = InMotionVectors[px].rg; // RG: Pixel Movement
         const float3 motionOut = float3(motionIn, depthDelta);
         OutMotion[px] = half4(motionOut, 0.0f);
 
-        // Calculate NoV (Dot(Normal, View))
-        //
+        // NoV remains useful for the converter debug view, but RR 1.1 no longer
+        // consumes it from the specular-albedo alpha channel.
         const float3 cameraPos = float3(InvViewMatrix._m03, InvViewMatrix._m13, InvViewMatrix._m23);
-        // Line from camera to the clip pos
         const float3 toCameraDir = normalize(cameraPos - worldSpacePos);
         const float NoV = dot(worldSurfaceNormal.rgb, toCameraDir);
 
-        // Secondary albedo packing
-        //
-        // FSR-RR expects metalness in diffuse alpha.
+        // RR 1.1 no longer consumes NoV or metalness from the albedo alpha channels.
         // DLSS-RR specular albedo is hemispherical specular reflectance at (NoV, roughness).
         // Diffuse albedo is the diffuse component of reflectance.                   
-        specReflectance.a = NoV;
 
         // Total albedo near or greater than 1 violate conservation of energy
         // May be sentinel value or bug
@@ -246,7 +242,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         }
         else // Primary radiance packing - Mode 1 Signal
         {           
-            fusedAlbedo = float4(max(specReflectance.rgb, diffAlbedo.rgb), NoV);
+            fusedAlbedo = float4(max(specReflectance.rgb, diffAlbedo.rgb), 0.0f);
             demodColor = GetSafeFP16(denosierColor / fusedAlbedo.rgb);
             
             const float3 residual = max(0.0f, denosierColor - (demodColor * fusedAlbedo.rgb));
@@ -272,7 +268,6 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
             diffAlbedo = sqrt(diffAlbedo);
         }
         
-        // FSR-RR expects NoV in specular alpha
         OutSpecAlbedo[px] = GetSafeFP16(specReflectance);
         OutDiffAlbedo[px] = GetSafeFP16(diffAlbedo);
         OutSkipSignal[px] = GetSafeFP16(float4(floorColor, 0.0f));

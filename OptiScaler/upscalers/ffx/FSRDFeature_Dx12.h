@@ -24,9 +24,19 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
 
   private:
+    struct DenoiserSettings
+    {
+        float crossBilateralNormalStrength {};
+        float stabilityBias {};
+        float maxRadiance {};
+        float radianceClipStdK {};
+        float gaussianKernelRelaxation {};
+        float disocclusionThreshold {};
+    };
+
     ffxContext _pDenoiserCtx;
     ffxCreateContextDescDenoiser _denoiserCtxDesc;
-    FfxApiDenoiserSettings _denoiserSettings;
+    DenoiserSettings _denoiserSettings;
     bool _isMode2;
     bool _isInReset;
 
@@ -56,6 +66,8 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool CreateDenoiserContext();
 
     bool QueryDenoiserVersions();
+
+    bool QueryDefaultDenoiserSettings();
 
     void DestroyDenoiserContext();
 
