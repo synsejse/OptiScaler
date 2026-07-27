@@ -279,7 +279,8 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             // FSR-RR
             FfxDenoiserMode.set_from_config(readInt("FSR-RR", "DenoiserMode"));
-            FfxDenoiserHistRejection.set_from_config(readFloat("FSR-RR", "HistoryRejection"));
+            FfxDenoiserDisocclusionThreshold.set_from_config(
+                readFloat("FSR-RR", "DisocclusionThreshold"));
             FfxDenoiserCrossBlNormStr.set_from_config(readFloat("FSR-RR", "CrossBilateralNormalStrength"));
             FfxDenoiserStabilityBias.set_from_config(readFloat("FSR-RR", "TemporalStabilityBias"));
             FfxDenoiserMaxRadiance.set_from_config(readFloat("FSR-RR", "MaxRadiance"));
@@ -1131,8 +1132,8 @@ bool Config::SaveIni()
 
         // FSR-RR
         ini.SetValue("FSR-RR", "DenoiserMode", GetIntValue(Instance()->FfxDenoiserMode.value_for_config()).c_str());
-        ini.SetValue("FSR-RR", "HistoryRejection",
-                     GetFloatValue(Instance()->FfxDenoiserHistRejection.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "DisocclusionThreshold",
+                     GetFloatValue(Instance()->FfxDenoiserDisocclusionThreshold.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "CrossBilateralNormalStrength",
                      GetFloatValue(Instance()->FfxDenoiserCrossBlNormStr.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "TemporalStabilityBias",

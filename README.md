@@ -1,5 +1,8 @@
 > [!NOTE]
-> This fork adds an experimental **FSR Ray Regeneration backend for Cyberpunk 2077**, modernizing the FidelityFX SDK 2.1.1 implementation so its denoiser can run independently alongside SDK 2.3 upscaling components. It is intended for feature testing and is not an official upstream OptiScaler release.
+> This fork adds an experimental **FSR Ray Regeneration backend for Cyberpunk 2077**. It ports the denoiser to FSR-RR 1.1 from FidelityFX SDK 2.2 while keeping it detached from the SDK 2.3 upscaling and frame-generation components. It is intended for feature testing and is not an official upstream OptiScaler release.
+
+> [!WARNING]
+> **FSR-RR 1.1 is the compatibility ceiling for this Cyberpunk integration.** RR 1.2 removes the fused one- and two-signal inputs used here and instead requires separate direct/indirect diffuse and specular radiance signals. Cyberpunk's DLSS Ray Reconstruction integration does not expose those split inputs, so an exact RR 1.2 port is impossible unless the game itself provides additional rendering buffers; reconstructing them inside OptiScaler changes exposure and temporal behavior and is not equivalent.
 
 <div align="center">
 

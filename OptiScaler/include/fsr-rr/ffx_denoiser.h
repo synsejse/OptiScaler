@@ -34,7 +34,7 @@
 #define FFX_API_MAKE_BACKEND_EFFECT_SUB_ID(backendId, effectId, subversion) ((subversion & ~FFX_API_EFFECT_MASK) | (effectId & FFX_API_EFFECT_MASK) | (backendId & FFX_API_BACKEND_MASK) | (subversion & ~(FFX_API_BACKEND_MASK | FFX_API_EFFECT_MASK)))
 
 #define FFX_DENOISER_VERSION_MAJOR 1
-#define FFX_DENOISER_VERSION_MINOR 0
+#define FFX_DENOISER_VERSION_MINOR 1
 #define FFX_DENOISER_VERSION_PATCH 0
 
 #define FFX_DENOISER_MAKE_VERSION(major, minor, patch) (((major) << 22) | ((minor) << 12) | (patch))
@@ -72,15 +72,18 @@ typedef struct ffxCreateContextDescDenoiser
     uint32_t                   version;                     ///< The version of the API the application was built against. This must be set to <c>FFX_DENOISER_VERSION</c>.
     struct FfxApiDimensions2D  maxRenderSize;               ///< The maximum size that rendering will be performed at.
     ffxApiMessage              fpMessage;                   ///< A pointer to a function that can receive messages from the runtime. May be null.
-    FfxApiDenoiserMode         mode;                        ///< An entry of <c>FfxApiDenoiserMode</c> that selects the number of signals to denoise.
+    uint32_t                   mode;                        ///< An entry of <c>FfxApiDenoiserMode</c> that selects the number of signals to denoise.
     uint32_t                   flags;                       ///< Zero or a combination of values from <c>FfxApiCreateContextDenoiserFlags</c>.
 } ffxCreateContextDescDenoiser;
 
-typedef enum FfxApiDispatchDenoiserFlags
+#define FFX_API_CONFIGURE_DESC_TYPE_DENOISER_KEYVALUE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x08)
+typedef struct ffxConfigureDescDenoiserKeyValue
 {
-    FFX_DENOISER_DISPATCH_RESET               = (1 << 0),   ///< A bit indicating that the we need to reset history accumulation.
-    FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO    = (1 << 1),   ///< A bit indicating that the input albedo textures are not gamma encoded.
-} FfxApiDispatchDenoiserFlags;
+    ffxConfigureDescHeader header;
+    uint64_t               key;
+    uint64_t               count;
+    const void*            data;
+} ffxConfigureDescDenoiserKeyValue;
 
 typedef struct FfxApiDenoiserSignal
 {
@@ -90,32 +93,20 @@ typedef struct FfxApiDenoiserSignal
     uint32_t _reserved[2];                                  ///< Reserved for future use.
 } FfxApiDenoiserSignal;
 
-typedef struct FfxApiDenoiserSettings
-{
-    float historyRejectionStrength;                         ///< The strength of the history rejection test.
-    float crossBilateralNormalStrength;                     ///< The strength of the cross bilateral normal term.
-    float stabilityBias;                                    ///< Biases the temporal accumulation to be more stable but less responsive.
-    float maxRadiance;                                      ///< Maximum radiance value.
-	float radianceClipStdK;                                 ///< The standard deviation K value used for radiance clipping.
-	float gaussianKernelRelaxation;                         ///< The Gaussian kernel relaxation factor.
-
-    uint32_t _reserved[26];                                 ///< Reserved for future use.
-} FfxApiDenoiserSettings;
-
 #define FFX_API_DISPATCH_DESC_TYPE_DENOISER FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x02)
 typedef struct ffxDispatchDescDenoiser
 {
     ffxDispatchDescHeader      header;
     void*                      commandList;                 ///< Command list to record upscaling rendering commands into.
                                
-    struct FfxApiResource      linearDepth;                 ///< R:   Linear depth values for the current frame.
-    struct FfxApiResource      motionVectors;               ///< RGB: 2D motion vectors, B: Linear Depth delta
+    struct FfxApiResource      linearDepth;                 ///< R: Absolute linear depth for the current frame.
+    struct FfxApiResource      motionVectors;               ///< RG: PreviousUV - CurrentUV, B: abs(PreviousLinearDepth) - abs(CurrentLinearDepth).
     struct FfxApiResource      normals;                     ///< RG:  Octahedrally encoded normals, B: Linear Roughness, A: Material Type - See docs for more info, 
-    struct FfxApiResource      specularAlbedo;              ///< RGB: Specular albedo, A: NoV - sqrt encoding assumed unless <c>FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO</c> is provided. (sqrt(specular_albedo, NoV))
-    struct FfxApiResource      diffuseAlbedo;               ///< RGB: Diffuse albedo, A: metalness - sqrt encoding assumed unless <c>FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO</c> is provided. (sqrt(diffuse_albedo, metalness))
+    struct FfxApiResource      specularAlbedo;              ///< RGB: Specular albedo; alpha is unused in RR 1.1.
+    struct FfxApiResource      diffuseAlbedo;               ///< RGB: Diffuse albedo; alpha is unused in RR 1.1.
                                                             
-    struct FfxApiFloatCoords2D motionVectorScale;           ///< The scale factor to apply to the 2D motion vectors.
-    struct FfxApiFloatCoords2D jitterOffsets;               ///< The subpixel jitter offset applied to the camera projection.
+    struct FfxApiFloatCoords3D motionVectorScale;           ///< RG transforms motion into UV space; B scales the linear-depth delta.
+    struct FfxApiFloatCoords2D jitterOffsets;               ///< Camera projection jitter expressed in NDC, matching AMD's SDK 2.2 sample.
                                                             
     struct FfxApiFloatCoords3D cameraPositionDelta;         ///< The position delta of the camera since last frame. (PrevPos - CurrentPos)
     struct FfxApiFloatCoords3D cameraRight;                 ///< The right vector of the camera in world space.
@@ -168,20 +159,13 @@ typedef struct ffxDispatchDescDenoiserInputDominantLight    ///< Requires <c>FFX
     struct FfxApiFloatCoords3D  dominantLightEmission;      ///< Dominant light emission. (emission == (lightColor * lightIntensity))
 } ffxDispatchDescDenoiserInputDominantLight;
 
-#define FFX_API_CONFIGURE_DESC_TYPE_DENOISER_SETTINGS FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x08)
-typedef struct ffxConfigureDescDenoiserSettings
-{
-    ffxConfigureDescHeader        header;
-    struct FfxApiDenoiserSettings settings;                 ///< Values to set.
-} ffxConfigureDescDenoiserSettings;
-
 #define FFX_API_QUERY_DESC_TYPE_DENOISER_GPU_MEMORY_USAGE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x09)
 typedef struct ffxQueryDescDenoiserGetGPUMemoryUsage        ///< If a valid FfxContext is passed into ffx::Query with this structure, current context usage will be reported. If no context is passed, the memory usage will be estimated based on the provided parameters.
 {
     ffxQueryDescHeader        header;
     void*                     device;                       ///< For DX12: pointer to ID3D12Device. For Vulkan: pointer to VkDevice.
     struct FfxApiDimensions2D maxRenderSize;                ///< Maximum size that rendering will be performed at.
-    FfxApiDenoiserMode        mode;                         ///< An entry of <c>FfxApiDenoiserMode</c> that selects the number of signals to denoise.
+    uint32_t                  mode;                         ///< An entry of <c>FfxApiDenoiserMode</c> that selects the number of signals to denoise.
     uint32_t                  flags;                        ///< Zero or a combination of values from <c>FfxApiCreateContextDenoiserFlags</c>.
 
     struct FfxApiEffectMemoryUsage* gpuMemoryUsage;         ///< A pointer to a <c>FfxApiEffectMemoryUsage</c> structure that will hold the GPU memory usage.
@@ -198,14 +182,30 @@ typedef struct ffxQueryDescDenoiserGetVersion               ///< If a valid FfxC
     uint32_t*               patch;                          ///< A pointer to a <c>uint32_t</c> variable that will hold the patch version number.
 } ffxQueryDescDenoiserGetVersion;
 
-#define FFX_API_QUERY_DESC_TYPE_DENOISER_GET_DEFAULT_SETTINGS FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x0b)
-typedef struct ffxQueryDescDenoiserGetDefaultSettings       ///< If a valid FfxContext is passed into ffx::Query with this structure, info based on current context will be reported. If no context is passed, the info will be evaluated based on the provided parameters.
+#define FFX_API_QUERY_DESC_TYPE_DENOISER_GET_DEFAULT_KEYVALUE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x0b)
+typedef struct ffxQueryDescDenoiserGetDefaultKeyValue
 {
-    ffxConfigureDescHeader         header;
-    void*                          device;                  ///< For DX12: pointer to ID3D12Device. For Vulkan: pointer to VkDevice.
+    ffxQueryDescHeader header;
+    uint64_t           key;
+    uint64_t           count;
+    void*              data;
+} ffxQueryDescDenoiserGetDefaultKeyValue;
 
-    struct FfxApiDenoiserSettings* defaultSettings;         ///< A pointer to a <c>FfxApiDenoiserSettings</c> structure that will hold the default setting values.
-} ffxQueryDescDenoiserGetDefaultSettings;
+typedef enum FfxApiConfigureDenoiserKey
+{
+    FFX_API_CONFIGURE_DENOISER_KEY_CROSS_BILATERAL_NORMAL_STRENGTH = 1,
+    FFX_API_CONFIGURE_DENOISER_KEY_STABILITY_BIAS                  = 2,
+    FFX_API_CONFIGURE_DENOISER_KEY_MAX_RADIANCE                    = 3,
+    FFX_API_CONFIGURE_DENOISER_KEY_RADIANCE_CLIP_STD_K             = 4,
+    FFX_API_CONFIGURE_DENOISER_KEY_GAUSSIAN_KERNEL_RELAXATION      = 5,
+    FFX_API_CONFIGURE_DENOISER_KEY_DISOCCLUSION_THRESHOLD          = 6,
+} FfxApiConfigureDenoiserKey;
+
+typedef enum FfxApiDispatchDenoiserFlags
+{
+    FFX_DENOISER_DISPATCH_RESET            = (1 << 0),
+    FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO = (1 << 1),
+} FfxApiDispatchDenoiserFlags;
 
 #ifdef __cplusplus
 }

@@ -1823,7 +1823,7 @@ class FfxApiProxy
             return std::format("DISPATCH_DESC_INPUT_DOMINANT_LIGHT_TYPE_DENOISER ({:X})", type);
 
         case 0x00050008u:
-            return std::format("CONFIGURE_DESC_TYPE_DENOISER_SETTINGS ({:X})", type);
+            return std::format("CONFIGURE_DESC_TYPE_DENOISER_KEYVALUE ({:X})", type);
 
         case 0x00050009u:
             return std::format("QUERY_DESC_TYPE_DENOISER_GPU_MEMORY_USAGE ({:X})", type);
@@ -1832,7 +1832,7 @@ class FfxApiProxy
             return std::format("QUERY_DESC_TYPE_DENOISER_GET_VERSION ({:X})", type);
 
         case 0x0005000bu:
-            return std::format("QUERY_DESC_TYPE_DENOISER_GET_DEFAULT_SETTINGS ({:X})", type);
+            return std::format("QUERY_DESC_TYPE_DENOISER_GET_DEFAULT_KEYVALUE ({:X})", type);
 
         // Radiance Cache
         case 0x00060002u:

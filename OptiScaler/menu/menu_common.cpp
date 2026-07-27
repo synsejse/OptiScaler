@@ -2857,9 +2857,9 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                     }
                 }
 
-                if (float v = config->FfxDenoiserHistRejection.value_or_default();
-                    ImGui::SliderFloat("History Rejection", &v, 0, 1))
-                    config->FfxDenoiserHistRejection = v;
+                if (float v = config->FfxDenoiserDisocclusionThreshold.value_or_default();
+                    ImGui::SliderFloat("Disocclusion Threshold", &v, 0.01f, 0.05f, "%.3f"))
+                    config->FfxDenoiserDisocclusionThreshold = v;
 
                 if (float v = config->FfxDenoiserCrossBlNormStr.value_or_default();
                     ImGui::SliderFloat("Cross Bilateral Normal Strength", &v, 0, 1))
