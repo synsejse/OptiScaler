@@ -764,10 +764,12 @@ bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandL
     inParams.Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitterX);
     inParams.Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitterY);
 
-    dispatchDesc.jitterOffsets.x = jitterX;
-    dispatchDesc.jitterOffsets.y = jitterY;
+    // The RR 1.1 header says screen pixels, but AMD's SDK 2.2 sample still
+    // passes the camera projection jitter in NDC, matching RR 1.0.
+    dispatchDesc.jitterOffsets.x = 2.0f * (jitterX / (float) RenderWidth());
+    dispatchDesc.jitterOffsets.y = -2.0f * (jitterY / (float) RenderHeight());
 
-    LOG_DEBUG("Jitter pixels [{:.6f}, {:.6f}]", dispatchDesc.jitterOffsets.x, dispatchDesc.jitterOffsets.y);
+    LOG_DEBUG("Jitter NDC [{:.6f}, {:.6f}]", dispatchDesc.jitterOffsets.x, dispatchDesc.jitterOffsets.y);
 
     return true;
 }

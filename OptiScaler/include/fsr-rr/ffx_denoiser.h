@@ -106,7 +106,7 @@ typedef struct ffxDispatchDescDenoiser
     struct FfxApiResource      diffuseAlbedo;               ///< RGB: Diffuse albedo; alpha is unused in RR 1.1.
                                                             
     struct FfxApiFloatCoords3D motionVectorScale;           ///< RG transforms motion into UV space; B scales the linear-depth delta.
-    struct FfxApiFloatCoords2D jitterOffsets;               ///< Camera jitter expressed in screen pixels.
+    struct FfxApiFloatCoords2D jitterOffsets;               ///< Camera projection jitter expressed in NDC, matching AMD's SDK 2.2 sample.
                                                             
     struct FfxApiFloatCoords3D cameraPositionDelta;         ///< The position delta of the camera since last frame. (PrevPos - CurrentPos)
     struct FfxApiFloatCoords3D cameraRight;                 ///< The right vector of the camera in world space.
