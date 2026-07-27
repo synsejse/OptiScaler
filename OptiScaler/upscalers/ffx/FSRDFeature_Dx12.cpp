@@ -298,7 +298,8 @@ bool FSRDFeatureDx12::s_isRoughnessPacked = false;
 FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InParameters)
     : FFXFeatureDx12(InHandleId, InParameters), IFeature(InHandleId, SetParameters(InParameters)),
       _pDenoiserCtx(nullptr), _denoiserCtxDesc({}), _denoiserSettings({}), _convDesc({}), _isMode2(false),
-      _isInReset(false), _lastCamPos({}), _invViewMatrix(XMMatrixIdentity()), _viewMatrix(XMMatrixIdentity()),
+      _isInReset(false), _lastCamPos(0.0f, 0.0f, 0.0f), _invViewMatrix(XMMatrixIdentity()),
+      _viewMatrix(XMMatrixIdentity()),
       _prevViewMatrix(XMMatrixIdentity()), _projMatrix(XMMatrixIdentity()), _upscaleColorOverride(nullptr),
       _upscaleFovVertical(0.0f), _upscaleDeltaTime(0.0f)
 {
