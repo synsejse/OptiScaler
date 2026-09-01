@@ -353,7 +353,7 @@ bool FSRDFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
 
 bool FSRDFeatureDx12::CreateDenoiserContext()
 {
-    ScopedSkipSpoofing skipSpoofing {};
+    ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
     auto& state = State::Instance();
     auto& cfg = *Config::Instance();
 
@@ -446,7 +446,7 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
 
 bool FSRDFeatureDx12::QueryDenoiserVersions()
 {
-    ScopedSkipSpoofing skipSpoofing {};
+    ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
     auto& state = State::Instance();
 
     // Get version count
