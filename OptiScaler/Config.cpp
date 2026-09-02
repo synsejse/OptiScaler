@@ -314,6 +314,7 @@ bool Config::Reload(std::filesystem::path iniPath)
         {
             // Don't enable again if set false because of no nvngx found
             DLSSEnabled.set_from_config(readBool("DLSS", "Enabled"));
+            CrossAdapterDLSS.set_from_config(readBool("DLSS", "CrossAdapter"));
             UseGenericAppIdWithDlss.set_from_config(readBool("DLSS", "UseGenericAppIdWithDlss"));
 
             RenderPresetOverride.set_from_config(readBool("DLSS", "RenderPresetOverride"));
@@ -1141,6 +1142,7 @@ bool Config::SaveIni()
     // DLSS
     {
         ini.SetValue("DLSS", "Enabled", GetBoolValue(Instance()->DLSSEnabled.value_for_config()).c_str());
+        ini.SetValue("DLSS", "CrossAdapter", GetBoolValue(Instance()->CrossAdapterDLSS.value_for_config()).c_str());
         ini.SetValue("DLSS", "RenderPresetOverride",
                      GetBoolValue(Instance()->RenderPresetOverride.value_for_config()).c_str());
         ini.SetValue("DLSS", "RenderPresetForAll",

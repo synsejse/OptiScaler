@@ -777,8 +777,12 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
     InParams->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 1);
     InParams->Set(NVSDK_NGX_Parameter_RTXValue, 0);
 
-    auto primaryGpu = IdentifyGpu::getPrimaryGpu();
-    if (!primaryGpu.dlssCapable)
+    const auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    const bool crossAdapterDlssd = api == API::DX12 && Config::Instance()->CrossAdapterDLSS.value_or_default() &&
+                                   primaryGpu.vendorId != VendorId::Nvidia &&
+                                   State::Instance().NVNGX_DLSSD_Path.has_value() && IdentifyGpu::hasNvidiaGpu();
+
+    if (!primaryGpu.dlssCapable && !crossAdapterDlssd)
     {
         InParams->Set("SuperSamplingDenoising.NeedsUpdatedDriver", 0);
 
@@ -797,6 +801,15 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
 
         InParams->Set("SuperSamplingDenoising.Available", 0);
         InParams->Set("SuperSamplingDenoising.FeatureInitResult", 0);
+    }
+    else if (crossAdapterDlssd)
+    {
+        LOG_DEBUG("Advertising DLSS Ray Reconstruction through the secondary NVIDIA adapter");
+        InParams->Set("SuperSamplingDenoising.NeedsUpdatedDriver", 0);
+        InParams->Set("SuperSamplingDenoising.MinDriverVersionMajor", 0);
+        InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
+        InParams->Set("SuperSamplingDenoising.Available", 1);
+        InParams->Set("SuperSamplingDenoising.FeatureInitResult", 1);
     }
 
     if ((api == API::DX12 || api == API::Vulkan) && (State::Instance().activeFgInput == FGInput::DLSSG ||

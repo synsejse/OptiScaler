@@ -254,6 +254,8 @@ class Config
 
     // DLSS
     CustomOptional<bool> DLSSEnabled { true };
+    // Experimental: render on the game's D3D12 adapter and execute DLSS SR/RR on a secondary NVIDIA adapter.
+    CustomOptional<bool> CrossAdapterDLSS { false };
     CustomOptional<bool> RenderPresetOverride { false };
     CustomOptional<uint32_t> RenderPresetForAll { 0 };
     CustomOptional<uint32_t> RenderPresetDLAA { 0 };

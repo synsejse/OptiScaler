@@ -47,6 +47,34 @@ class ScopedInitDx12
     ~ScopedInitDx12() { _skipInit = previousState; }
 };
 
+static bool DeferNativeNgxInitForCrossAdapter(ID3D12Device* device)
+{
+    if (!device || !Config::Instance()->CrossAdapterDLSS.value_or_default())
+        return false;
+
+    const auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    return primaryGpu.vendorId != VendorId::Nvidia && IsEqualLUID(device->GetAdapterLuid(), primaryGpu.luid);
+}
+
+static void RefreshNvidiaDlssCapability(ID3D12Device* device)
+{
+    if (!device || !State::Instance().NVNGX_DLSS_Path.has_value())
+        return;
+
+    auto& dlssEnabled = Config::Instance()->DLSSEnabled;
+    const bool configuredEnabled = dlssEnabled.value_for_config().value_or(true);
+    if (!configuredEnabled)
+        return;
+
+    if (IdentifyGpu::refreshNvidiaCapabilities(device->GetAdapterLuid()))
+    {
+        if (!dlssEnabled.value_or_default())
+            LOG_INFO("Enabling DLSS after late Nvidia D3D12 adapter detection");
+
+        dlssEnabled.set_volatile_value(true);
+    }
+}
+
 static void UpdateInitPaths(NVSDK_NGX_FeatureCommonInfo* InFeatureInfo)
 {
     State::Instance().NVNGX_FeatureInfo_Paths.clear();
@@ -160,13 +188,20 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_Ext(unsigned long long InApp
     if (!_skipInit)
         UpdateInitPaths(&localFeatureInfo);
 
+    if (!_skipInit)
+        RefreshNvidiaDlssCapability(InDevice);
+
     State::Instance().NVNGX_ApplicationId = InApplicationId;
     State::Instance().NVNGX_ApplicationDataPath = std::wstring(InApplicationDataPath);
     State::Instance().NVNGX_Version = InSDKVersion;
     State::Instance().NVNGX_FeatureInfo = &localFeatureInfo;
     State::Instance().NVNGX_Version = InSDKVersion;
 
-    if (Config::Instance()->DLSSEnabled.value_or_default() && !_skipInit)
+    const bool deferNativeInit = DeferNativeNgxInitForCrossAdapter(InDevice);
+    if (deferNativeInit && !_skipInit)
+        LOG_WARN("Deferring native NGX initialization until the cross-adapter NVIDIA device is created");
+
+    if (Config::Instance()->DLSSEnabled.value_or_default() && !_skipInit && !deferNativeInit)
     {
         if (Config::Instance()->UseGenericAppIdWithDlss.value_or_default())
             InApplicationId = app_id_override;
@@ -235,7 +270,14 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init(unsigned long long InApplica
     if (!_skipInit)
         UpdateInitPaths(&localFeatureInfo);
 
-    if (Config::Instance()->DLSSEnabled.value_or_default() && !_skipInit)
+    if (!_skipInit)
+        RefreshNvidiaDlssCapability(InDevice);
+
+    const bool deferNativeInit = DeferNativeNgxInitForCrossAdapter(InDevice);
+    if (deferNativeInit && !_skipInit)
+        LOG_WARN("Deferring native NGX initialization until the cross-adapter NVIDIA device is created");
+
+    if (Config::Instance()->DLSSEnabled.value_or_default() && !_skipInit && !deferNativeInit)
     {
         if (Config::Instance()->UseGenericAppIdWithDlss.value_or_default())
             InApplicationId = app_id_override;
@@ -293,7 +335,14 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_ProjectID(const char* InProj
     if (!_skipInit)
         UpdateInitPaths(&localFeatureInfo);
 
-    if (Config::Instance()->DLSSEnabled.value_or_default() && !_skipInit)
+    if (!_skipInit)
+        RefreshNvidiaDlssCapability(InDevice);
+
+    const bool deferNativeInit = DeferNativeNgxInitForCrossAdapter(InDevice);
+    if (deferNativeInit && !_skipInit)
+        LOG_WARN("Deferring native NGX initialization until the cross-adapter NVIDIA device is created");
+
+    if (Config::Instance()->DLSSEnabled.value_or_default() && !_skipInit && !deferNativeInit)
     {
         if (Config::Instance()->UseGenericAppIdWithDlss.value_or_default())
             InProjectId = project_id_override;
@@ -892,11 +941,19 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
     LOG_DEBUG("for ({0})", (int) FeatureDiscoveryInfo->FeatureID);
 
     const bool isUpscaling = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling;
+    const bool isRayReconstruction = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction;
     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
+    const auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    const bool crossAdapterDlssd = isRayReconstruction && Config::Instance()->CrossAdapterDLSS.value_or_default() &&
+                                   primaryGpu.vendorId != VendorId::Nvidia &&
+                                   State::Instance().NVNGX_DLSSD_Path.has_value() && IdentifyGpu::hasNvidiaGpu();
 
-    if (isUpscaling || (isFG && dlssgAdjacent))
+    if (isUpscaling || crossAdapterDlssd || (isFG && dlssgAdjacent))
     {
+        if (crossAdapterDlssd)
+            LOG_DEBUG("Reporting cross-adapter DLSS Ray Reconstruction support");
+
         if (OutSupported == nullptr)
         {
             static auto tmp = NVSDK_NGX_FeatureRequirement();
@@ -911,13 +968,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
         return NVSDK_NGX_Result_Success;
     }
 
-    if (Config::Instance()->DLSSEnabled.value_or_default() && IdentifyGpu::getPrimaryGpu().dlssCapable &&
+    if (Config::Instance()->DLSSEnabled.value_or_default() && primaryGpu.dlssCapable &&
         NVNGXProxy::NVNGXModule() == nullptr)
     {
         NVNGXProxy::InitNVNGX();
     }
 
-    if (Config::Instance()->DLSSEnabled.value_or_default() && IdentifyGpu::getPrimaryGpu().dlssCapable &&
+    if (Config::Instance()->DLSSEnabled.value_or_default() && primaryGpu.dlssCapable &&
         NVNGXProxy::D3D12_GetFeatureRequirements() != nullptr)
     {
         LOG_DEBUG("D3D12_GetFeatureRequirements for ({0})", (int) FeatureDiscoveryInfo->FeatureID);

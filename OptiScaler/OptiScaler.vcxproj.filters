@@ -95,6 +95,12 @@
     <ClInclude Include="upscalers\dlss\DLSSFeature_Dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\dlss\CrossAdapterDLSSFeature_Dx12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\dlssd\CrossAdapterDLSSDFeature_Dx12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\dlss\DLSSFeature_Dx11.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1026,6 +1032,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="upscalers\dlss\DLSSFeature_Dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\dlss\CrossAdapterDLSSFeature_Dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\dlssd\CrossAdapterDLSSDFeature_Dx12.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="upscalers\dlss\DLSSFeature_Dx11.cpp">

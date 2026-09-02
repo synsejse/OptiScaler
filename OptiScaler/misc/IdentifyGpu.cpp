@@ -288,9 +288,9 @@ void IdentifyGpu::queryNvapi(GpuInformation& gpuInfo)
 
     NtdllProxy::FreeLibrary_Ldr(nvapiModule);
 
-    // assumes GTX16xx to be capable due to our spoofing
-    if (Config::Instance()->DLSSEnabled.value_or_default())
-        gpuInfo.dlssCapable = gpuInfo.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100;
+    // Capability describes the adapter, not whether DLSS is currently enabled in the config.
+    // Keeping these independent also allows a failed early NVAPI probe to be retried later.
+    gpuInfo.dlssCapable = gpuInfo.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100;
 }
 
 void IdentifyGpu::getHardwareAdapter(IDXGIFactory* InFactory, IDXGIAdapter** InAdapter,
@@ -360,6 +360,54 @@ GpuInformation IdentifyGpu::getPrimaryGpu()
 {
     auto allGpus = getAllGpus();
     return !allGpus.empty() ? allGpus.front() : GpuInformation {};
+}
+
+bool IdentifyGpu::hasNvidiaGpu()
+{
+    const auto allGpus = getAllGpus();
+    return std::any_of(allGpus.begin(), allGpus.end(), [](const GpuInformation& gpu)
+                       { return gpu.vendorId == VendorId::Nvidia && !gpu.softwareAdapter; });
+}
+
+bool IdentifyGpu::refreshNvidiaCapabilities(LUID adapterLuid)
+{
+    // Populate the cache if capability refresh is the first full adapter query.
+    getAllGpus();
+
+    GpuInformation refreshedGpu;
+
+    {
+        std::scoped_lock lock(mutex);
+        auto gpu = std::find_if(cache.begin(), cache.end(),
+                                [&](const auto& entry) { return IsEqualLUID(entry.luid, adapterLuid); });
+
+        if (gpu == cache.end() || gpu->vendorId != VendorId::Nvidia)
+            return false;
+
+        if (gpu->dlssCapable)
+            return true;
+
+        refreshedGpu = *gpu;
+    }
+
+    LOG_INFO("Retrying Nvidia capability detection for {}", refreshedGpu.name);
+    queryNvapi(refreshedGpu);
+
+    {
+        std::scoped_lock lock(mutex);
+        auto gpu = std::find_if(cache.begin(), cache.end(),
+                                [&](const auto& entry) { return IsEqualLUID(entry.luid, adapterLuid); });
+
+        if (gpu == cache.end() || gpu->vendorId != VendorId::Nvidia)
+            return false;
+
+        gpu->nvidiaArchInfo = refreshedGpu.nvidiaArchInfo;
+        gpu->noDisplayConnected = refreshedGpu.noDisplayConnected;
+        gpu->dlssCapable = refreshedGpu.dlssCapable;
+    }
+
+    LOG_INFO("Nvidia capability refresh for {}: DLSS capable: {}", refreshedGpu.name, refreshedGpu.dlssCapable);
+    return refreshedGpu.dlssCapable;
 }
 
 void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3D12CreateDevice)

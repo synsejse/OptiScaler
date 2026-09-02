@@ -468,7 +468,8 @@ void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, co
         for (auto opt : options)
         {
             // Check if GPU is capable of a given backend
-            if (opt == Upscaler::DLSS && !primaryGpu.dlssCapable)
+            const bool crossAdapterDlss = api == API::DX12 && Config::Instance()->CrossAdapterDLSS.value_or_default();
+            if (opt == Upscaler::DLSS && !primaryGpu.dlssCapable && !crossAdapterDlss)
                 continue;
 
             // Not all Intel GPUs support native DX11 XeSS but don't think we have a good way to check exactly
@@ -2380,6 +2381,52 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                 }
 
                 MARK_ALL_BACKENDS_CHANGED();
+            }
+        }
+
+        if (auto crossAdapter = currentFeature->GetCrossAdapterInfo(); crossAdapter.has_value())
+        {
+            const char* pipelineState = "Initializing";
+            ImVec4 stateColor(1.0f, 0.8f, 0.0f, 1.0f);
+            switch (crossAdapter->state)
+            {
+            case CrossAdapterPipelineState::Priming:
+                pipelineState = "Priming";
+                break;
+            case CrossAdapterPipelineState::Active:
+                pipelineState = "Active";
+                stateColor = ImVec4(0.2f, 1.0f, 0.35f, 1.0f);
+                break;
+            case CrossAdapterPipelineState::Error:
+                pipelineState = "Error";
+                stateColor = ImVec4(1.0f, 0.25f, 0.2f, 1.0f);
+                break;
+            default:
+                break;
+            }
+
+            ImGui::Spacing();
+            const std::string crossAdapterTitle = "Cross-GPU " + crossAdapter->featureName;
+            ImGui::SeparatorText(crossAdapterTitle.c_str());
+            ImGui::Text("%s -> %s", crossAdapter->renderGpuName.c_str(), crossAdapter->upscalerGpuName.c_str());
+            ImGui::TextUnformatted("Pipeline:");
+            ImGui::SameLine(0.0f, 6.0f);
+            ImGui::TextColored(toneMapColor(stateColor), "%s", pipelineState);
+            ImGui::SameLine(0.0f, 6.0f);
+            ImGui::TextUnformatted("| CPU staging | Packed HDR | +1 frame");
+
+            if (crossAdapter->completedFrames)
+            {
+                if (crossAdapter->nvidiaGpuTimingAvailable)
+                {
+                    ImGui::Text("Transfer: %.0f MB/s", crossAdapter->transferRateMBs);
+                    ImGui::Text("Time: %.2f ms | NVIDIA: %.2f ms", crossAdapter->pipelineMs,
+                                crossAdapter->nvidiaFeatureMs);
+                }
+                else
+                {
+                    ImGui::Text("Time: %.2f ms pipeline", crossAdapter->pipelineMs);
+                }
             }
         }
 

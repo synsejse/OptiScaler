@@ -8,6 +8,7 @@ class DLSSFeatureDx12 : public DLSSFeature, public IFeature_Dx12
 {
   private:
   protected:
+    bool EnsureNGXInitialized();
     bool InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
 
   public:
@@ -17,7 +18,7 @@ class DLSSFeatureDx12 : public DLSSFeature, public IFeature_Dx12
     static void Shutdown(ID3D12Device* InDevice);
 
     feature_version Version() override { return DLSSFeature::Version(); }
-    Upscaler GetUpscalerType() const final { return DLSSFeature::GetUpscalerType(); }
+    Upscaler GetUpscalerType() const override { return DLSSFeature::GetUpscalerType(); }
     API Api() const override { return IFeature_Dx12::Api(); }
     bool CallsUpscalerEndByItself() override { return IFeature_Dx12::CallsUpscalerEndByItself(); }
 

@@ -994,6 +994,14 @@ static void CheckWorkingMode()
         StreamlineHooks::hookDlss(slDlss);
     }
 
+    HMODULE slDlssd = GetDllNameWModule(&slDlssdNamesW);
+    if (slDlssd != nullptr)
+    {
+        State::Instance().postCodes |= PostCode::SlPluginsAlreadyInMemory;
+        LOG_WARN("sl.dlss_d.dll already in memory");
+        StreamlineHooks::hookDlssd(slDlssd);
+    }
+
     HMODULE slDlssg = nullptr;
     slDlssg = GetDllNameWModule(&slDlssgNamesW);
     if (slDlssg != nullptr)
@@ -1979,12 +1987,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         if (!State::Instance().NVNGX_DLSSG_Path.has_value())
             State::Instance().NVNGX_DLSSG_Path = Util::FindFilePath(exePath, "nvngx_dlssg.dll");
 
+        // Cross-adapter DLSS SR/RR deliberately initializes NGX on a secondary NVIDIA device, so the
+        // render adapter does not need to pass the normal NVIDIA capability probe.
+        const bool crossAdapterDlss = Config::Instance()->CrossAdapterDLSS.value_or_default();
+
         // Not 100% accurate for Nvidia cards without DLSS
-        if (Config::Instance()->DLSSEnabled.value_or_default() && possibleNvidia)
+        if (Config::Instance()->DLSSEnabled.value_or_default() && (possibleNvidia || crossAdapterDlss))
         {
             if (State::Instance().NVNGX_DLSS_Path.has_value())
             {
                 spdlog::info("Enabling DLSS");
+                if (crossAdapterDlss && !possibleNvidia)
+                    spdlog::warn("Enabling experimental cross-adapter DLSS SR/RR on a non-NVIDIA render adapter");
                 Config::Instance()->DLSSEnabled.set_volatile_value(true);
             }
             else

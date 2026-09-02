@@ -38,6 +38,27 @@ struct DetailedGpuTime
     bool includedInUpscalerTime = false;
 };
 
+enum class CrossAdapterPipelineState
+{
+    Initializing,
+    Priming,
+    Active,
+    Error,
+};
+
+struct CrossAdapterInfo
+{
+    std::string featureName;
+    std::string renderGpuName;
+    std::string upscalerGpuName;
+    CrossAdapterPipelineState state = CrossAdapterPipelineState::Initializing;
+    uint64_t completedFrames = 0;
+    double transferRateMBs = 0.0;
+    double pipelineMs = 0.0;
+    bool nvidiaGpuTimingAvailable = false;
+    double nvidiaFeatureMs = 0.0;
+};
+
 class IFeature
 {
   private:
@@ -120,6 +141,7 @@ class IFeature
     std::string ShortName() const { return UpscalerShortName(GetUpscalerType()); }; // Without the version
     virtual std::optional<double> ReadUpscalerTime(void* commandQueue) { return std::nullopt; }
     virtual void ReadDetailedGpuTimes(void* commandQueue, std::vector<DetailedGpuTime>& detailedGpuTimes) {};
+    virtual std::optional<CrossAdapterInfo> GetCrossAdapterInfo() { return std::nullopt; }
 
     virtual size_t JitterCount() { return _jitterInfo.size(); }
 

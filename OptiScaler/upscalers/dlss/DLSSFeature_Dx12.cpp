@@ -19,23 +19,8 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
         return false;
     }
 
-    if (!_dlssInited)
-    {
-        _dlssInited = NVNGXProxy::InitDx12(Device);
-
-        if (!_dlssInited)
-            return false;
-
-        _moduleLoaded =
-            (NVNGXProxy::D3D12_Init_ProjectID() != nullptr || NVNGXProxy::D3D12_Init_Ext() != nullptr) &&
-            (NVNGXProxy::D3D12_Shutdown() != nullptr || NVNGXProxy::D3D12_Shutdown1() != nullptr) &&
-            (NVNGXProxy::D3D12_GetParameters() != nullptr || NVNGXProxy::D3D12_AllocateParameters() != nullptr) &&
-            NVNGXProxy::D3D12_DestroyParameters() != nullptr && NVNGXProxy::D3D12_CreateFeature() != nullptr &&
-            NVNGXProxy::D3D12_ReleaseFeature() != nullptr && NVNGXProxy::D3D12_EvaluateFeature() != nullptr;
-
-        // delay between init and create feature
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
+    if (!EnsureNGXInitialized())
+        return false;
 
     LOG_INFO("Creating DLSS feature");
 
@@ -72,6 +57,27 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
     ReadVersion();
 
     SetInit(true);
+    return true;
+}
+
+bool DLSSFeatureDx12::EnsureNGXInitialized()
+{
+    if (_dlssInited)
+        return true;
+
+    _dlssInited = NVNGXProxy::InitDx12(Device);
+    if (!_dlssInited)
+        return false;
+
+    _moduleLoaded =
+        (NVNGXProxy::D3D12_Init_ProjectID() != nullptr || NVNGXProxy::D3D12_Init_Ext() != nullptr) &&
+        (NVNGXProxy::D3D12_Shutdown() != nullptr || NVNGXProxy::D3D12_Shutdown1() != nullptr) &&
+        (NVNGXProxy::D3D12_GetParameters() != nullptr || NVNGXProxy::D3D12_AllocateParameters() != nullptr) &&
+        NVNGXProxy::D3D12_DestroyParameters() != nullptr && NVNGXProxy::D3D12_CreateFeature() != nullptr &&
+        NVNGXProxy::D3D12_ReleaseFeature() != nullptr && NVNGXProxy::D3D12_EvaluateFeature() != nullptr;
+
+    // Delay between init and create feature.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return true;
 }
 

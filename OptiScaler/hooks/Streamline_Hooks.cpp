@@ -31,6 +31,13 @@ static bool IsSL1AndFGActive()
     return state.streamlineVersion.major == 1 && state.activeFgInput == FGInput::DLSSG;
 }
 
+static bool CanUseCrossAdapterDlssd()
+{
+    const auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    return Config::Instance()->CrossAdapterDLSS.value_or_default() && primaryGpu.vendorId != VendorId::Nvidia &&
+           IdentifyGpu::hasNvidiaGpu();
+}
+
 static void PatchSL1PluginJson(nlohmann::json& configJson)
 {
     if (!IsSL1AndFGActive())
@@ -764,9 +771,13 @@ void StreamlineHooks::spoofArch(uint32_t currentArch, sl::Feature feature, Syste
             return setArch(maxArch, altSystemCaps);
     }
 
-    // Don't spoof DLSSD at all
+    // DLSS-RR normally sees the non-NVIDIA render adapter. Expose the RTX capability only when the
+    // explicitly enabled cross-adapter backend can actually service the feature.
     else if (feature == sl::kFeatureDLSS_RR)
     {
+        if (CanUseCrossAdapterDlssd() && currentArch < NV_GPU_ARCHITECTURE_TU100)
+            return setArch(maxArch, altSystemCaps);
+
         return;
     }
 
@@ -835,6 +846,50 @@ bool StreamlineHooks::hkdlss_slOnPluginLoad(sl::param::IParameters* params, cons
 
     *pluginJSON = config.c_str();
 
+    return result;
+}
+
+bool StreamlineHooks::hkdlssd_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
+                                             const char** pluginJSON)
+{
+    LOG_FUNC();
+
+    static std::string config;
+    const bool shouldSpoofArch = CanUseCrossAdapterDlssd();
+
+    uint32_t currentArch = 0;
+    if (shouldSpoofArch)
+    {
+        hookSystemCaps(params);
+        currentArch = getSystemCapsArch();
+        spoofArch(currentArch, sl::kFeatureDLSS_RR);
+    }
+
+    const auto result = o_dlssd_slOnPluginLoad(params, loaderJSON, pluginJSON);
+
+    if (shouldSpoofArch)
+        setArch(currentArch);
+
+    nlohmann::json configJson = nlohmann::json::parse(*pluginJSON);
+    const auto primaryGpu = IdentifyGpu::getPrimaryGpu();
+    if (primaryGpu.vendorId != VendorId::Nvidia || !primaryGpu.dlssCapable)
+    {
+        if (configJson.contains("/external/vk/instance/extensions"_json_pointer))
+            configJson["external"]["vk"]["instance"]["extensions"].clear();
+
+        if (configJson.contains("/external/vk/device/extensions"_json_pointer))
+            configJson["external"]["vk"]["device"]["extensions"].clear();
+
+        if (configJson.contains("/external/vk/device/1.2_features"_json_pointer))
+            configJson["external"]["vk"]["device"]["1.2_features"].clear();
+
+        if (configJson.contains("/external/vk/device/1.3_features"_json_pointer))
+            configJson["external"]["vk"]["device"]["1.3_features"].clear();
+    }
+
+    PatchSL1PluginJson(configJson);
+    config = configJson.dump();
+    *pluginJSON = config.c_str();
     return result;
 }
 
@@ -1382,6 +1437,19 @@ void* StreamlineHooks::hkdlss_slGetPluginFunction(const char* functionName)
     }
 
     return o_dlss_slGetPluginFunction(functionName);
+}
+
+void* StreamlineHooks::hkdlssd_slGetPluginFunction(const char* functionName)
+{
+    LOG_DEBUG("{}", functionName);
+
+    if (strcmp(functionName, "slOnPluginLoad") == 0)
+    {
+        o_dlssd_slOnPluginLoad = (PFN_slOnPluginLoad) o_dlssd_slGetPluginFunction(functionName);
+        return &hkdlssd_slOnPluginLoad;
+    }
+
+    return o_dlssd_slGetPluginFunction(functionName);
 }
 
 void* StreamlineHooks::hkdlssg_slGetPluginFunction(const char* functionName)
@@ -2047,6 +2115,61 @@ void StreamlineHooks::hookDlss(HMODULE slDlss)
     }
 }
 
+// SL DLSS Ray Reconstruction
+
+void StreamlineHooks::unhookDlssd()
+{
+    LOG_FUNC();
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    if (o_dlssd_slGetPluginFunction)
+        DetourDetach(&(PVOID&) o_dlssd_slGetPluginFunction, hkdlssd_slGetPluginFunction);
+
+    const auto detourResult = DetourTransactionCommit();
+    if (detourResult != NO_ERROR)
+    {
+        LOG_ERROR("Failed to unhook DLSS Ray Reconstruction: {:X}", detourResult);
+    }
+    else
+    {
+        o_dlssd_slGetPluginFunction = nullptr;
+    }
+}
+
+void StreamlineHooks::hookDlssd(HMODULE slDlssd)
+{
+    LOG_FUNC();
+
+    if (!slDlssd)
+    {
+        LOG_WARN("DLSS Ray Reconstruction module is NULL");
+        return;
+    }
+
+    if (o_dlssd_slGetPluginFunction)
+        unhookDlssd();
+
+    o_dlssd_slGetPluginFunction =
+        reinterpret_cast<PFN_slGetPluginFunction>(KernelBaseProxy::GetProcAddress_()(slDlssd, "slGetPluginFunction"));
+
+    if (o_dlssd_slGetPluginFunction != nullptr)
+    {
+        LOG_TRACE("Hooking slGetPluginFunction in sl.dlss_d");
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+        DetourAttach(&(PVOID&) o_dlssd_slGetPluginFunction, hkdlssd_slGetPluginFunction);
+
+        const auto detourResult = DetourTransactionCommit();
+        if (detourResult != NO_ERROR)
+        {
+            LOG_ERROR("Failed to hook DLSS Ray Reconstruction: {:X}", detourResult);
+            o_dlssd_slGetPluginFunction = nullptr;
+        }
+    }
+}
+
 // SL DLSSG
 
 void StreamlineHooks::unhookDlssg()
@@ -2319,6 +2442,8 @@ void StreamlineHooks::hookCommon(HMODULE slCommon)
 bool StreamlineHooks::isInterposerHooked() { return o_slInit != nullptr || o_slInit_sl1 != nullptr; }
 
 bool StreamlineHooks::isDlssHooked() { return o_dlss_slGetPluginFunction != nullptr; }
+
+bool StreamlineHooks::isDlssdHooked() { return o_dlssd_slGetPluginFunction != nullptr; }
 
 bool StreamlineHooks::isDlssgHooked() { return o_dlssg_slGetPluginFunction != nullptr; }
 

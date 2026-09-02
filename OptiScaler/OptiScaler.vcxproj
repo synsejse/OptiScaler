@@ -501,10 +501,12 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\dlssd\DLSSDFeature.h" />
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Dx11.h" />
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Dx12.h" />
+    <ClInclude Include="upscalers\dlssd\CrossAdapterDLSSDFeature_Dx12.h" />
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Vk.h" />
     <ClInclude Include="upscalers\dlss\DLSSFeature.h" />
     <ClInclude Include="upscalers\dlss\DLSSFeature_Dx11.h" />
     <ClInclude Include="upscalers\dlss\DLSSFeature_Dx12.h" />
+    <ClInclude Include="upscalers\dlss\CrossAdapterDLSSFeature_Dx12.h" />
     <ClInclude Include="upscalers\dlss\DLSSFeature_Vk.h" />
     <ClInclude Include="upscalers\FeatureProvider_Dx11.h" />
     <ClInclude Include="upscalers\FeatureProvider_Dx12.h" />
@@ -750,10 +752,12 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\dlssd\DLSSDFeature.cpp" />
     <ClCompile Include="upscalers\dlssd\DLSSDFeature_Dx11.cpp" />
     <ClCompile Include="upscalers\dlssd\DLSSDFeature_Dx12.cpp" />
+    <ClCompile Include="upscalers\dlssd\CrossAdapterDLSSDFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\dlssd\DLSSDFeature_Vk.cpp" />
     <ClCompile Include="upscalers\dlss\DLSSFeature.cpp" />
     <ClCompile Include="upscalers\dlss\DLSSFeature_Dx11.cpp" />
     <ClCompile Include="upscalers\dlss\DLSSFeature_Dx12.cpp" />
+    <ClCompile Include="upscalers\dlss\CrossAdapterDLSSFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\dlss\DLSSFeature_Vk.cpp" />
     <ClCompile Include="upscalers\FeatureProvider_Dx11.cpp" />
     <ClCompile Include="upscalers\FeatureProvider_Dx12.cpp" />
