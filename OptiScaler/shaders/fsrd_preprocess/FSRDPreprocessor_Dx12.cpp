@@ -378,7 +378,7 @@ struct FSRDPreprocessor_Dx12::Impl
     }
 
     void Blit(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* srcTex, ID3D12Resource* dstTex,
-              XMFLOAT2 dstDim) 
+              XMFLOAT2 dstDim, bool fullSource)
     {
         XMFLOAT2 srcDim = {};
         D3D12_RESOURCE_DESC srcDesc = srcTex->GetDesc();
@@ -401,7 +401,8 @@ struct FSRDPreprocessor_Dx12::Impl
         const Composition::Constants constants = {
             .DstTexSize = { dstDim.x, dstDim.y, (1.0f / dstDim.x), (1.0f / dstDim.y) },
             .Flags = (UINT) CompFlags::RawSourceBlit | (UINT) CompFlags::ScaleSrc,
-            .SrcTexSize = { std::min(srcDim.x, m_renderSize.x), std::min(srcDim.y, m_renderSize.y) }
+            .SrcTexSize = fullSource ? srcDim : XMFLOAT2 { std::min(srcDim.x, m_renderSize.x),
+                                                         std::min(srcDim.y, m_renderSize.y) }
         };
 
         std::array<ID3D12Resource*, 1> uavs { dstTex };
@@ -531,12 +532,12 @@ ID3D12Resource* FSRDPreprocessor_Dx12::GetCompositionOutput() const
 }
 
 bool FSRDPreprocessor_Dx12::Blit(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* srcTex,
-                                 ID3D12Resource* dstTex, XMFLOAT2 dim) const
+                                 ID3D12Resource* dstTex, XMFLOAT2 dim, bool fullSource) const
 
 {
     try
     {
-        m_impl->Blit(cmdList, srcTex, dstTex, dim);
+        m_impl->Blit(cmdList, srcTex, dstTex, dim, fullSource);
         return true;
     }
     catch (const std::exception& err)

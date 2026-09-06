@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <vector>
+#include "replay_options.h"
 
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
@@ -95,6 +96,44 @@ static FfxApiFloatCoords3D vec3(const json& j)
     return { j.at(0).get<float>(), j.at(1).get<float>(), j.at(2).get<float>() };
 }
 
+struct Readback
+{
+    ComPtr<ID3D12Resource> buffer;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
+    UINT64 bytes = 0;
+};
+static Readback copyReadback(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* source)
+{
+    Readback result;
+    barrier(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const auto desc = source->GetDesc();
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &result.footprint, nullptr, nullptr, &result.bytes);
+    result.buffer = buffer(device, result.bytes, D3D12_HEAP_TYPE_READBACK);
+    D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
+    src.pResource = source;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = result.buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = result.footprint;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    return result;
+}
+static void writeReadback(const Readback& readback, const fs::path& path, uint32_t width, uint32_t height)
+{
+    void* mapped = nullptr;
+    D3D12_RANGE range { 0, size_t(readback.bytes) };
+    check(readback.buffer->Map(0, &range, &mapped), "Map readback");
+    std::ofstream result(path, std::ios::binary);
+    for (uint32_t y = 0; y < height; ++y)
+        result.write(static_cast<char*>(mapped) + readback.footprint.Offset +
+                         size_t(y) * readback.footprint.Footprint.RowPitch, size_t(width) * 8);
+    D3D12_RANGE noWrite { 0, 0 };
+    readback.buffer->Unmap(0, &noWrite);
+    result.close();
+    if (!result)
+        throw std::runtime_error("Cannot write replay texture: " + path.string());
+}
+
 static int run(int argc, wchar_t** argv)
 {
     if (argc != 4)
@@ -109,6 +148,10 @@ static int run(int argc, wchar_t** argv)
     uint32_t w = d.at("render_size").at(0), h = d.at("render_size").at(1);
     if (!w || !h || w > 8192 || h > 8192 || !(d.at("flags").get<uint32_t>() & FFX_DENOISER_DISPATCH_RESET))
         throw std::runtime_error("Replay requires valid dimensions and explicit RESET");
+    static_assert(FFX_API_DENOISER_DEBUG_VIEW_MODE_OVERVIEW == 0 &&
+                  FFX_API_DENOISER_DEBUG_VIEW_MODE_FULLSCREEN_VIEWPORT == 1 &&
+                  FFX_API_DENOISER_DEBUG_VIEW_MAX_VIEWPORTS == 12);
+    const auto options = Replay::parseOptions(job, w, h);
     // Validate paths and file sizes before loading a provider or creating GPU resources.
     std::map<std::string, std::vector<char>> bytes;
     std::map<std::string, std::pair<uint32_t, uint32_t>> resourceSizes;
@@ -218,6 +261,7 @@ static int run(int argc, wchar_t** argv)
     create.header.pNext = &backend.header;
     create.version = FFX_DENOISER_VERSION;
     create.mode = FFX_DENOISER_MODE_1_SIGNAL;
+    create.flags = options.debug ? FFX_DENOISER_ENABLE_DEBUGGING : 0;
     create.maxRenderSize = { job.at("max_render_size").at(0).get<uint32_t>(),
                              job.at("max_render_size").at(1).get<uint32_t>() };
     if (create.maxRenderSize.width < w || create.maxRenderSize.height < h ||
@@ -236,7 +280,19 @@ static int run(int argc, wchar_t** argv)
         query.data = &value;
         checkFfx(ffxQuery(&context, &query.header), "Query default setting");
         job["provider_defaults"][std::to_string(key)] = value;
+        if (options.settings.contains(key))
+        {
+            value = options.settings.at(key);
+            ffxConfigureDescDenoiserKeyValue configure {};
+            configure.header.type = FFX_API_CONFIGURE_DESC_TYPE_DENOISER_KEYVALUE;
+            configure.key = key;
+            configure.count = 1;
+            configure.data = &value;
+            checkFfx(ffxConfigure(&context, &configure.header), "Configure replay setting");
+        }
+        job["effective_settings"][std::to_string(key)] = value;
     }
+    job["context_flags"] = create.flags;
 
     constexpr auto readState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     std::map<std::string, ComPtr<ID3D12Resource>> inputs;
@@ -282,6 +338,43 @@ static int run(int argc, wchar_t** argv)
     signal.radiance.input = resource("converted_radiance");
     signal.radiance.output = ffxApiGetResourceDX12(output.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     signal.fusedAlbedo = resource("converted_fused_albedo");
+    ComPtr<ID3D12Resource> debugOutput;
+    ffxDispatchDescDenoiserDebugView debug {};
+    if (options.debug)
+    {
+        // Match AMD's sample format. Clear every pixel because alpha marks the pixels
+        // written by the debug pass; untouched overview borders must not contain garbage.
+        debugOutput = texture(device.Get(), options.debugWidth, options.debugHeight,
+                              DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COPY_DEST);
+        const auto desc = debugOutput->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
+        UINT64 total = 0;
+        device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+        auto clearUpload = buffer(device.Get(), total, D3D12_HEAP_TYPE_UPLOAD);
+        void* mapped = nullptr;
+        D3D12_RANGE noRead { 0, 0 };
+        check(clearUpload->Map(0, &noRead, &mapped), "Map debug clear");
+        memset(mapped, 0, size_t(total));
+        clearUpload->Unmap(0, nullptr);
+        D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
+        src.pResource = clearUpload.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = footprint;
+        dst.pResource = debugOutput.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        barrier(list.Get(), debugOutput.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        uploads.push_back(clearUpload);
+
+        debug.header.type = FFX_API_DISPATCH_DESC_DEBUG_VIEW_TYPE_DENOISER;
+        debug.output = ffxApiGetResourceDX12(debugOutput.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        debug.outputSize = { options.debugWidth, options.debugHeight };
+        debug.mode = options.debugMode;
+        debug.viewportIndex = options.viewportIndex;
+        // The debug extension belongs to the same dispatch, and does not replace its signal.
+        signal.header.pNext = &debug.header;
+    }
     ffxDispatchDescDenoiser dispatch {};
     dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER;
     dispatch.header.pNext = &signal.header;
@@ -306,19 +399,10 @@ static int run(int argc, wchar_t** argv)
     dispatch.frameIndex = d.at("frame_index");
     dispatch.flags = d.at("flags");
     checkFfx(ffxDispatch(&context, &dispatch.header), "Dispatch denoiser");
-    barrier(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    auto outputDesc = output->GetDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
-    UINT64 total = 0;
-    device->GetCopyableFootprints(&outputDesc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
-    auto readback = buffer(device.Get(), total, D3D12_HEAP_TYPE_READBACK);
-    D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
-    src.pResource = output.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.pResource = readback.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    const auto readback = copyReadback(device.Get(), list.Get(), output.Get());
+    Readback debugReadback;
+    if (options.debug)
+        debugReadback = copyReadback(device.Get(), list.Get(), debugOutput.Get());
     check(list->Close(), "Close command list");
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create fence");
@@ -337,17 +421,18 @@ static int run(int argc, wchar_t** argv)
     }
     CloseHandle(event);
     fs::create_directories(outputPath);
-    void* mapped = nullptr;
-    D3D12_RANGE range { 0, size_t(total) };
-    check(readback->Map(0, &range, &mapped), "Map readback");
-    std::ofstream result(outputPath / "denoised.rgba16f", std::ios::binary);
-    for (uint32_t y = 0; y < h; ++y)
-        result.write(static_cast<char*>(mapped) + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch, size_t(w) * 8);
-    D3D12_RANGE noWrite { 0, 0 };
-    readback->Unmap(0, &noWrite);
-    result.close();
-    if (!result)
-        throw std::runtime_error("Cannot write denoiser result");
+    writeReadback(readback, outputPath / "denoised.rgba16f", w, h);
+    if (options.debug)
+    {
+        writeReadback(debugReadback, outputPath / "debug.rgba16f", options.debugWidth, options.debugHeight);
+        job["debug_output"] = {
+            { "file", "debug.rgba16f" }, { "format", 10 },
+            { "size", { options.debugWidth, options.debugHeight } },
+            { "bytes", uint64_t(options.debugWidth) * options.debugHeight * 8 },
+            { "mode", options.debugMode }, { "viewport_index", options.viewportIndex },
+            { "meaning", "AMD diagnostic visualization; alpha marks written pixels, not a raw NN/history tensor" }
+        };
+    }
     checkFfx(ffxDestroyContext(&context, nullptr), "Destroy denoiser");
     job["completed"] = true;
     job["output"] = "denoised.rgba16f";

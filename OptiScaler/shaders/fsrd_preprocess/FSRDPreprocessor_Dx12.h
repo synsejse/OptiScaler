@@ -188,7 +188,7 @@ class FSRDPreprocessor_Dx12
      * @brief Copies the contents of the given source texture. Does not automatically set resource barriers.
      */
     bool Blit(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* srcTex, ID3D12Resource* dstTex,
-              DirectX::XMFLOAT2 dim = {}) const;
+              DirectX::XMFLOAT2 dim = {}, bool fullSource = false) const;
 
   private:
     struct Impl;

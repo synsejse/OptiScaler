@@ -442,4 +442,5 @@ CyberFSR/imgui.ini
 /OptiScaler/misc/Telemetry.h
 
 /build-artifacts/
+/progress/
 /tests/__pycache__/

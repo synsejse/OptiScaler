@@ -5,6 +5,7 @@
 #include "FSRDFeature_Dx12.h"
 #include "FSRDDiagnosticPolicy.h"
 #include "shaders/fsrd_preprocess/FSRDPreprocessor_Dx12.h"
+#include "shaders/fsrd_preprocess/FSRDShaderUtils.h"
 #include "MathUtils.h"
 #include "FSRDInputMath.h"
 #include "FSRDInputValidation.h"
@@ -354,6 +355,8 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
 
     state.ffxDenoiserUpscalerVersion = FFXFeature::Version();
     _denoiserVersion.parse_version(state.ffxDenoiserVersionNames[cfg.FfxDenoiserIndex.value_or_default()]);
+    _denoiserProviderId = state.ffxDenoiserVersionIds[cfg.FfxDenoiserIndex.value_or_default()];
+    _denoiserProviderName = state.ffxDenoiserVersionNames[cfg.FfxDenoiserIndex.value_or_default()];
 
     ffxOverrideVersion vidOverride = { .header = { .type = FFX_API_DESC_TYPE_OVERRIDE_VERSION },
                                        .versionId =
@@ -375,10 +378,9 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
                          .mode = FFX_DENOISER_MODE_1_SIGNAL,
                          .flags = 0 };
 
-#ifdef _DEBUG
-    LOG_INFO("Debug checking enabled for denoiser!");
-    _denoiserCtxDesc.flags |= FFX_DENOISER_ENABLE_DEBUGGING;
-#endif
+    // Opt in at context creation only. The GUI never destroys a live GPU context.
+    if (cfg.FfxDenoiserNativeDebug.value_or_default())
+        _denoiserCtxDesc.flags |= FFX_DENOISER_ENABLE_DEBUGGING;
 
     // Create the denoiser context
     {
@@ -421,7 +423,85 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
     if (!FSRDConvShader->SetMaxRenderSize(_denoiserCtxDesc.maxRenderSize.width, _denoiserCtxDesc.maxRenderSize.height))
         return false;
 
+    if ((_denoiserCtxDesc.flags & FFX_DENOISER_ENABLE_DEBUGGING) && !CreateNativeDebugResources())
+        return false;
+    _diagnostics.nativeDebugAvailable.store(_nativeDebugOutput != nullptr);
+
     return true;
+}
+
+bool FSRDFeatureDx12::CreateNativeDebugResources()
+{
+    // Allocate once at context capacity. Resolution/view switches never replace a texture
+    // or descriptor still referenced by queued GPU work. The debug viewport covers this full target.
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = _denoiserCtxDesc.maxRenderSize.width;
+    desc.Height = _denoiserCtxDesc.maxRenderSize.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr auto readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (FAILED(Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, readable, nullptr,
+                                                IID_PPV_ARGS(&_nativeDebugOutput))))
+    {
+        LOG_ERROR("Cannot allocate AMD native debug output");
+        return false;
+    }
+    _nativeDebugOutput->SetName(L"FSR_RR_NativeDebug");
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 1;
+    if (FAILED(Device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&_nativeDebugCpuHeap))))
+        return false;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(Device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&_nativeDebugGpuHeap))))
+        return false;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = desc.Format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    Device->CreateUnorderedAccessView(_nativeDebugOutput.Get(), nullptr, &uav,
+                                      _nativeDebugCpuHeap->GetCPUDescriptorHandleForHeapStart());
+    Device->CreateUnorderedAccessView(_nativeDebugOutput.Get(), nullptr, &uav,
+                                      _nativeDebugGpuHeap->GetCPUDescriptorHandleForHeapStart());
+    return true;
+}
+
+void FSRDFeatureDx12::ClearNativeDebugOutput(ID3D12GraphicsCommandList* commandList)
+{
+    constexpr auto readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    FSRD::AddBarrier(commandList, _nativeDebugOutput.Get(), readable, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[] = { _nativeDebugGpuHeap.Get() };
+    commandList->SetDescriptorHeaps(1, heaps);
+    const float clear[4] = {};
+    commandList->ClearUnorderedAccessViewFloat(_nativeDebugGpuHeap->GetGPUDescriptorHandleForHeapStart(),
+        _nativeDebugCpuHeap->GetCPUDescriptorHandleForHeapStart(), _nativeDebugOutput.Get(), clear, 0, nullptr);
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = _nativeDebugOutput.Get();
+    commandList->ResourceBarrier(1, &barrier);
+}
+
+bool FSRDFeatureDx12::ShowNativeDebugOutput(ID3D12GraphicsCommandList* commandList,
+                                           const NVSDK_NGX_Parameter& parameters)
+{
+    if (!_frameShowNativeDebug)
+        return true;
+    ID3D12Resource* output = nullptr;
+    if (!TryGetNGXVoidPointer(parameters, NVSDK_NGX_Parameter_Output, output))
+        return false;
+    const auto& cfg = *Config::Instance();
+    const auto outputState = cfg.OutputResourceBarrier.has_value()
+        ? D3D12_RESOURCE_STATES(cfg.OutputResourceBarrier.value()) : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    FSRD::AddBarrier(commandList, output, outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const bool success = FSRDConvShader->Blit(commandList, _nativeDebugOutput.Get(), output, {}, true);
+    FSRD::AddBarrier(commandList, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputState);
+    return success;
 }
 
 bool FSRDFeatureDx12::QueryDenoiserVersions()
@@ -657,6 +737,29 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     if (diagnosticPlan.resetDenoiser)
         denoiserDesc.flags |= FFX_DENOISER_DISPATCH_RESET;
 
+    // Capture effective provider settings, not the previous frame's cached values.
+    // Configuration does not alter the converted signal or camera/motion data.
+    if (diagnosticPlan.runDenoiser && !ConfigureDenoiser())
+        return false;
+
+    const uint32_t nativeDebugSelection = _diagnostics.NativeDebugSelection();
+    _frameShowNativeDebug = diagnosticView && diagnosticPlan.runDenoiser && _nativeDebugOutput &&
+                            _diagnostics.ShowNativeDebug();
+    const bool dispatchNativeDebug = diagnosticView && diagnosticPlan.runDenoiser && _nativeDebugOutput &&
+                                     (_frameShowNativeDebug || FSRDResearch::WantsCapture(Handle()->Id));
+    ffxDispatchDescDenoiserDebugView nativeDebugDesc = {};
+    if (dispatchNativeDebug)
+    {
+        nativeDebugDesc.header.type = FFX_API_DISPATCH_DESC_DEBUG_VIEW_TYPE_DENOISER;
+        nativeDebugDesc.output = ffxApiGetResourceDX12(_nativeDebugOutput.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        nativeDebugDesc.outputSize = _denoiserCtxDesc.maxRenderSize;
+        nativeDebugDesc.mode = nativeDebugSelection == 0 ? FFX_API_DENOISER_DEBUG_VIEW_MODE_OVERVIEW
+                                                       : FFX_API_DENOISER_DEBUG_VIEW_MODE_FULLSCREEN_VIEWPORT;
+        nativeDebugDesc.viewportIndex = nativeDebugSelection == 0 ? 0 : nativeDebugSelection - 1;
+        // This is an extension of the SAME denoiser dispatch, not a second evaluation.
+        fusedSignal.header.pNext = &nativeDebugDesc.header;
+    }
+
     FSRDResearch::Capture research;
     bool captureEvaluationSucceeded = false;
     struct CaptureCompletion
@@ -714,7 +817,40 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
                                            ? "cyberpunk_hardware_delta_1000" : "camera_only"},
             {"amd_jitter", {denoiserDesc.jitterOffsets.x, denoiserDesc.jitterOffsets.y}},
             {"amd_motion_scale", {denoiserDesc.motionVectorScale.x, denoiserDesc.motionVectorScale.y,
-                                    denoiserDesc.motionVectorScale.z}}
+                                    denoiserDesc.motionVectorScale.z}},
+            {"amd_dispatch", {
+                {"delta_time_ms", denoiserDesc.deltaTime}, {"frame_index", denoiserDesc.frameIndex},
+                {"flags", denoiserDesc.flags},
+                {"render_size", {denoiserDesc.renderSize.width, denoiserDesc.renderSize.height}},
+                {"motion_scale", {denoiserDesc.motionVectorScale.x, denoiserDesc.motionVectorScale.y,
+                                    denoiserDesc.motionVectorScale.z}},
+                {"jitter", {denoiserDesc.jitterOffsets.x, denoiserDesc.jitterOffsets.y}},
+                {"camera_position_delta", {denoiserDesc.cameraPositionDelta.x, denoiserDesc.cameraPositionDelta.y,
+                                             denoiserDesc.cameraPositionDelta.z}},
+                {"camera_right", {denoiserDesc.cameraRight.x, denoiserDesc.cameraRight.y, denoiserDesc.cameraRight.z}},
+                {"camera_up", {denoiserDesc.cameraUp.x, denoiserDesc.cameraUp.y, denoiserDesc.cameraUp.z}},
+                {"camera_forward", {denoiserDesc.cameraForward.x, denoiserDesc.cameraForward.y,
+                                      denoiserDesc.cameraForward.z}},
+                {"camera_aspect_ratio", denoiserDesc.cameraAspectRatio},
+                {"camera_near", denoiserDesc.cameraNear}, {"camera_far", denoiserDesc.cameraFar},
+                {"camera_fov_vertical", denoiserDesc.cameraFovAngleVertical}
+            }},
+            {"amd_settings", {
+                {"1", _denoiserSettings.crossBilateralNormalStrength}, {"2", _denoiserSettings.stabilityBias},
+                {"3", _denoiserSettings.maxRadiance}, {"4", _denoiserSettings.radianceClipStdK},
+                {"5", _denoiserSettings.gaussianKernelRelaxation}, {"6", _denoiserSettings.disocclusionThreshold}
+            }},
+            {"amd_provider_id", _denoiserProviderId},
+            {"amd_provider_version", _denoiserProviderName},
+            {"amd_context_flags", _denoiserCtxDesc.flags},
+            {"amd_max_render_size", {_denoiserCtxDesc.maxRenderSize.width, _denoiserCtxDesc.maxRenderSize.height}},
+            {"amd_native_debug", {
+                {"context_enabled", (_denoiserCtxDesc.flags & FFX_DENOISER_ENABLE_DEBUGGING) != 0},
+                {"dispatched", dispatchNativeDebug}, {"displayed", _frameShowNativeDebug},
+                {"mode", nativeDebugDesc.mode}, {"viewport_index", nativeDebugDesc.viewportIndex},
+                {"output_size", {nativeDebugDesc.outputSize.width, nativeDebugDesc.outputSize.height}},
+                {"format", "RGBA16_FLOAT; alpha is provider write coverage"}
+            }}
         };
         for (const char* key : { NVSDK_NGX_Parameter_Jitter_Offset_X, NVSDK_NGX_Parameter_Jitter_Offset_Y,
                 NVSDK_NGX_Parameter_MV_Scale_X, NVSDK_NGX_Parameter_MV_Scale_Y, NVSDK_NGX_Parameter_DLSS_Pre_Exposure })
@@ -796,9 +932,19 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         }
         else
         {
+            if (dispatchNativeDebug)
+                ClearNativeDebugOutput(InCommandList);
             FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, true);
             isDenoiserReady = DispatchDenoiser(InCommandList, denoiserDesc);
             FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, false);
+            if (dispatchNativeDebug)
+            {
+                constexpr auto readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                FSRD::AddBarrier(InCommandList, _nativeDebugOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, readable);
+                if (isDenoiserReady)
+                    FSRDResearch::Record(research, "amd_native_debug", _nativeDebugOutput.Get(), true);
+            }
             FSRDResearch::Record(research, "denoised_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.output));
             if (isDenoiserReady && manualDenoiserReset)
             {
@@ -859,6 +1005,11 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             FSRDResearch::RecordOutput(research, output, outputState);
         }
 
+        // Preserve/capture the normal backend result and SR history first. Only an explicit
+        // GUI display request replaces the visible output; raw AMD debug is captured separately.
+        if (isUpscalerReady && !ShowNativeDebugOutput(InCommandList, inParams))
+            return false;
+
         if (isUpscalerReady && isDenoiserReady)
         {
             CommitCameraHistory();
@@ -905,6 +1056,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         if (!FSRDConvShader->Blit(InCommandList, srcTex, dstTex))
             return false;
         FSRDResearch::RecordOutput(research, dstTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (_frameShowNativeDebug && !FSRDConvShader->Blit(InCommandList, _nativeDebugOutput.Get(), dstTex, {}, true))
+            return false;
         if (isDenoiserReady)
         {
             CommitCameraHistory();
@@ -1318,10 +1471,8 @@ bool FSRDFeatureDx12::ConvertDenoiserBuffers(ID3D12GraphicsCommandList* InComman
     return true;
 }
 
-bool FSRDFeatureDx12::DispatchDenoiser(ID3D12GraphicsCommandList* InCommandList,
-                                       const ffxDispatchDescDenoiser& dispatchDesc)
+bool FSRDFeatureDx12::ConfigureDenoiser()
 {
-    auto& state = State::Instance();
     const auto& cfg = *Config::Instance();
 
     const auto Configure = [this](const CustomOptional<float>& cfgValue, float& currentValue,
@@ -1366,6 +1517,13 @@ bool FSRDFeatureDx12::DispatchDenoiser(ID3D12GraphicsCommandList* InCommandList,
                    FFX_API_CONFIGURE_DENOISER_KEY_DISOCCLUSION_THRESHOLD))
         return false;
 
+    return true;
+}
+
+bool FSRDFeatureDx12::DispatchDenoiser(ID3D12GraphicsCommandList* InCommandList,
+                                       const ffxDispatchDescDenoiser& dispatchDesc)
+{
+    auto& state = State::Instance();
     LOG_DEBUG("Dispatching FSR-RR...");
     const ffxReturnCode_t result = FfxApiProxy::D3D12_Dispatch(&_pDenoiserCtx, &dispatchDesc.header);
 

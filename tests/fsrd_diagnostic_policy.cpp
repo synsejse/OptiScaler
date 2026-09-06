@@ -8,6 +8,12 @@ int main()
 {
     Diagnostics controls;
     assert(controls.Options() == 0 && !controls.DenoiserResetPending());
+    assert(!controls.NativeDebugAvailable() && !controls.ShowNativeDebug() && controls.NativeDebugSelection() == 0);
+    controls.SetShowNativeDebug(true);
+    controls.SetNativeDebugSelection(12);
+    assert(controls.ShowNativeDebug() && controls.NativeDebugSelection() == 12 && controls.Options() == 0);
+    controls.SetNativeDebugSelection(13);
+    assert(controls.NativeDebugSelection() == 0);
     assert(controls.LastDiagnosticResetFrame() == Diagnostics::NoDiagnosticFrame);
     controls.SetOptions(IdentityDenoiser | BypassUpscaler);
     controls.RequestDenoiserReset();

@@ -45,6 +45,8 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     feature_version _denoiserVersion {};
     ffxCreateContextDescDenoiser _denoiserCtxDesc;
     DenoiserSettings _denoiserSettings;
+    uint64_t _denoiserProviderId = 0;
+    std::string _denoiserProviderName;
     bool _isInReset;
     uint32_t _captureSamples = 0;
 
@@ -63,6 +65,10 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     double _lastDenoiserFrameTime = 0.0;
     uint32_t _lastRenderWidth = 0;
     uint32_t _lastRenderHeight = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> _nativeDebugOutput;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> _nativeDebugGpuHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> _nativeDebugCpuHeap;
+    bool _frameShowNativeDebug = false;
 
     FSRDConvDesc _convDesc;
     DirectX::XMFLOAT3 _lastCamPos; // Last world space camera position
@@ -90,6 +96,12 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool QueryDenoiserVersions();
 
     bool QueryDefaultDenoiserSettings();
+
+    bool ConfigureDenoiser();
+
+    bool CreateNativeDebugResources();
+    void ClearNativeDebugOutput(ID3D12GraphicsCommandList* commandList);
+    bool ShowNativeDebugOutput(ID3D12GraphicsCommandList* commandList, const NVSDK_NGX_Parameter& parameters);
 
     void DestroyDenoiserContext();
 

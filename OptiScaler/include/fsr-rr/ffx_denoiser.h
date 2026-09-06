@@ -124,6 +124,25 @@ typedef struct ffxDispatchDescDenoiser
     uint32_t                   flags;                       ///< Zero or a combination of values from <c>FfxApiDispatchDenoiserFlags</c>.
 } ffxDispatchDescDenoiser;
 
+// Additive diagnostic extension from the FidelityFX SDK v2.2 / RR 1.1 API.
+// Its output is a visualization, not a raw neural-network tensor/history buffer.
+#define FFX_API_DENOISER_DEBUG_VIEW_MAX_VIEWPORTS 12
+#define FFX_API_DISPATCH_DESC_DEBUG_VIEW_TYPE_DENOISER FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x0c)
+typedef struct ffxDispatchDescDenoiserDebugView
+{
+    ffxDispatchDescHeader header;
+    struct FfxApiResource output;
+    struct FfxApiDimensions2D outputSize;
+    uint32_t mode;
+    uint32_t viewportIndex;
+} ffxDispatchDescDenoiserDebugView;
+
+typedef enum FfxApiDenoiserDebugViewMode
+{
+    FFX_API_DENOISER_DEBUG_VIEW_MODE_OVERVIEW = 0,
+    FFX_API_DENOISER_DEBUG_VIEW_MODE_FULLSCREEN_VIEWPORT = 1,
+} FfxApiDenoiserDebugViewMode;
+
 #define FFX_API_DISPATCH_DESC_INPUT_4_SIGNALS_TYPE_DENOISER FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x03)
 typedef struct ffxDispatchDescDenoiserInput4Signals        ///< Requires FFX_DENOISER_MODE_4_SIGNALS to be set in the create flags.
 {

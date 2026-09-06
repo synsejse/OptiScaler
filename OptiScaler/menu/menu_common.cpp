@@ -2981,6 +2981,36 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                     }
                     if (const auto frame = rr->LastDiagnosticResetFrame(); frame != FSRD::Diagnostics::NoDiagnosticFrame)
                         ImGui::Text("Reset recorded at RR frame %llu", static_cast<unsigned long long>(frame));
+
+                    ImGui::SeparatorText("AMD native diagnostics");
+                    bool nativeDebug = config->FfxDenoiserNativeDebug.value_or_default();
+                    if (ImGui::Checkbox("Enable AMD native debug (restart)", &nativeDebug))
+                        config->FfxDenoiserNativeDebug = nativeDebug;
+                    ShowHelpMarker("Opt-in AMD internal visualization support. Save Settings, then restart the game.\n"
+                                   "Allocates additional GPU memory; no live context is destroyed by this switch.\n"
+                                   "With support active, Dump buffers also saves the selected AMD debug RGBA output.\n"
+                                   "This is a provider-generated visualization, not a dump of private history textures.");
+                    if (nativeDebug != rr->NativeDebugAvailable())
+                        ImGui::TextWrapped("Save Settings and restart the game to apply native debug support.");
+                    ImGui::BeginDisabled(!rr->NativeDebugAvailable() || !testView ||
+                                          (options & FSRD::IdentityDenoiser) || busy);
+                    bool showNative = rr->ShowNativeDebug();
+                    if (ImGui::Checkbox("Show AMD debug view", &showNative))
+                        rr->SetShowNativeDebug(showNative);
+                    ShowHelpMarker("Displays the selected AMD visualization after the normal RR and SR processing.\n"
+                                   "Does not feed debug colors into denoising/upscaling history. Turning this off restores\n"
+                                   "the normal image without resetting either history. Game postprocessing still applies;\n"
+                                   "use the raw amd_native_debug capture for unmodified RGB and alpha coverage.");
+                    const char* nativeViews[] = { "Overview", "Viewport 0", "Viewport 1", "Viewport 2", "Viewport 3",
+                        "Viewport 4", "Viewport 5", "Viewport 6", "Viewport 7", "Viewport 8", "Viewport 9",
+                        "Viewport 10", "Viewport 11" };
+                    int nativeView = static_cast<int>(rr->NativeDebugSelection());
+                    if (ImGui::Combo("AMD viewport", &nativeView, nativeViews, IM_ARRAYSIZE(nativeViews)))
+                        rr->SetNativeDebugSelection(static_cast<uint32_t>(nativeView));
+                    ShowHelpMarker("Start with Overview to identify the provider's labeled panels, then choose a viewport.\n"
+                                   "AMD does not expose named viewport enums; indices are deliberately not guessed.\n"
+                                   "Selections and display are session-only; Debug View must be None or UpscalerBypass.");
+                    ImGui::EndDisabled();
                 }
 
                 if (!state.ffxDenoiserDebugModes.empty())

@@ -98,6 +98,47 @@ class Diagnostics(unittest.TestCase):
         self.assertIn("compDesc.Flags |= (uint32_t) FSRDCompFlags::SkipAlbedoMultiply", FEATURE)
         self.assertIn("compDesc.Flags |= (uint32_t) FSRDCompFlags::SkipResidual", FEATURE)
 
+    def test_native_debug_requires_explicit_context_creation_opt_in(self):
+        create = FEATURE.split("bool FSRDFeatureDx12::CreateDenoiserContext()", 1)[1].split(
+            "bool FSRDFeatureDx12::CreateNativeDebugResources()", 1)[0]
+        self.assertIn("if (cfg.FfxDenoiserNativeDebug.value_or_default())", create)
+        self.assertIn("_denoiserCtxDesc.flags |= FFX_DENOISER_ENABLE_DEBUGGING", create)
+        self.assertNotIn("#ifdef _DEBUG", create)
+        native_menu = MENU.split('ImGui::SeparatorText("AMD native diagnostics")', 1)[1].split(
+            "if (!state.ffxDenoiserDebugModes", 1)[0]
+        self.assertIn("Save Settings and restart the game", native_menu)
+        self.assertNotIn("changeBackend", native_menu)
+        self.assertNotIn("Destroy", native_menu)
+        self.assertIn("std::atomic<bool> showNativeDebug { false }", DIAGNOSTICS)
+
+    def test_native_debug_is_same_dispatch_separate_output_and_full_extent_capture(self):
+        evaluate = FEATURE.split("bool FSRDFeatureDx12::EvaluateInternal(", 1)[1]
+        self.assertIn("fusedSignal.header.pNext = &nativeDebugDesc.header", evaluate)
+        self.assertIn("nativeDebugDesc.outputSize = _denoiserCtxDesc.maxRenderSize", evaluate)
+        self.assertIn('FSRDResearch::Record(research, "amd_native_debug", _nativeDebugOutput.Get(), true)', evaluate)
+        self.assertLess(evaluate.index("ClearNativeDebugOutput(InCommandList)"),
+                        evaluate.index("DispatchDenoiser(InCommandList, denoiserDesc)"))
+        self.assertLess(evaluate.index("FSRDResearch::RecordOutput(research, output, outputState)"),
+                        evaluate.index("ShowNativeDebugOutput(InCommandList, inParams)"))
+        clear = FEATURE.split("void FSRDFeatureDx12::ClearNativeDebugOutput", 1)[1].split(
+            "bool FSRDFeatureDx12::ShowNativeDebugOutput", 1)[0]
+        self.assertIn("ClearUnorderedAccessViewFloat", clear)
+        self.assertIn("const float clear[4] = {}", clear)
+        self.assertIn("D3D12_RESOURCE_BARRIER_TYPE_UAV", clear)
+        self.assertIn("fullSource ? srcDim", COMPOSITOR)
+
+    def test_exact_dispatch_and_effective_provider_settings_are_captured(self):
+        evaluate = FEATURE.split("bool FSRDFeatureDx12::EvaluateInternal(", 1)[1]
+        self.assertLess(evaluate.index("!ConfigureDenoiser()"), evaluate.index("nlohmann::json metadata"))
+        for field in ("amd_dispatch", "delta_time_ms", "frame_index", "flags", "camera_position_delta",
+                      "camera_right", "camera_up", "camera_forward", "camera_aspect_ratio",
+                      "camera_near", "camera_far", "camera_fov_vertical", "amd_settings", "amd_provider_id",
+                      "amd_provider_version", "amd_context_flags", "amd_max_render_size", "amd_native_debug"):
+            self.assertIn(f'{{"{field}"', evaluate)
+        for key, name in enumerate(("crossBilateralNormalStrength", "stabilityBias", "maxRadiance",
+                                    "radianceClipStdK", "gaussianKernelRelaxation", "disocclusionThreshold"), 1):
+            self.assertIn(f'{{"{key}", _denoiserSettings.{name}}}', evaluate)
+
 
 if __name__ == "__main__":
     unittest.main()

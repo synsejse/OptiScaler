@@ -43,9 +43,12 @@ to RGB10, and clears NON_GAMMA_ALBEDO, matching the SDK 2.2 sample's representat
 Radiance/depth/motion/normals do not change. The resulting small albedo quantization
 difference is recorded; this is not an exactly equivalent mathematical input.
 
-Limits: old manifests lack exact frame duration and live tuning settings. The tool
-uses an explicit assumed duration (default 16.667 ms) and records provider defaults.
-Camera delta is reconstructed from float32 matrices. A fresh context with RESET
+New captures with `amd_dispatch` and `amd_settings` replay the recorded camera,
+jitter, frame duration and all six accepted provider settings. `--delta-ms` overrides
+the recorded duration explicitly. Old manifests lack exact frame duration and live
+tuning settings: for them the tool defaults to 16.667 ms, uses provider defaults,
+and reconstructs camera delta from float32 matrices. The result records defaults
+separately from the accepted `effective_settings`. A fresh context with RESET
 is not guaranteed bit-identical to resetting an existing context. Compare the
 linear replay with the captured reset result before drawing conclusions. A single
 frame does not validate temporal quality or moving-object reprojection.
@@ -54,3 +57,45 @@ Reference: AMD FidelityFX SDK 2.2 `Samples/Denoisers/FidelityFX_Denoiser/shaders
 `trace_rays_denoiser.hlsl`, `common.hlsl`, and `denoiser_compose.hlsl`.
 This test deliberately does not subtract guessed fog, split fused radiance into
 invented lobes, or blend raw color back into the denoised result.
+
+## Native AMD diagnostic views
+
+Request the optional provider visualization while preserving the ordinary denoised
+output from the same dispatch:
+
+```sh
+python tools/fsrrr-replay/prepare.py CAPTURE NEW-debug-job --debug-view overview
+python tools/fsrrr-replay/prepare.py CAPTURE NEW-fullscreen-job --debug-view fullscreen --debug-viewport 8
+```
+
+The optional schema-1 job entry is:
+
+```json
+"debug_view": {"mode": "fullscreen", "viewport_index": 8, "output_size": [1280, 720]}
+```
+
+Omit `debug_view` to retain the non-debug context. An empty object requests overview
+at render size; valid viewport indices are 0–11. A request enables
+`FFX_DENOISER_ENABLE_DEBUGGING`, adds a dedicated zero-initialized RGBA16F UAV, and
+chains the SDK debug descriptor into the same RR dispatch. No inputs are replaced.
+`denoised.rgba16f` remains the normal result. `debug.rgba16f` contains tightly packed
+little-endian RGBA FP16; `result.json/debug_output` records its dimensions, bytes,
+mode and viewport. Alpha marks pixels written by AMD; do not treat alpha-zero
+overview borders as meaningful diagnostic values. These are provider-generated
+**visualizations, not raw neural tensors or directly accessible history buffers**.
+Enabling debug can affect performance/memory; compare non-debug and debug denoised
+results before interpreting an apparent difference.
+
+Optional `provider_settings` maps numeric strings `"1"`–`"6"` to finite FP32 values.
+Only requested keys override queried defaults; provider rejection fails the job.
+These keys are AMD's six configuration controls, not DLSS presets. The replay does
+not assume that supplied settings are visually appropriate.
+
+The Windows build runs CPU-only `options_tests.cpp` before compiling the replay.
+Recorded-metadata tests can also run locally without loading a provider:
+
+```sh
+python -m unittest discover -s tools/fsrrr-replay -p 'test_*.py'
+```
+
+Pinned [AMD diagnostic API and sample](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.2.0/Kits/FidelityFX/docs/techniques/denoising.md#debug-view).
