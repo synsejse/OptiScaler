@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "FSRDResearchCapture.h"
+#include <DirectXMath.h>
 #include "shaders/fsrd_preprocess/FSRDShaderUtils.h"
 #include "resource_tracking/ResTrack_dx12.h"
 #include "Util.h"
@@ -120,10 +121,9 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
         auto batch = std::make_shared<Batch>();
         batch->device = device;
         batch->list = list;
-        batch->submittedList = list;
-        IUnknown* realList = nullptr;
-        if (ResTrack_Dx12::CheckForRealObject("FSRRR research", list, &realList))
-            batch->submittedList = static_cast<ID3D12CommandList*>(realList);
+        batch->submittedList = ResTrack_Dx12::PrepareResearchSubmission(device, list);
+        if (!batch->submittedList)
+            throw std::runtime_error("research submission hook unavailable");
         batch->width = width;
         batch->height = height;
         batch->metadata = Json::parse(metadata);
@@ -154,8 +154,6 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
         batch->scratch = Buffer(device, UINT64(width) * height * 16, D3D12_HEAP_TYPE_DEFAULT);
         FSRD::ThrowIfFailed(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch->fence)),
                             "research fence failed");
-        // Ensure ExecuteCommandLists is intercepted even when frame generation is disabled.
-        ResTrack_Dx12::HookToQueue(device);
         registry.pending.push_back(batch);
         hasCaptures.store(true, std::memory_order_release);
         ++registry.count;

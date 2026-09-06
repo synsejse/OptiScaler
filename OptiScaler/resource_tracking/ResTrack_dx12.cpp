@@ -629,6 +629,15 @@ void ResTrack_Dx12::hkCreateUnorderedAccessView(ID3D12Device* This, ID3D12Resour
 
 #pragma endregion
 
+ID3D12CommandList* ResTrack_Dx12::PrepareResearchSubmission(ID3D12Device* device, ID3D12CommandList* list)
+{
+    HookToQueue(device);
+    if (o_ExecuteCommandLists == nullptr)
+        return nullptr;
+    IUnknown* real = nullptr;
+    return CheckForRealObject("FSRRR research", list, &real) ? static_cast<ID3D12CommandList*>(real) : list;
+}
+
 void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists,
                                           ID3D12CommandList* const* ppCommandLists)
 {

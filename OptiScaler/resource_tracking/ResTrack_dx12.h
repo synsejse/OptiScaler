@@ -480,6 +480,10 @@ struct alignas(CACHE_LINE_SIZE) CommandListShard
 
 class ResTrack_Dx12
 {
+  public:
+    // Opt-in research: enable queue observation and resolve Streamline's submitted command-list identity.
+    static ID3D12CommandList* PrepareResearchSubmission(ID3D12Device* device, ID3D12CommandList* list);
+
   private:
     inline static bool _presentDone = true;
     inline static std::mutex _drawMutex;
