@@ -81,6 +81,30 @@ class RRContracts(unittest.TestCase):
         self.assertNotIn("Defaulting to packed roughness", source)
         self.assertIn("_convDesc.Resources = {}", source)
 
+    def test_ambiguous_r16_non_depth_inputs_are_rejected_before_conversion(self):
+        header = (ROOT / "OptiScaler/upscalers/ffx/FSRDInputValidation.h").read_text()
+        self.assertIn("return hardwareDepth || format != DXGI_FORMAT_R16_TYPELESS", header)
+        for format_name in ("R16_FLOAT", "R16_UNORM", "R32_FLOAT"):
+            self.assertIn(f"static_assert(HasUnambiguousInputView(DXGI_FORMAT_{format_name}, false))", header)
+        self.assertIn("static_assert(!HasUnambiguousInputView(DXGI_FORMAT_R16_TYPELESS, false))", header)
+        self.assertIn("static_assert(HasUnambiguousInputView(DXGI_FORMAT_R16_TYPELESS, true))", header)
+        inputs = header.split("const InputBinding inputs[]", 1)[1].split("};", 1)[0]
+        for key in ("Color", "MotionVectors", "GBuffer_Normals", "GBuffer_Roughness", "DiffuseAlbedo",
+                    "SpecularAlbedo", "DLSSD_SpecularHitDistance"):
+            self.assertIn(f"NVSDK_NGX_Parameter_{key}", inputs)
+        self.assertIn("{ NVSDK_NGX_Parameter_Depth, true, hardwareDepth }", inputs)
+        self.assertIn("{ NVSDK_NGX_Parameter_GBuffer_Roughness, !packedRoughness, false }", inputs)
+        self.assertIn("if (!input.consumed)", header)
+        self.assertIn("!HasUnambiguousInputView(resource->GetDesc().Format, input.hardwareDepth)", header)
+        self.assertIn("parameters.Get(key, reinterpret_cast<void**>(&resource))", header)
+        # The depth interpretation is deliberately unchanged, not globally switched to FLOAT.
+        utils = (SHADERS / "FSRDShaderUtils.h").read_text()
+        self.assertRegex(utils, r"case DXGI_FORMAT_R16_TYPELESS:\s*return DXGI_FORMAT_R16_UNORM;")
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
+        evaluate = source.split("bool FSRDFeatureDx12::EvaluateInternal", 1)[1].split(
+            "bool FSRDFeatureDx12::PrepareDenoiserInput", 1)[0]
+        self.assertLess(evaluate.index("ValidateInputContract"), evaluate.index("PrepareDenoiserInput(InCommandList"))
+
     def test_sample_jitter_convention_is_preserved(self):
         source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
         self.assertIn("2.0f * (jitterX / RenderWidth())", source)

@@ -3,8 +3,13 @@
 #include <d3dx/d3dx12.h>
 #include <shaders/Shader_Dx12Utils.h>
 #include <shaders/Shader_Dx12.h>
+#include <memory>
+#include <vector>
 
-#define BIAS_NUM_OF_HEAPS 2
+namespace FSRDSubmission
+{
+struct Ticket;
+}
 
 class Bias_Dx12 : public Shader_Dx12
 {
@@ -14,7 +19,15 @@ class Bias_Dx12 : public Shader_Dx12
         float Bias;
     };
 
-    FrameDescriptorHeap _frameHeaps[BIAS_NUM_OF_HEAPS];
+    struct DispatchStorage;
+    struct DispatchSlot
+    {
+        std::shared_ptr<DispatchStorage> storage;
+        std::shared_ptr<FSRDSubmission::Ticket> ticket;
+    };
+    std::vector<DispatchSlot> _dispatchSlots;
+
+    std::shared_ptr<DispatchStorage> AcquireDispatchStorage(ID3D12GraphicsCommandList* commandList);
 
     ID3D12Resource* _buffer = nullptr;
     D3D12_RESOURCE_STATES _bufferState = D3D12_RESOURCE_STATE_COMMON;

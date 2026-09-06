@@ -571,7 +571,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     auto& cfg = *Config::Instance();
     const auto& inParams = *InParameters;
 
-    if (!FSRD::ValidateInputContract(inParams, cfg, state))
+    if (!FSRD::ValidateInputContract(inParams, cfg, state, _isHWDepth, _isRoughnessPacked))
     {
         _hasCameraHistory = false;
         return false;

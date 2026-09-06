@@ -15,6 +15,7 @@ This remains a Cyberpunk-oriented adapter, not a lossless translation of every N
 - Skipped pixels initialize motion explicitly. Composition has its own exact-render-size output, so SR auto-exposure cannot scan unused display-capacity padding. Replacing that output during quality changes retains recorded GPU references through completion. Invalid camera input also invalidates temporal history before resuming.
 - Cyberpunk's authored depth motion is decoded from its verified extra Z/W channels using the previous projection; see [producer evidence and limits](FSR_RR_MOTION.md). Other integrations retain the documented camera-only path. Motion scales default independently and nonfinite scalar inputs are rejected.
 - RR and SR provider versions are tracked separately; the RR version must not disable the inherited SR provider's format/exposure handling.
+- The inherited SR reactive-mask bias pass also retains per-dispatch descriptors, constants and textures until GPU completion, and preserves texture state on buffer reuse. Its mask arithmetic is unchanged. These are independent correctness fixes, not a proven explanation of the observed benchmark-exit fault.
 
 ## What fused lighting means
 
@@ -29,6 +30,8 @@ After denoising, composition multiplies the result by that same albedo. This dem
 Genuinely separate signals can retain information that was lost when the renderer combined them. That would require real diffuse/specular lighting from the engine, not an albedo-based estimate. For example, the same material can be mostly diffuse-lit in one situation and mostly reflecting a bright light in another. The removed split could not distinguish those cases; algebraically its two demodulated outputs collapsed to the same lighting value. We do not trade input correctness for an assumed performance or quality benefit.
 
 ## Remaining limitations
+
+Ambiguous `R16_TYPELESS` non-hardware-depth inputs are rejected: their resource format does not establish whether the shader should read FP16 or UNORM. Typed `R16_FLOAT` remains accepted, and hardware-depth `R16_TYPELESS` retains its defined UNORM interpretation. An unused separate roughness texture is not inspected in packed-roughness mode.
 
 World-space normals and origin-zero, single-sample render-resolution resources are expected. Unsupported subrects, jittered/high-resolution motion layouts and late input-barrier configurations are rejected rather than silently misinterpreted. Standard 2D NGX motion does not supply independent object motion along Z outside the verified Cyberpunk path. RGB10A2 guide/normal and FP16 radiance/hit-distance storage still introduce quantization; arbitrarily large FP32 source values cannot be represented. This is not lossless or equivalent to native engine integration. The inherited FFX upscaler still handles the bias mask; before-particles color is capture/debug-only because no exact RR 1.1 mapping is established. Other games, moving-object reprojection and final visual quality require runtime validation; these changes do not by themselves establish the cause of earlier GPU faults.
 
