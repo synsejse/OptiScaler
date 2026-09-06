@@ -2,6 +2,23 @@
 
 This follows the [original capture research](FSR_RR_RESEARCH_RESULTS.md). The work is on `research/fsr-rr-fidelity`. Production changes, builds and runtime evidence are separated below; successful arithmetic tests alone do not establish temporal image quality or GPU stability.
 
+## User visual pass: unresolved lighting regression
+
+The subsequent user pass with `d398f06f` reports incorrect atmospheric/shadow appearance and strong surface-detail outlines. Normal rendering, `FusedLighting` and `UpscalerBypass` show the problem; `DenoiserBypass` looks correct. **Visual acceptance has failed; the runtime/round-trip results below do not establish that this implementation is finished.**
+
+The code distinguishes these views as follows:
+
+- `DenoiserBypass` upscales the original game color without AMD denoising or our lighting composition.
+- `UpscalerBypass` shows AMD denoising plus normal composition, without temporal upscaling. This localizes the reported problem upstream of SR.
+- `FusedLighting` shows denoised demodulated radiance multiplied by the fused material albedo, without `SkipSignal`.
+- `DenoiserOutput` displays demodulated radiance directly. Its apparent smoothness is not evidence that remodulated lighting, fog or shadows are correct. Sky pixels may be black in either of the last two views because they are carried separately in `SkipSignal`.
+
+`SkipSignal` currently preserves invalid-surface color and signed numerical residual, not an independently supplied fog/emissive/ambient layer. AMD SDK 2.2's sample demodulates surface lighting and keeps primary emission separate. Applying this model to an already-combined game color is a possible semantic mismatch; the reported scene has not yet been captured, so it is **not a confirmed diagnosis of missing fog**. Shadow filtering, guide/history interpretation and engine composition remain alternatives. Do not restore an estimated lighting floor, infer a diffuse/specular split, or silently blend raw brightness into the result.
+
+Reinspection of existing frame 7860 confirms input color alpha is exactly one throughout. The optional `ColorBeforeParticles` buffer instead has alpha in `[0, 0.9296875]`; 40.61% of pixels have zero alpha and exactly zero RGB. Its RGB is not a full-scene before-particles snapshot in this capture. It is consistent with an auxiliary layer, but its producer, exposure and blend relationship to the main color are not authenticated. In particular, main-color minus auxiliary RGB reaches `-0.5264892578125`; blindly subtracting/clamping it is not justified. Reading the installed fog shader in isolation does not prove that it produced this particular resource.
+
+The installed DLL has not been replaced for this investigation. The current INI and a snapshot of the user-pass log were backed up to `/home/synse/Games/Heroic/cyberpunk-fsrrr-visual-20260906.wy3sSY`. `ResearchCapture=true` was then enabled for the next launch; no capture request was placed, so this will not automatically capture a loading screen. Next evidence needed: a triggered normal-mode capture at the reported location, including raw color, guides, demodulated input/output, residual and composed output. The user controls the next game launch; the running process was left untouched.
+
 ## Correctness changes
 
 - Removed the estimated raster-light floor, diffuse-plus-specular energy correction and raw-brightness correlation blend. AMD receives native fused lighting with separate, preserved material guides. No invented diffuse/specular lighting split was reintroduced.

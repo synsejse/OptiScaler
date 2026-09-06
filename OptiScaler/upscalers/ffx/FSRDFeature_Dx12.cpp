@@ -577,8 +577,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         return false;
     }
 
-    if (cfg.FfxDenoiserResearchCapture.value_or_default())
-        FSRDResearch::Poll();
+    FSRDResearch::Poll();
 
     if (!UpdateSize(InParameters))
     {
@@ -637,7 +636,14 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     }
 
     FSRDResearch::Capture research;
-    if (cfg.FfxDenoiserResearchCapture.value_or_default())
+    bool captureEvaluationSucceeded = false;
+    struct CaptureCompletion
+    {
+        const FSRDResearch::Capture& capture;
+        const bool& succeeded;
+        ~CaptureCompletion() { FSRDResearch::Finish(capture, succeeded); }
+    } captureCompletion { research, captureEvaluationSucceeded };
+    if (FSRDResearch::WantsCapture(Handle()->Id))
     {
         auto matrix = [](const XMFLOAT4X4& value)
         {
@@ -650,6 +656,10 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         XMStoreFloat4x4(&previousProjection, XMMatrixTranspose(_prevProjMatrix));
         nlohmann::json metadata = {
             {"render_size", {RenderWidth(), RenderHeight()}},
+            {"display_size", {DisplayWidth(), DisplayHeight()}},
+            {"debug_mode", uint64_t(dbgMode)},
+            {"denoiser_bypassed", isDenoiseBypassed}, {"upscaler_bypassed", isUpscaleBypassed},
+            {"output_stage", "backend output before OptiScaler sharpening/output scaling/overlay"},
             {"reset", _isInReset}, {"hw_depth", _isHWDepth}, {"inverted_depth", DepthInverted()},
             {"packed_roughness", _isRoughnessPacked},
             {"pipeline", "pure_fused"},
@@ -696,14 +706,25 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
                 {"input_specular_direction", NVSDK_NGX_Parameter_DLSSD_SpecularRayDirection},
                 {"input_specular_direction_hit", NVSDK_NGX_Parameter_DLSSD_SpecularRayDirectionHitDistance},
                 {"input_diffuse_direction_hit", NVSDK_NGX_Parameter_DLSSD_DiffuseRayDirectionHitDistance},
+                {"input_diffuse_direction", NVSDK_NGX_Parameter_DLSSD_DiffuseRayDirection},
                 {"input_reflected_albedo", NVSDK_NGX_Parameter_DLSSD_ReflectedAlbedo},
                 {"input_before_particles", NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles},
+                {"input_after_particles", NVSDK_NGX_Parameter_DLSSD_ColorAfterParticles},
                 {"input_before_transparency", NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency},
                 {"input_after_transparency", NVSDK_NGX_Parameter_DLSSD_ColorAfterTransparency},
                 {"input_before_fog", NVSDK_NGX_Parameter_DLSSD_ColorBeforeFog},
+                {"input_after_fog", NVSDK_NGX_Parameter_DLSSD_ColorAfterFog},
+                {"input_sss_guide", NVSDK_NGX_Parameter_DLSSD_ScreenSpaceSubsurfaceScatteringGuide},
                 {"input_before_sss", NVSDK_NGX_Parameter_DLSSD_ColorBeforeScreenSpaceSubsurfaceScattering},
+                {"input_after_sss", NVSDK_NGX_Parameter_DLSSD_ColorAfterScreenSpaceSubsurfaceScattering},
+                {"input_refraction_guide", NVSDK_NGX_Parameter_DLSSD_ScreenSpaceRefractionGuide},
                 {"input_before_refraction", NVSDK_NGX_Parameter_DLSSD_ColorBeforeScreenSpaceRefraction},
+                {"input_after_refraction", NVSDK_NGX_Parameter_DLSSD_ColorAfterScreenSpaceRefraction},
+                {"input_dof_guide", NVSDK_NGX_Parameter_DLSSD_DepthOfFieldGuide},
                 {"input_before_dof", NVSDK_NGX_Parameter_DLSSD_ColorBeforeDepthOfField},
+                {"input_after_dof", NVSDK_NGX_Parameter_DLSSD_ColorAfterDepthOfField},
+                {"input_alpha", NVSDK_NGX_Parameter_DLSSD_Alpha},
+                {"input_emissive", NVSDK_NGX_Parameter_GBuffer_Emissive},
                 {"input_transparency", NVSDK_NGX_Parameter_DLSS_TransparencyLayer},
                 {"input_transparency_opacity", NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity},
                 {"input_transparency_motion", NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs},
@@ -753,7 +774,11 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         isDenoiserReady = true;
     }
     else
+    {
         _hasCameraHistory = false; // Resuming after a debug bypass must reset stale denoiser history.
+        FSRDResearch::Record(research, "denoised_radiance", nullptr);
+        FSRDResearch::Record(research, "composed_color", nullptr);
+    }
 
     // Upscaler start
     if (!isUpscaleBypassed)
@@ -769,10 +794,20 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
 
         _upscaleColorOverride = nullptr;
 
+        if (research && isUpscalerReady)
+        {
+            ID3D12Resource* output = nullptr;
+            TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Output, output);
+            const auto outputState = cfg.OutputResourceBarrier.has_value()
+                ? D3D12_RESOURCE_STATES(cfg.OutputResourceBarrier.value()) : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            FSRDResearch::RecordOutput(research, output, outputState);
+        }
+
         if (isUpscalerReady && isDenoiserReady)
             CommitCameraHistory();
 
         // _frameCount is incremented by the base implementation
+        captureEvaluationSucceeded = isUpscalerReady;
         return isUpscalerReady;
     }
     else // Debug visualization
@@ -804,12 +839,14 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
 
         if (!FSRDConvShader->Blit(InCommandList, srcTex, dstTex))
             return false;
+        FSRDResearch::RecordOutput(research, dstTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (isDenoiserReady)
             CommitCameraHistory();
     }
 
     _frameCount++;
-    return isDenoiserReady || isDenoiseBypassed;
+    captureEvaluationSucceeded = isDenoiserReady || isDenoiseBypassed;
+    return captureEvaluationSucceeded;
 }
 
 bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandList,

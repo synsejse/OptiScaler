@@ -18,6 +18,7 @@
 #include <version_check.h>
 
 #include <upscaler_time/UpscalerTime_Vk.h>
+#include <upscalers/ffx/FSRDResearchCapture.h>
 
 #include <imgui/imgui_internal.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -2818,6 +2819,8 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         }
 
         // FSR Ray Regeneration -----------------
+        // Finish submitted dumps even after switching backend or closing the advanced panel.
+        FSRDResearch::Poll();
         if (currentBackend == Upscaler::FSRD)
         {
             if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())
@@ -2852,6 +2855,33 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                     config->FfxDenoiserGaussKernRelax = v;
 
                 ImGui::SeparatorText("Debug");
+
+                const auto dumpStatus = FSRDResearch::GetStatus();
+                ImGui::BeginDisabled(dumpStatus.busy || !currentFeature || !currentFeature->Handle());
+                if (ImGui::Button("Dump buffers"))
+                    FSRDResearch::Request(currentFeature->Handle()->Id);
+                ImGui::EndDisabled();
+                ShowHelpMarker("Dumps the next frame's available FSR-RR inputs, intermediate buffers and backend output.\n"
+                               "Writes HDR/alpha-preserving RGBA32F .f32 files and manifest.json to a timestamped\n"
+                               "FSRRR-captures folder beside the game executable. No INI change or restart needed.\n"
+                               "Use Debug View = None for the complete processing chain; bypassed stages are not produced.\n"
+                               "Can cause a brief stutter. Limit: 512 MiB/frame; skipped buffers are listed in the manifest.\n"
+                               "This does not capture private AMD internals or unrelated game render targets.");
+                if (dumpStatus.queued)
+                {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel dump"))
+                        FSRDResearch::CancelRequest();
+                }
+                if (!dumpStatus.message.empty())
+                    ImGui::TextWrapped("%s", dumpStatus.message.c_str());
+                if (!dumpStatus.directory.empty())
+                {
+                    if (ImGui::SmallButton("Copy dump folder"))
+                        ImGui::SetClipboardText(dumpStatus.directory.c_str());
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", dumpStatus.directory.c_str());
+                }
 
                 if (!state.ffxDenoiserDebugModes.empty())
                 {
