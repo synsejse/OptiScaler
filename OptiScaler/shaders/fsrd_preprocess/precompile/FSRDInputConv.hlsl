@@ -22,6 +22,7 @@ static const uint2 s_ThreadGroupSize = uint2(THREAD_GROUP_SIZE_X, THREAD_GROUP_S
 #define FLAGS_IS_RIGHT_HANDED           (1 << 4)
 #define FLAGS_CYBERPUNK_DEPTH_MOTION     (1 << 5)
 #define FLAGS_RESET_MOTION_HISTORY      (1 << 6)
+#define FLAGS_SKIP_ALBEDO_DIVIDE         (1 << 7)
 
 // Debug Flags
 #define FLAGS_DEBUG                     (1 << 16)
@@ -221,11 +222,15 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         float4 fusedAlbedo = float4(max(1e-3f, max(specReflectance.rgb, diffAlbedo.rgb)), 0.0f);
         fusedAlbedo.rgb = round(fusedAlbedo.rgb * 1023.0f) / 1023.0f;
         // Explicit FP16 rounding makes the residual agree with the actually stored signal.
-        const float3 demodColor = f16tof32(f32tof16(clamp(rawColor / fusedAlbedo.rgb, 0.0f, 65504.0f)));
+        const float3 signalColor = IsSet(FLAGS_SKIP_ALBEDO_DIVIDE) ? rawColor : rawColor / fusedAlbedo.rgb;
+        const float3 demodColor = f16tof32(f32tof16(clamp(signalColor, 0.0f, 65504.0f)));
 
         // This is a numerical remainder, not a guessed lighting separation. Signed residuals
         // preserve finite negative source values, demodulation overflow and rounding overshoot.
-        const float3 preservedLighting = rawColor - (demodColor * fusedAlbedo.rgb);
+        // Keep the remainder in the selected input convention. It must not undo
+        // a diagnostic multiply switch or smuggle a guessed lighting layer back in.
+        const float3 restoredColor = IsSet(FLAGS_SKIP_ALBEDO_DIVIDE) ? demodColor : demodColor * fusedAlbedo.rgb;
+        const float3 preservedLighting = rawColor - restoredColor;
 
         [branch]
         if (!IsSet(FLAGS_NON_GAMMA_ALBEDO))

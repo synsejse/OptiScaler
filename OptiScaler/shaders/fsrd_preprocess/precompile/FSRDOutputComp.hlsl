@@ -17,6 +17,8 @@
 
 #define FLAGS_RAW_SOURCE_BLIT (1 << 0)
 #define FLAGS_SCALE_SRC (1 << 1)
+#define FLAGS_SKIP_ALBEDO_MULTIPLY (1 << 2)
+#define FLAGS_SKIP_RESIDUAL (1 << 3)
 #define FLAGS_DEBUG (1 << 16)
 #define FLAGS_DEBUG_MODE_MASK (0xFF << 16)
 #define FLAGS_DEBUG_SKIP_SIGNAL (2 << 17 | FLAGS_DEBUG)
@@ -67,8 +69,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     }
 
     const float3 denoisedRadiance = InDenoisedRadiance[px].rgb;
-    const float3 denoisedColor = denoisedRadiance * InFusedAlbedo[px].rgb;
-    const float3 preservedLighting = InSkipSignal[px].rgb;
+    const float3 denoisedColor = IsSet(FLAGS_SKIP_ALBEDO_MULTIPLY)
+        ? denoisedRadiance : denoisedRadiance * InFusedAlbedo[px].rgb;
+    const float3 preservedLighting = IsSet(FLAGS_SKIP_RESIDUAL) ? float3(0, 0, 0) : InSkipSignal[px].rgb;
 
     [branch]
     if (IsSet(FLAGS_DEBUG))
@@ -88,7 +91,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // Native fused composition. Do not mix raw brightness back into the denoiser result,
-    // invent a particle layer, or clamp finite source values carried by the signed residual.
-    OutColor[px] = float4(denoisedColor + preservedLighting, 1.0f);
+    float3 composedColor = denoisedColor + preservedLighting;
+    // The deliberately mismatched lighting + residual diagnostic can exceed FP16.
+    // Keep that test from feeding infinities into SR; normal composition is unchanged.
+    if (IsSet(FLAGS_SKIP_ALBEDO_MULTIPLY))
+        composedColor = clamp(composedColor, -65504.0f, 65504.0f);
+    OutColor[px] = float4(composedColor, 1.0f);
 }

@@ -19,6 +19,28 @@ if np is not None:
 
 @unittest.skipIf(np is None, "NumPy not installed")
 class NativePacking(unittest.TestCase):
+    def test_comparison_honors_captured_composition_switches(self):
+        try:
+            import PIL
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        spec = importlib.util.spec_from_file_location("compare_replay", Path(__file__).resolve().parents[1] /
+                                                    "tools/fsrrr-replay/compare.py")
+        comparison = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(comparison)
+        signal = np.array([[[8., 4., 2., 10.]]])
+        albedo = np.array([[[.5, .25, .125]]])
+        residual = np.array([[[.5, -.25, 1.]]])
+        for multiply in (False, True):
+            for add in (False, True):
+                meta = {"albedo_multiply": multiply, "add_residual": add}
+                expected = signal[..., :3] * albedo if multiply else signal[..., :3]
+                if add:
+                    expected = expected + residual
+                np.testing.assert_array_equal(comparison.compose(signal, albedo, residual, meta), expected)
+        np.testing.assert_array_equal(comparison.compose(signal, albedo, residual, {}),
+                                      signal[..., :3] * albedo + residual)
+
     def test_every_unorm_code(self):
         codes = np.arange(1024, dtype=np.float32)
         values = np.stack((codes / 1023, codes[::-1] / 1023, codes / 1023, (codes % 4) / 3), -1)[None]

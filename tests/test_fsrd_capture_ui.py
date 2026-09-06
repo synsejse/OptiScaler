@@ -10,7 +10,7 @@ MENU = (ROOT / "OptiScaler/menu/menu_common.cpp").read_text(encoding="utf-8-sig"
 
 class CaptureUI(unittest.TestCase):
     def test_button_targets_selected_feature_without_modifying_configuration(self):
-        menu = MENU.split('ImGui::SeparatorText("Debug")', 1)[1].split("if (!state.ffxDenoiserDebugModes", 1)[0]
+        menu = MENU.split('ImGui::SeparatorText("Debug")', 1)[1].split("if (auto* rr =", 1)[0]
         self.assertIn('ImGui::Button("Dump buffers")', menu)
         self.assertIn("FSRDResearch::Request(currentFeature->Handle()->Id)", menu)
         self.assertIn("dumpStatus.busy", menu)

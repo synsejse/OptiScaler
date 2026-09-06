@@ -30,6 +30,7 @@ class FSRDPreprocessor_Dx12
         IsRightHanded = 1 << 4,     // Visible view-space positions have negative Z
         CyberpunkDepthMotion = 1 << 5, // Verified game-specific hardware-depth motion in Z, not NGX MVScale.Z
         ResetMotionHistory = 1 << 6, // No previous-frame depth correspondence is available
+        SkipAlbedoDivide = 1 << 7, // Diagnostic only; material guides remain unchanged
 
         Debug = 1 << 16, // Denoiser and upscaler bypassed for debug out if this is set
         DebugModeMask = 0xFF << 16,
@@ -62,6 +63,8 @@ class FSRDPreprocessor_Dx12
         None = 0,
         RawSourceBlit = 1 << 0, // Bypass composition and write unmodified input
         ScaleSrc = 1 << 1,      // Enable bilinear scaling to output
+        SkipAlbedoMultiply = 1 << 2, // Diagnostic only
+        SkipResidual = 1 << 3,       // Diagnostic only
 
         Debug = 1 << 16,
         DebugModeMask = 0xFF << 16,

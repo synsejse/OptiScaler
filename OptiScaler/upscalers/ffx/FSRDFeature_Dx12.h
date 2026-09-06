@@ -52,7 +52,11 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool _isRoughnessPacked = false;
     bool _hasCameraHistory = false;
     bool _hasDenoiserHistory = false;
-    bool _identityWasActive = false;
+    bool _hasUpscalerHistory = false;
+    uint32_t _frameDiagnosticOptions = 0;
+    uint64_t _frameDebugMode = 0;
+    uint32_t _lastDenoiserOptions = 0;
+    uint32_t _lastUpscalerOptions = 0;
     bool _diagnosticUpscaleReset = false;
     FSRD::Diagnostics _diagnostics;
     bool _loggedCyberpunkDepthMotion = false;

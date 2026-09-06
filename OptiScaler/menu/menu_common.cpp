@@ -2886,29 +2886,95 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
 
                 if (auto* rr = currentFeature ? currentFeature->GetFsrRRDiagnostics() : nullptr)
                 {
-                    const bool normalView = config->FfxDenoiserDebugMode.value_or_default() == 0;
-                    bool identity = rr->IdentityDenoiserRequested();
-                    ImGui::BeginDisabled(!normalView || rr->DenoiserResetPending() || dumpStatus.busy);
-                    if (ImGui::Checkbox("Identity denoiser (diagnostic)", &identity))
-                        rr->SetIdentityDenoiser(identity);
+                    ImGui::SeparatorText("Albedo pipeline tests (session only)");
+                    uint32_t options = rr->Options();
+                    uint64_t view = config->FfxDenoiserDebugMode.value_or_default();
+                    const bool busy = rr->DenoiserResetPending() || dumpStatus.busy;
+                    const auto preset = [&](const char* label, uint32_t value)
+                    {
+                        if (ImGui::Button(label))
+                        {
+                            options = value;
+                            view = 0;
+                            config->FfxDenoiserDebugMode.set_volatile_value(view);
+                        }
+                    };
+                    ImGui::BeginDisabled(busy);
+                    preset("Normal / reset tests", 0);
+                    ImGui::SameLine();
+                    preset("Identity", FSRD::IdentityDenoiser);
+                    preset("No albedo round-trip", FSRD::SkipAlbedoDivide | FSRD::SkipAlbedoMultiply);
+                    ImGui::SameLine();
+                    preset("Lighting only", FSRD::SkipAlbedoMultiply | FSRD::SkipResidual);
+                    if (ImGui::Button("Original color + SR"))
+                    {
+                        options = 0;
+                        view = 1; // DenoiserBypass: unconverted game color through SR.
+                        config->FfxDenoiserDebugMode.set_volatile_value(view);
+                    }
                     ImGui::EndDisabled();
-                    ShowHelpMarker("Session-only test, active only with Debug View = None.\n"
-                                   "Skips AMD filtering but keeps input conversion, the normal composition shader,\n"
-                                   "upscaling and postprocessing. Noisy output is expected; this is not a quality fix.\n"
-                                   "Switching modes resets SR once. Returning to AMD also resets its stale history.\n"
-                                   "Use Dump buffers after the new mode has settled.");
+                    ShowHelpMarker("Presets change all five switches together and select the appropriate view.\n"
+                                   "Normal restores the standard pipeline, not your other FSR tuning settings.\n"
+                                   "Original color + SR is the existing denoiser-bypass reference.");
 
-                    ImGui::BeginDisabled(!normalView || identity || rr->DenoiserResetPending() || dumpStatus.busy);
+                    const bool testView = view == 0 || view == 2; // None or UpscalerBypass
+                    const auto stage = [&](const char* label, uint32_t skipBit, const char* help, bool forcedOff = false)
+                    {
+                        bool enabled = !forcedOff && (options & skipBit) == 0;
+                        if (ImGui::Checkbox(label, &enabled))
+                            options = enabled ? options & ~skipBit : options | skipBit;
+                        ShowHelpMarker(help);
+                    };
+                    ImGui::BeginDisabled(!testView || busy);
+                    stage("Divide input by fused albedo", FSRD::SkipAlbedoDivide,
+                          "Off feeds combined color to AMD without dividing. Material guides, normals,\n"
+                          "motion and hit distance stay unchanged. This is a diagnostic contract violation, not a fix.\n"
+                          "The numerical residual follows the selected input convention.");
+                    stage("AMD denoising", FSRD::IdentityDenoiser,
+                          "Off is identity: the SAME compositor reads converted input instead of AMD output.\n"
+                          "Works with temporal upscaling on or off, including Debug View = UpscalerBypass.");
+                    stage("Multiply output by fused albedo", FSRD::SkipAlbedoMultiply,
+                          "Off displays lighting without albedo remodulation. Brightness is not final-color units\n"
+                          "when the input was divided. No guide replacement or automatic compensation is applied.\n"
+                          "This diagnostic clamps at the FP16 limit to avoid infinities in SR.");
+                    stage("Add numerical residual", FSRD::SkipResidual,
+                          "Adds the conversion's rounding/overflow remainder. This is NOT a separated fog layer.\n"
+                          "Disable it with multiply-back off to inspect the lighting signal alone.");
+                    ImGui::BeginDisabled(view == 2);
+                    stage("Temporal upscaling", FSRD::BypassUpscaler,
+                          "Off uses bilinear enlargement of the composed result. This isolates SR without\n"
+                          "changing the other switches. OptiScaler postprocessing and game postprocessing still apply.\n"
+                          "Debug View = UpscalerBypass forces SR off; choose Normal to return to this switch.", view == 2);
+                    ImGui::EndDisabled();
+                    ImGui::EndDisabled();
+                    rr->SetOptions(options);
+                    if (!testView)
+                        ImGui::TextWrapped("Stage switches inactive in this Debug View. Choose a preset to resume testing.");
+                    else
+                    {
+                        ImGui::Text("Divide %s | AMD %s | Multiply %s | Residual %s | SR %s",
+                            options & FSRD::SkipAlbedoDivide ? "off" : "on",
+                            options & FSRD::IdentityDenoiser ? "off" : "on",
+                            options & FSRD::SkipAlbedoMultiply ? "off" : "on",
+                            options & FSRD::SkipResidual ? "off" : "on",
+                            view == 2 || (options & FSRD::BypassUpscaler) ? "off" : "on");
+                        if (options & (FSRD::SkipAlbedoDivide | FSRD::SkipAlbedoMultiply | FSRD::SkipResidual))
+                            ImGui::TextWrapped("Diagnostic image: altered signal units/composition; not a quality mode.");
+                    }
+                    ImGui::TextWrapped("Combine switches live; affected histories reset once. Dumps record the combination.\n"
+                                       "All test switches reset when the feature is recreated or the game restarts.");
+
+                    ImGui::BeginDisabled(!testView || (options & FSRD::IdentityDenoiser) || busy);
                     if (ImGui::Button("Reset denoiser history + dump"))
                         rr->RequestDenoiserReset();
                     ImGui::EndDisabled();
                     ShowHelpMarker("Resets AMD denoiser history once and requests a dump of that exact frame.\n"
                                    "Does not reset SR history or modify motion/camera data. Natural game resets still apply.\n"
-                                   "Requires Debug View = None and Identity denoiser off.\n"
+                                   "Requires AMD denoising on and Debug View = None or UpscalerBypass.\n"
                                    "Check the dump status and manifest for completion or capture errors.");
                     if (rr->DenoiserResetPending())
                     {
-                        ImGui::TextUnformatted("Denoiser reset queued; waiting for a normal AMD-filtered frame.");
+                        ImGui::TextUnformatted("Denoiser reset queued; waiting for an AMD-filtered test frame.");
                         ImGui::SameLine();
                         if (ImGui::SmallButton("Cancel reset"))
                             rr->CancelDenoiserReset();

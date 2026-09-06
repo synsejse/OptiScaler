@@ -15,6 +15,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
 from analyze_fsrd_textures import load_capture, stats
 
 
+def compose(signal, albedo, residual, metadata):
+    """Use the captured stage switches; older manifests describe the normal path."""
+    color = signal[..., :3] * albedo if metadata.get("albedo_multiply", True) else signal[..., :3]
+    if metadata.get("add_residual", True):
+        color = color + residual
+    if not metadata.get("albedo_multiply", True):
+        color = np.clip(color, -65504, 65504)
+    return color.astype(np.float16).astype(np.float32)
+
+
 def compare(capture, results, destination):
     meta, tex = load_capture(capture)
     width, height = meta["render_size"]
@@ -42,7 +52,7 @@ def compare(capture, results, destination):
         parameters[name] = info
         # Fixed original albedo/residual for both encodings: isolate denoiser differences.
         # Sqrt-guide quantization error is separately recorded by preparation.
-        images[name] = (signal[..., :3] * albedo + residual).astype(np.float16).astype(np.float32)
+        images[name] = compose(signal, albedo, residual, meta)
 
     luma = np.array([.2126, .7152, .0722])
     factor = .5 / max(float(np.quantile(raw @ luma, .95)), 1e-8)
@@ -61,6 +71,7 @@ def compare(capture, results, destination):
     pairs = panel[:, 1:] & panel[:, :-1]
     albedo_gradient = np.diff(np.log(np.maximum(albedo, 1e-6)), axis=1)[pairs].ravel()
     report = {"source_manifest_sha256": source_hash, "exposure": factor,
+              "diagnostic_options_active": meta.get("diagnostic_options_active", 0),
               "note": "Single-frame ROI structural diagnostics; noisy input is not ground truth.",
               "panel_pixels": int(panel.sum()), "panel_pairs": int(pairs.sum()),
               "parameters": parameters, "images": {}, "radiance_difference_from_game": {}}

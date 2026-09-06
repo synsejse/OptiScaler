@@ -1,4 +1,5 @@
 #pragma once
+#include "FSRDDiagnostics.h"
 
 namespace FSRD
 {
@@ -10,17 +11,20 @@ struct DiagnosticPlan
     bool resetUpscaler;
 };
 
-// Identity is deliberately limited to the normal full processing chain. A manual
-// reset affects only RR; switching color sources resets SR once to avoid mixing
-// old filtered output with the identity result. Existing game resets still apply.
-constexpr DiagnosticPlan PlanDiagnostics(bool normalView, bool identityRequested, bool bypassDenoiser,
-                                         bool baseReset, bool denoiserHistoryValid, bool previousIdentity,
+// The caller enables options only for normal composition (including UpscalerBypass).
+// Only the divide changes AMD's input. Composition switches reset SR, not RR.
+// Returning from a bilinear/debug view resets the stale SR history once.
+constexpr DiagnosticPlan PlanDiagnostics(uint32_t options, bool bypassDenoiser, bool baseReset,
+                                         bool denoiserHistoryValid, uint32_t previousDenoiserOptions,
+                                         bool upscalerHistoryValid, uint32_t previousUpscalerOptions,
                                          bool manualReset)
 {
-    const bool identity = normalView && identityRequested;
+    const bool identity = !bypassDenoiser && (options & IdentityDenoiser) != 0;
     const bool runDenoiser = !bypassDenoiser && !identity;
     return { identity, runDenoiser,
-             runDenoiser && (baseReset || !denoiserHistoryValid || manualReset),
-             baseReset || identity != previousIdentity };
+             runDenoiser && (baseReset || !denoiserHistoryValid || manualReset ||
+                            ((options ^ previousDenoiserOptions) & SkipAlbedoDivide) != 0),
+             baseReset || !upscalerHistoryValid ||
+                 ((options ^ previousUpscalerOptions) & (AllDiagnosticOptions ^ BypassUpscaler)) != 0 };
 }
 } // namespace FSRD

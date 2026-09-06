@@ -596,6 +596,10 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     }
 
     const auto dbgMode = static_cast<DebugModes>(cfg.FfxDenoiserDebugMode.value_or_default());
+    _frameDebugMode = uint64_t(dbgMode);
+    const bool diagnosticView = dbgMode == DebugModes::None || dbgMode == DebugModes::UpscalerBypass;
+    const uint32_t requestedOptions = _diagnostics.Options();
+    _frameDiagnosticOptions = diagnosticView ? requestedOptions : 0;
     const bool isDebugVis = (uint32_t) dbgMode & (uint32_t) DebugModes::ConversionDebug;
     const bool isDebugComp = ((uint64_t) dbgMode & (uint64_t) DebugModes::CompositionDebug);
     const bool hasAnyDebug = (dbgMode != DebugModes::None);
@@ -605,7 +609,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         !isDebugComp && hasAnyDebug && dbgMode != DebugModes::DenoiserOutput && dbgMode != DebugModes::UpscalerBypass;
 
     // Upscale is bypassed if we are in a debug mode that isn't the DenoiserBypass (final raw)
-    const bool isUpscaleBypassed = hasAnyDebug && dbgMode != DebugModes::DenoiserBypass;
+    const bool isUpscaleBypassed = (hasAnyDebug && dbgMode != DebugModes::DenoiserBypass) ||
+                                  (_frameDiagnosticOptions & FSRD::BypassUpscaler) != 0;
 
     // Validate helper features
     if (!RCAS->IsInit())
@@ -624,6 +629,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     _hasCameraHistory = false;
     const bool denoiserHadHistory = _hasDenoiserHistory;
     _hasDenoiserHistory = false;
+    const bool upscalerHadHistory = _hasUpscalerHistory;
+    _hasUpscalerHistory = false;
 
     // Denoiser start
     ffxDispatchDescDenoiserInput1Signal fusedSignal = {};
@@ -638,14 +645,14 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         return false;
     }
 
-    // Snapshot the UI request once for this evaluation. Request the dump here, on
+    // The options were snapshotted before conversion. Request the dump here on
     // the render thread after input preparation, so the reset and capture cannot
     // land on different frames. A busy capture defers the manual reset request.
-    const bool identityRequested = _diagnostics.identityDenoiser.load();
-    const bool manualDenoiserReset = dbgMode == DebugModes::None && !identityRequested &&
+    const bool manualDenoiserReset = diagnosticView && !(_frameDiagnosticOptions & FSRD::IdentityDenoiser) &&
         _diagnostics.resetDenoiserHistory.load() && FSRDResearch::Request(Handle()->Id);
-    const auto diagnosticPlan = FSRD::PlanDiagnostics(dbgMode == DebugModes::None, identityRequested,
-        isDenoiseBypassed, _isInReset, denoiserHadHistory, _identityWasActive, manualDenoiserReset);
+    const auto diagnosticPlan = FSRD::PlanDiagnostics(_frameDiagnosticOptions, isDenoiseBypassed,
+        _isInReset, denoiserHadHistory, _lastDenoiserOptions, upscalerHadHistory, _lastUpscalerOptions,
+        manualDenoiserReset);
     _diagnosticUpscaleReset = diagnosticPlan.resetUpscaler;
     if (diagnosticPlan.resetDenoiser)
         denoiserDesc.flags |= FFX_DENOISER_DISPATCH_RESET;
@@ -675,6 +682,12 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             {"debug_mode", uint64_t(dbgMode)},
             {"denoiser_bypassed", isDenoiseBypassed}, {"upscaler_bypassed", isUpscaleBypassed},
             {"identity_denoiser", diagnosticPlan.identity},
+            {"diagnostic_options_requested", requestedOptions},
+            {"diagnostic_options_active", _frameDiagnosticOptions},
+            {"diagnostic_controls_active", diagnosticView},
+            {"albedo_divide", !(_frameDiagnosticOptions & FSRD::SkipAlbedoDivide)},
+            {"albedo_multiply", !(_frameDiagnosticOptions & FSRD::SkipAlbedoMultiply)},
+            {"add_residual", !(_frameDiagnosticOptions & FSRD::SkipResidual)},
             {"denoiser_executed", diagnosticPlan.runDenoiser},
             {"denoiser_output_kind", diagnosticPlan.identity ? "identity_converted_input" :
                                       isDenoiseBypassed ? "absent" : "amd_filtered"},
@@ -804,6 +817,10 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         // Compose denoised signals
         FSRDCompDesc compDesc = { .DstTexSize = _convDesc.RenderSize,
                                   .Flags = (uint32_t) GetCompDebugFlags(dbgMode) };
+        if (_frameDiagnosticOptions & FSRD::SkipAlbedoMultiply)
+            compDesc.Flags |= (uint32_t) FSRDCompFlags::SkipAlbedoMultiply;
+        if (_frameDiagnosticOptions & FSRD::SkipResidual)
+            compDesc.Flags |= (uint32_t) FSRDCompFlags::SkipResidual;
 
         if (!FSRDConvShader->DispatchComposition(InCommandList, compDesc, diagnosticPlan.identity))
             return false;
@@ -846,7 +863,12 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         {
             CommitCameraHistory();
             _hasDenoiserHistory = diagnosticPlan.runDenoiser;
-            _identityWasActive = diagnosticPlan.identity;
+            _lastDenoiserOptions = _frameDiagnosticOptions;
+        }
+        if (isUpscalerReady)
+        {
+            _hasUpscalerHistory = true;
+            _lastUpscalerOptions = _frameDiagnosticOptions;
         }
 
         // _frameCount is incremented by the base implementation
@@ -887,8 +909,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         {
             CommitCameraHistory();
             _hasDenoiserHistory = diagnosticPlan.runDenoiser;
-            // SR did not execute here. Preserve its last source mode so resuming
-            // from an output-only debug view still resets an identity transition.
+            _lastDenoiserOptions = _frameDiagnosticOptions;
+            // SR remains invalid until it actually executes again.
         }
     }
 
@@ -1238,12 +1260,14 @@ bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParam
 
 bool FSRDFeatureDx12::ConvertDenoiserBuffers(ID3D12GraphicsCommandList* InCommandList)
 {
-    const uint32_t dbgMode = (uint32_t) Config::Instance()->FfxDenoiserDebugMode.value_or_default();
+    const uint32_t dbgMode = (uint32_t) _frameDebugMode;
 
     // Prepare input converter
     _convDesc.RenderSize = { (float) RenderWidth(), (float) RenderHeight(), 1.0f / (float) RenderWidth(),
                              1.0f / (float) RenderHeight() };
     _convDesc.Flags = (uint32_t) FSRDConvFlags::NonGammaAlbedo | (dbgMode & (uint32_t) FSRDConvFlags::DebugModeMask);
+    if (_frameDiagnosticOptions & FSRD::SkipAlbedoDivide)
+        _convDesc.Flags |= (uint32_t) FSRDConvFlags::SkipAlbedoDivide;
 
     if (_isRoughnessPacked)
         _convDesc.Flags |= (uint32_t) FSRDConvFlags::IsRoughnessPacked;
