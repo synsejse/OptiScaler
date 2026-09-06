@@ -170,7 +170,10 @@ class FSRDPreprocessor_Dx12
      * @brief Composes the denoised radiance from FSR-RR with the skip signal previously generated 
      * by the converter, and writes the result to the given destination texture.
      */
-    bool DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc);
+    // Identity uses converted radiance as the first input of the SAME compositor,
+    // without an extra blit/filter or a change to albedo/residual processing.
+    bool DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc,
+                             bool identityDenoiser = false);
 
     /**
      * @brief Returns the output from the last composition dispatch. Valid until the next conversion dispatch.

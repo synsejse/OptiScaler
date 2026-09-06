@@ -340,7 +340,7 @@ struct FSRDPreprocessor_Dx12::Impl
 
     }
 
-    void DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc)
+    void DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc, bool identityDenoiser)
     {
         if (!cmdList || !m_maxWidth)
             throw std::runtime_error("FSRD composition has no command list or allocated buffers");
@@ -366,7 +366,7 @@ struct FSRDPreprocessor_Dx12::Impl
             .Flags = UINT(desc.Flags) 
         };
 
-        inputs.Resources = { .InDenoisedRadiance = m_outputBuffer1.Get(),
+        inputs.Resources = { .InDenoisedRadiance = identityDenoiser ? outResources.Radiance.Get() : m_outputBuffer1.Get(),
                              .InFusedAlbedo = outResources.FusedAlbedo.Get(),
                              .InSkipSignal = outResources.SkipSignal.Get() };
 
@@ -504,11 +504,12 @@ void FSRDPreprocessor_Dx12::SetDenoiserOutputsWritable(ID3D12GraphicsCommandList
     AddBarriers(cmdList, buffers, writable ? kSrvState : kUavState, writable ? kUavState : kSrvState);
 }
 
-bool FSRDPreprocessor_Dx12::DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc)
+bool FSRDPreprocessor_Dx12::DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc,
+                                             bool identityDenoiser)
 {
     try
     {
-        m_impl->DispatchComposition(cmdList, desc);
+        m_impl->DispatchComposition(cmdList, desc, identityDenoiser);
         return true;
     }
     catch (const std::exception& err)

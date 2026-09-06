@@ -13,6 +13,10 @@ cl /nologo /std:c++20 /EHsc "%~1\tests\fsrd_submission_policy.cpp" /Fo:fsrd_subm
 if errorlevel 1 exit /b 1
 fsrd_submission_policy.exe
 if errorlevel 1 exit /b 1
+cl /nologo /std:c++20 /EHsc "%~1\tests\fsrd_diagnostic_policy.cpp" /Fo:fsrd_diagnostic_policy.obj /Fe:fsrd_diagnostic_policy.exe
+if errorlevel 1 exit /b 1
+fsrd_diagnostic_policy.exe
+if errorlevel 1 exit /b 1
 python -m unittest discover -s "%~1\tests" -p "test_fsrd_*.py" -v
 if errorlevel 1 exit /b 1
 popd

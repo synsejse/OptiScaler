@@ -3,6 +3,8 @@
 #include "shaders/fsrd_preprocess/FSRDPreprocessor_Dx12.h"
 #include "fsr-rr/ffx_denoiser.h"
 #include <DirectXMath.h>
+#include <atomic>
+#include <limits>
 
 /**
  * @brief Unified denoiser-upscaler utilising AMD FSR Ray Regeneration and Super Resolution with
@@ -26,6 +28,15 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     // The generic backend-recreation path only copies SR parameters. Preserve the RR input layout too.
     void CopyRRCreateParameters(NVSDK_NGX_Parameter* parameters) const;
 
+    // Per-feature, session-only diagnostic requests. Never persisted in the INI.
+    bool IdentityDenoiserRequested() const { return _identityDenoiser.load(); }
+    void SetIdentityDenoiser(bool enabled) { _identityDenoiser.store(enabled); }
+    bool DenoiserResetPending() const { return _resetDenoiserHistory.load(); }
+    void RequestDenoiserReset() { _resetDenoiserHistory.store(true); }
+    void CancelDenoiserReset() { _resetDenoiserHistory.store(false); }
+    static constexpr uint64_t NoDiagnosticFrame = (std::numeric_limits<uint64_t>::max)();
+    uint64_t LastDiagnosticResetFrame() const { return _lastDiagnosticResetFrame.load(); }
+
   private:
     struct DenoiserSettings
     {
@@ -47,6 +58,12 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool _isHWDepth = false;
     bool _isRoughnessPacked = false;
     bool _hasCameraHistory = false;
+    bool _hasDenoiserHistory = false;
+    bool _identityWasActive = false;
+    bool _diagnosticUpscaleReset = false;
+    std::atomic<bool> _identityDenoiser { false };
+    std::atomic<bool> _resetDenoiserHistory { false };
+    std::atomic<uint64_t> _lastDiagnosticResetFrame { NoDiagnosticFrame };
     bool _loggedCyberpunkDepthMotion = false;
     double _lastDenoiserFrameTime = 0.0;
     uint32_t _lastRenderWidth = 0;

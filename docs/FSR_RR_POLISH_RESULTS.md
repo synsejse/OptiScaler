@@ -4,6 +4,8 @@ This follows the [original capture research](FSR_RR_RESEARCH_RESULTS.md). The wo
 
 ## User visual pass: unresolved lighting regression
 
+**Update:** a normal-mode GUI dump from the reported scene now reproduces and localizes the problem before upscaling. See [same-frame buffer findings and remaining producer/blend-state questions](FSR_RR_DUMP_FINDINGS.md). The paragraphs below preserve the earlier pre-capture investigation.
+
 The subsequent user pass with `d398f06f` reports incorrect atmospheric/shadow appearance and strong surface-detail outlines. Normal rendering, `FusedLighting` and `UpscalerBypass` show the problem; `DenoiserBypass` looks correct. **Visual acceptance has failed; the runtime/round-trip results below do not establish that this implementation is finished.**
 
 The code distinguishes these views as follows:

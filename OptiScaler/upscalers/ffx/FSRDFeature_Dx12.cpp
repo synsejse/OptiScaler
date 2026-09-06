@@ -3,6 +3,7 @@
 #include <DirectXMath.h>
 #include "NVNGX_Parameter.h"
 #include "FSRDFeature_Dx12.h"
+#include "FSRDDiagnosticPolicy.h"
 #include "shaders/fsrd_preprocess/FSRDPreprocessor_Dx12.h"
 #include "MathUtils.h"
 #include "FSRDInputMath.h"
@@ -546,7 +547,7 @@ void FSRDFeatureDx12::OverrideUpscaleDispatch(ffxDispatchDescUpscale& params)
     params.color = ffxApiGetResourceDX12(_upscaleColorOverride, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     params.cameraFovAngleVertical = _upscaleFovVertical;
     params.frameTimeDelta = _upscaleDeltaTime;
-    params.reset |= _isInReset;
+    params.reset |= _isInReset || _diagnosticUpscaleReset;
 }
 
 void FSRDFeatureDx12::CommitCameraHistory()
@@ -621,6 +622,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     // Only a completely successful RR evaluation commits it below. Output-only debug
     // visualization still runs RR and may keep history; actual denoiser bypasses may not.
     _hasCameraHistory = false;
+    const bool denoiserHadHistory = _hasDenoiserHistory;
+    _hasDenoiserHistory = false;
 
     // Denoiser start
     ffxDispatchDescDenoiserInput1Signal fusedSignal = {};
@@ -634,6 +637,18 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         _hasCameraHistory = false;
         return false;
     }
+
+    // Snapshot the UI request once for this evaluation. Request the dump here, on
+    // the render thread after input preparation, so the reset and capture cannot
+    // land on different frames. A busy capture defers the manual reset request.
+    const bool identityRequested = _identityDenoiser.load();
+    const bool manualDenoiserReset = dbgMode == DebugModes::None && !identityRequested &&
+        _resetDenoiserHistory.load() && FSRDResearch::Request(Handle()->Id);
+    const auto diagnosticPlan = FSRD::PlanDiagnostics(dbgMode == DebugModes::None, identityRequested,
+        isDenoiseBypassed, _isInReset, denoiserHadHistory, _identityWasActive, manualDenoiserReset);
+    _diagnosticUpscaleReset = diagnosticPlan.resetUpscaler;
+    if (diagnosticPlan.resetDenoiser)
+        denoiserDesc.flags |= FFX_DENOISER_DISPATCH_RESET;
 
     FSRDResearch::Capture research;
     bool captureEvaluationSucceeded = false;
@@ -659,6 +674,14 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             {"display_size", {DisplayWidth(), DisplayHeight()}},
             {"debug_mode", uint64_t(dbgMode)},
             {"denoiser_bypassed", isDenoiseBypassed}, {"upscaler_bypassed", isUpscaleBypassed},
+            {"identity_denoiser", diagnosticPlan.identity},
+            {"denoiser_executed", diagnosticPlan.runDenoiser},
+            {"denoiser_output_kind", diagnosticPlan.identity ? "identity_converted_input" :
+                                      isDenoiseBypassed ? "absent" : "amd_filtered"},
+            {"diagnostic_manual_reset", manualDenoiserReset},
+            {"denoiser_reset", diagnosticPlan.resetDenoiser},
+            {"denoiser_history_valid_on_entry", denoiserHadHistory},
+            {"bridge_upscaler_reset", !isUpscaleBypassed && diagnosticPlan.resetUpscaler},
             {"output_stage", "backend output before OptiScaler sharpening/output scaling/overlay"},
             {"reset", _isInReset}, {"hw_depth", _isHWDepth}, {"inverted_depth", DepthInverted()},
             {"packed_roughness", _isRoughnessPacked},
@@ -751,10 +774,26 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     // Dispatch denoiser
     if (!isDenoiseBypassed)
     {
-        FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, true);
-        isDenoiserReady = DispatchDenoiser(InCommandList, denoiserDesc);
-        FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, false);
-        FSRDResearch::Record(research, "denoised_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.output));
+        if (diagnosticPlan.identity)
+        {
+            // No shader, sampling or copy intervenes. The normal compositor reads
+            // converted radiance directly; all of its other inputs are unchanged.
+            isDenoiserReady = true;
+            FSRDResearch::Record(research, "denoised_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.input));
+        }
+        else
+        {
+            FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, true);
+            isDenoiserReady = DispatchDenoiser(InCommandList, denoiserDesc);
+            FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, false);
+            FSRDResearch::Record(research, "denoised_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.output));
+            if (isDenoiserReady && manualDenoiserReset)
+            {
+                _resetDenoiserHistory.store(false);
+                _lastDiagnosticResetFrame.store(_frameCount);
+                LOG_INFO("FSR-RR diagnostic denoiser-only reset recorded at frame {}", _frameCount);
+            }
+        }
 
         if (!isDenoiserReady)
         {
@@ -766,7 +805,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         FSRDCompDesc compDesc = { .DstTexSize = _convDesc.RenderSize,
                                   .Flags = (uint32_t) GetCompDebugFlags(dbgMode) };
 
-        if (!FSRDConvShader->DispatchComposition(InCommandList, compDesc))
+        if (!FSRDConvShader->DispatchComposition(InCommandList, compDesc, diagnosticPlan.identity))
             return false;
 
         FSRDResearch::Record(research, "composed_color", FSRDConvShader->GetCompositionOutput());
@@ -804,7 +843,11 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         }
 
         if (isUpscalerReady && isDenoiserReady)
+        {
             CommitCameraHistory();
+            _hasDenoiserHistory = diagnosticPlan.runDenoiser;
+            _identityWasActive = diagnosticPlan.identity;
+        }
 
         // _frameCount is incremented by the base implementation
         captureEvaluationSucceeded = isUpscalerReady;
@@ -841,7 +884,12 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             return false;
         FSRDResearch::RecordOutput(research, dstTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if (isDenoiserReady)
+        {
             CommitCameraHistory();
+            _hasDenoiserHistory = diagnosticPlan.runDenoiser;
+            // SR did not execute here. Preserve its last source mode so resuming
+            // from an output-only debug view still resets an identity transition.
+        }
     }
 
     _frameCount++;

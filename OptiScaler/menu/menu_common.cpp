@@ -19,6 +19,7 @@
 
 #include <upscaler_time/UpscalerTime_Vk.h>
 #include <upscalers/ffx/FSRDResearchCapture.h>
+#include <upscalers/ffx/FSRDFeature_Dx12.h>
 
 #include <imgui/imgui_internal.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -2881,6 +2882,40 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                         ImGui::SetClipboardText(dumpStatus.directory.c_str());
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", dumpStatus.directory.c_str());
+                }
+
+                if (currentFeature && currentFeature->GetUpscalerType() == Upscaler::FSRD)
+                {
+                    auto* rr = static_cast<FSRDFeatureDx12*>(currentFeature);
+                    const bool normalView = config->FfxDenoiserDebugMode.value_or_default() == 0;
+                    bool identity = rr->IdentityDenoiserRequested();
+                    ImGui::BeginDisabled(!normalView || rr->DenoiserResetPending() || dumpStatus.busy);
+                    if (ImGui::Checkbox("Identity denoiser (diagnostic)", &identity))
+                        rr->SetIdentityDenoiser(identity);
+                    ImGui::EndDisabled();
+                    ShowHelpMarker("Session-only test, active only with Debug View = None.\n"
+                                   "Skips AMD filtering but keeps input conversion, the normal composition shader,\n"
+                                   "upscaling and postprocessing. Noisy output is expected; this is not a quality fix.\n"
+                                   "Switching modes resets SR once. Returning to AMD also resets its stale history.\n"
+                                   "Use Dump buffers after the new mode has settled.");
+
+                    ImGui::BeginDisabled(!normalView || identity || rr->DenoiserResetPending() || dumpStatus.busy);
+                    if (ImGui::Button("Reset denoiser history + dump"))
+                        rr->RequestDenoiserReset();
+                    ImGui::EndDisabled();
+                    ShowHelpMarker("Resets AMD denoiser history once and requests a dump of that exact frame.\n"
+                                   "Does not reset SR history or modify motion/camera data. Natural game resets still apply.\n"
+                                   "Requires Debug View = None and Identity denoiser off.\n"
+                                   "Check the dump status and manifest for completion or capture errors.");
+                    if (rr->DenoiserResetPending())
+                    {
+                        ImGui::TextUnformatted("Denoiser reset queued; waiting for a normal AMD-filtered frame.");
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Cancel reset"))
+                            rr->CancelDenoiserReset();
+                    }
+                    if (const auto frame = rr->LastDiagnosticResetFrame(); frame != FSRDFeatureDx12::NoDiagnosticFrame)
+                        ImGui::Text("Reset recorded at RR frame %llu", static_cast<unsigned long long>(frame));
                 }
 
                 if (!state.ffxDenoiserDebugModes.empty())

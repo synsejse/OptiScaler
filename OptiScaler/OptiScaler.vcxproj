@@ -432,6 +432,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderData.h" />
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderUtils.h" />
     <ClInclude Include="upscalers\ffx\FSRDInputMath.h" />
+    <ClInclude Include="upscalers\ffx\FSRDDiagnosticPolicy.h" />
     <ClInclude Include="upscalers\ffx\FSRDInputValidation.h" />
     <ClInclude Include="upscalers\ffx\FSRDDepthMotion.h" />
     <ClInclude Include="resource_tracking\FSRDSubmission.h" />
