@@ -771,7 +771,105 @@ bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandL
 
     LOG_DEBUG("Jitter NDC [{:.6f}, {:.6f}]", dispatchDesc.jitterOffsets.x, dispatchDesc.jitterOffsets.y);
 
+    CaptureInputs(inParams, dispatchDesc);
+
     return true;
+}
+
+void FSRDFeatureDx12::CaptureInputs(const NVSDK_NGX_Parameter& inParams, const ffxDispatchDescDenoiser& dispatchDesc)
+{
+    const auto limit =
+        static_cast<uint32_t>(std::clamp(Config::Instance()->FfxDenoiserCaptureSamples.value_or_default(), 0, 240));
+    if (_captureSamples >= limit || (_frameCount > 1 && _frameCount % 30 != 0))
+        return;
+
+    ++_captureSamples;
+    const auto& slData = State::Instance().slLastConstants;
+    LOG_INFO("FSRRR_CAPTURE begin handle={} frame={} sample={}/{} hwDepth={} inverted={} packedRoughness={} reset={}",
+             Handle()->Id, _frameCount, _captureSamples, limit, s_isHWDepth, DepthInverted(), s_isRoughnessPacked,
+             _isInReset);
+
+    const auto LogMatrix = [](const char* name, const XMMATRIX& matrix)
+    {
+        XMFLOAT4X4 values;
+        XMStoreFloat4x4(&values, matrix);
+        for (int row = 0; row < 4; ++row)
+            LOG_INFO("FSRRR_CAPTURE matrix {} row={} {:.9g} {:.9g} {:.9g} {:.9g}", name, row, values.m[row][0],
+                     values.m[row][1], values.m[row][2], values.m[row][3]);
+    };
+    const auto LogRawMatrix = [&](const char* key)
+    {
+        XMMATRIX matrix;
+        // Deliberately preserve the incoming 16-float memory layout before any transpose.
+        if (TryGetNGXMatrixTranspose(inParams, key, matrix))
+            LogMatrix(key, matrix);
+        else
+            LOG_INFO("FSRRR_CAPTURE matrix {} missing", key);
+    };
+    LogRawMatrix(NVSDK_NGX_Parameter_DLSS_WORLD_TO_VIEW_MATRIX);
+    LogRawMatrix(NVSDK_NGX_Parameter_DLSS_VIEW_TO_CLIP_MATRIX);
+    LogMatrix("derivedView", _viewMatrix);
+    LogMatrix("derivedInvView", _invViewMatrix);
+    LogMatrix("derivedPrevView", _prevViewMatrix);
+    LogMatrix("derivedProjection", _projMatrix);
+    XMMATRIX slProjection;
+    static_assert(sizeof(slData.cameraViewToClip) == sizeof(slProjection));
+    memcpy(&slProjection, &slData.cameraViewToClip, sizeof(slProjection));
+    LogMatrix("slCameraViewToClip", slProjection);
+
+    const auto LogVector = [](const char* name, float x, float y, float z)
+    { LOG_INFO("FSRRR_CAPTURE vector {} {:.9g} {:.9g} {:.9g}", name, x, y, z); };
+    LogVector("slPosition", slData.cameraPos.x, slData.cameraPos.y, slData.cameraPos.z);
+    LogVector("slForward", slData.cameraFwd.x, slData.cameraFwd.y, slData.cameraFwd.z);
+    LogVector("slRight", slData.cameraRight.x, slData.cameraRight.y, slData.cameraRight.z);
+    LogVector("slUp", slData.cameraUp.x, slData.cameraUp.y, slData.cameraUp.z);
+    LogVector("amdForward", dispatchDesc.cameraForward.x, dispatchDesc.cameraForward.y, dispatchDesc.cameraForward.z);
+    LogVector("amdRight", dispatchDesc.cameraRight.x, dispatchDesc.cameraRight.y, dispatchDesc.cameraRight.z);
+    LogVector("amdUp", dispatchDesc.cameraUp.x, dispatchDesc.cameraUp.y, dispatchDesc.cameraUp.z);
+    LogVector("amdPositionDelta", dispatchDesc.cameraPositionDelta.x, dispatchDesc.cameraPositionDelta.y,
+              dispatchDesc.cameraPositionDelta.z);
+    LogVector("amdMotionScale", dispatchDesc.motionVectorScale.x, dispatchDesc.motionVectorScale.y,
+              dispatchDesc.motionVectorScale.z);
+    LOG_INFO("FSRRR_CAPTURE amd render={}x{} jitter={:.9g},{:.9g} near={:.9g} far={:.9g} fov={:.9g} dt={:.9g}",
+             dispatchDesc.renderSize.width, dispatchDesc.renderSize.height, dispatchDesc.jitterOffsets.x,
+             dispatchDesc.jitterOffsets.y, dispatchDesc.cameraNear, dispatchDesc.cameraFar,
+             dispatchDesc.cameraFovAngleVertical, dispatchDesc.deltaTime);
+    LOG_INFO("FSRRR_CAPTURE streamline near={:.9g} far={:.9g} fov={:.9g} aspect={:.9g}", slData.cameraNear,
+             slData.cameraFar, slData.cameraFOV, slData.cameraAspectRatio);
+
+    for (const char* key :
+         { NVSDK_NGX_Parameter_Jitter_Offset_X, NVSDK_NGX_Parameter_Jitter_Offset_Y, NVSDK_NGX_Parameter_MV_Scale_X,
+           NVSDK_NGX_Parameter_MV_Scale_Y, NVSDK_NGX_Parameter_DLSS_Pre_Exposure })
+    {
+        float value = 0.0f;
+        if (inParams.Get(key, &value) == NVSDK_NGX_Result_Success)
+            LOG_INFO("FSRRR_CAPTURE scalar {} {:.9g}", key, value);
+        else
+            LOG_INFO("FSRRR_CAPTURE scalar {} missing", key);
+    }
+    for (const char* key : { NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                             NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height })
+    {
+        unsigned int value = 0;
+        if (inParams.Get(key, &value) == NVSDK_NGX_Result_Success)
+            LOG_INFO("FSRRR_CAPTURE dimension {} {}", key, value);
+    }
+    for (const char* key :
+         { NVSDK_NGX_Parameter_Color, NVSDK_NGX_Parameter_Depth, NVSDK_NGX_Parameter_MotionVectors,
+           NVSDK_NGX_Parameter_GBuffer_Normals, NVSDK_NGX_Parameter_GBuffer_Roughness,
+           NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance, NVSDK_NGX_Parameter_DLSSD_SpecularRayDirectionHitDistance })
+    {
+        ID3D12Resource* resource = nullptr;
+        if (TryGetNGXVoidPointer(inParams, key, resource))
+        {
+            const auto desc = resource->GetDesc();
+            LOG_INFO("FSRRR_CAPTURE resource {} {}x{} format={} flags={}", key, desc.Width, desc.Height,
+                     static_cast<unsigned int>(desc.Format), static_cast<unsigned int>(desc.Flags));
+        }
+        else
+            LOG_INFO("FSRRR_CAPTURE resource {} missing", key);
+    }
+    LOG_INFO("FSRRR_CAPTURE end handle={} frame={}", Handle()->Id, _frameCount);
 }
 
 bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParams)

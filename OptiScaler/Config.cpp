@@ -279,6 +279,7 @@ bool Config::Reload(std::filesystem::path iniPath)
 
             // FSR-RR
             FfxDenoiserMode.set_from_config(readInt("FSR-RR", "DenoiserMode"));
+            FfxDenoiserCaptureSamples.set_from_config(readInt("FSR-RR", "CaptureSamples"));
             FfxDenoiserDisocclusionThreshold.set_from_config(
                 readFloat("FSR-RR", "DisocclusionThreshold"));
             FfxDenoiserCrossBlNormStr.set_from_config(readFloat("FSR-RR", "CrossBilateralNormalStrength"));
@@ -1132,6 +1133,8 @@ bool Config::SaveIni()
 
         // FSR-RR
         ini.SetValue("FSR-RR", "DenoiserMode", GetIntValue(Instance()->FfxDenoiserMode.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "CaptureSamples",
+                     GetIntValue(Instance()->FfxDenoiserCaptureSamples.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "DisocclusionThreshold",
                      GetFloatValue(Instance()->FfxDenoiserDisocclusionThreshold.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "CrossBilateralNormalStrength",

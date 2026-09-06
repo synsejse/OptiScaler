@@ -460,6 +460,7 @@ class Config
     CustomOptional<int> FfxDenoiserIndex { 0 };
     CustomOptional<int> FfxDenoiserMode { 0 };
     CustomOptional<uint64_t> FfxDenoiserDebugMode { 0 };
+    CustomOptional<int> FfxDenoiserCaptureSamples { 0 };
 
     CustomOptional<float> FfxDenoiserDisocclusionThreshold { 0.02f };
     CustomOptional<float> FfxDenoiserCrossBlNormStr { 0.7f };

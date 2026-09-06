@@ -39,6 +39,7 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     DenoiserSettings _denoiserSettings;
     bool _isMode2;
     bool _isInReset;
+    uint32_t _captureSamples = 0;
 
     static bool s_isHWDepth;
     static bool s_isRoughnessPacked;
@@ -72,6 +73,8 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     void DestroyDenoiserContext();
 
     void UpdateSize();
+
+    void CaptureInputs(const NVSDK_NGX_Parameter& inParams, const ffxDispatchDescDenoiser& dispatchDesc);
 
     /**
      * @brief Generates FSR denoiser configuration and input buffers from DLSS-RR inputs and NGX configurations,
