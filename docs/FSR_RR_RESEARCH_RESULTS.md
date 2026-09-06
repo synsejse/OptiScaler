@@ -1,6 +1,6 @@
 # Cyberpunk RR input-fidelity research — 2026-09-06
 
-This document preserves the **original pre-fix capture run**. Its “current path” and installation status describe build `be887e88`, not the latest branch. Follow-up work removed the measured lighting/material heuristics and authenticated Cyberpunk's motion producer; see [current implementation](FSR_RR.md) and [motion evidence](FSR_RR_MOTION.md).
+This document preserves the **original pre-fix capture run**. Its “current path” and installation status describe build `be887e88`, not the latest branch. Follow-up work removed the measured lighting/material heuristics and authenticated Cyberpunk's motion producer; see [current implementation](FSR_RR.md), [motion evidence](FSR_RR_MOTION.md) and [post-fix measurements and runtime validation](FSR_RR_POLISH_RESULTS.md).
 
 ## Conclusion
 

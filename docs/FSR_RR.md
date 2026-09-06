@@ -2,6 +2,8 @@
 
 This remains a Cyberpunk-oriented adapter, not a lossless translation of every NGX RR integration.
 
+See the [follow-up research and runtime validation](FSR_RR_POLISH_RESULTS.md) for measured input fidelity, build links and test limitations.
+
 - Only AMD's fused single-signal mode is supported. The albedo-weighted diffuse/specular split has been removed from the converter, denoiser dispatch, composition, GUI and configuration. Old `DenoiserMode` entries are ignored and deleted when saving settings; they cannot restore the guessed split.
 - Available specular hit distance is retained. Missing optional hit distance reads as zero; missing required depth, normals, albedo or separately declared roughness fails validation. Packed normal-alpha roughness does not require a separate texture.
 - Depth and roughness layout are per feature and explicitly copied when changing providers/recreating the backend. Simultaneous features cannot overwrite one another's interpretation.
