@@ -17,7 +17,7 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
 
     ~FSRDFeatureDx12();
 
-    feature_version Version() override { return FFXFeatureDx12::Version(); }
+    feature_version Version() override { return _denoiserVersion; }
 
     Upscaler GetUpscalerType() const override { return Upscaler::FSRD; }
 
@@ -38,6 +38,7 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     };
 
     ffxContext _pDenoiserCtx;
+    feature_version _denoiserVersion {};
     ffxCreateContextDescDenoiser _denoiserCtxDesc;
     DenoiserSettings _denoiserSettings;
     bool _isInReset;

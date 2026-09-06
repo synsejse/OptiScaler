@@ -469,9 +469,6 @@ class Config
     CustomOptional<float> FfxDenoiserRadianceClip { 40.0f };
     CustomOptional<float> FfxDenoiserGaussKernRelax { 0.5f };
 
-    CustomOptional<float> FfxDenoiserCorrelationBias { 1.0f };
-    CustomOptional<float> FfxDenoiserFloorIsolation { 1.0f };
-
     // FSR4
     CustomOptional<FSR4Support> Fsr4ForceModel { FSR4Support::None };
     CustomOptional<uint32_t, NoDefault> Fsr4Preset;

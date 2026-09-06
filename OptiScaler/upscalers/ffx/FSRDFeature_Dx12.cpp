@@ -200,14 +200,11 @@ enum class DebugModes : uint64_t
     OutNormDotView = FSRDConvFlags::DebugOutNormDotView,
     AlbedoError = FSRDConvFlags::DebugAlbedoError,
 
-    FloorVariance = FSRDConvFlags::DebugFloorVariance,
-    FloorColor = FSRDConvFlags::DebugFloorColor,
 
     CompositionDebugOffset = 16u,
     CompositionDebug = (uint64_t) FSRDCompFlags::Debug << CompositionDebugOffset,
     CompositionDebugMask = (uint64_t) FSRDCompFlags::DebugModeMask,
 
-    Correlation = (uint64_t) FSRDCompFlags::DebugCorrelation << CompositionDebugOffset,
     SkipSignal = (uint64_t) FSRDCompFlags::DebugSkipSignal << CompositionDebugOffset,
     DenoiserOutput = (uint64_t) FSRDCompFlags::DebugDenoiserOutput << CompositionDebugOffset,
     FusedLighting = (uint64_t) FSRDCompFlags::DebugFusedLighting << CompositionDebugOffset,
@@ -262,10 +259,7 @@ constexpr auto kDebugModes = std::to_array<ModeNamePair>({
     { "OutNormDotView", (uint64_t) DebugModes::OutNormDotView },
 
     { "AlbedoError", (uint64_t) DebugModes::AlbedoError },
-    { "Correlation", (uint64_t) DebugModes::Correlation },
 
-    { "FloorVariance", (uint64_t) DebugModes::FloorVariance },
-    { "FloorColor", (uint64_t) DebugModes::FloorColor },
 
     { "FusedLighting", (uint64_t) DebugModes::FusedLighting },
 });
@@ -343,8 +337,8 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
     if (!QueryDenoiserVersions())
         return false;
 
-    state.ffxDenoiserUpscalerVersion = Version();
-    parse_version(state.ffxDenoiserVersionNames[cfg.FfxDenoiserIndex.value_or_default()]);
+    state.ffxDenoiserUpscalerVersion = FFXFeature::Version();
+    _denoiserVersion.parse_version(state.ffxDenoiserVersionNames[cfg.FfxDenoiserIndex.value_or_default()]);
 
     ffxOverrideVersion vidOverride = { .header = { .type = FFX_API_DESC_TYPE_OVERRIDE_VERSION },
                                        .versionId =
@@ -608,8 +602,9 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             {"render_size", {RenderWidth(), RenderHeight()}},
             {"reset", _isInReset}, {"hw_depth", _isHWDepth}, {"inverted_depth", DepthInverted()},
             {"packed_roughness", _isRoughnessPacked},
-            {"floor_isolation", _convDesc.FloorIsolation},
-            {"correlation_bias", cfg.FfxDenoiserCorrelationBias.value_or_default()},
+            {"pipeline", "pure_fused"},
+            {"floor_isolation", 0.0f},
+            {"correlation_bias", 0.0f},
             {"near", _convDesc.NearPlane}, {"far", _convDesc.FarPlane},
             {"conversion_flags", _convDesc.Flags},
             {"inv_view", matrix(_convDesc.InvViewMatrix)},
@@ -692,11 +687,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
 
         // Compose denoised signals
         FSRDCompDesc compDesc = { .DstTexSize = _convDesc.RenderSize,
-                                  .CorrelationBias = cfg.FfxDenoiserCorrelationBias.value_or_default(),
                                   .Flags = (uint32_t) GetCompDebugFlags(dbgMode) };
-
-        TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Color, compDesc.InRawColor);
-        TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles, compDesc.InColorBeforeParticles);
 
         if (!FSRDConvShader->DispatchComposition(InCommandList, compDesc))
             return false;
@@ -976,9 +967,6 @@ bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParam
     if (!TryGetLoggedResource(inParams, NVSDK_NGX_Parameter_SpecularAlbedo, _convDesc.Resources.InSpecAlbedo))
         isReady = false;
 
-    TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask,
-                         _convDesc.Resources.InBiasMask);
-
     // Optional in both modes. A null SRV reads zero; do not report it as a missing required input.
     TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance, _convDesc.Resources.InSpecHitDist);
 
@@ -993,9 +981,10 @@ bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParam
             continue;
         const auto desc = resource->GetDesc();
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width < RenderWidth() ||
-            desc.Height < RenderHeight())
+            desc.Height < RenderHeight() || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 ||
+            (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0)
         {
-            LOG_ERROR("FSR-RR input texture does not cover the current render size {}x{}", RenderWidth(),
+            LOG_ERROR("FSR-RR needs single-sample, shader-readable 2D inputs covering render size {}x{}", RenderWidth(),
                       RenderHeight());
             return false;
         }
@@ -1086,14 +1075,11 @@ bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParam
 bool FSRDFeatureDx12::ConvertDenoiserBuffers(ID3D12GraphicsCommandList* InCommandList)
 {
     const uint32_t dbgMode = (uint32_t) Config::Instance()->FfxDenoiserDebugMode.value_or_default();
-    const auto& cfg = *Config::Instance();
-    const auto& slData = State::Instance().slLastConstants;
 
     // Prepare input converter
     _convDesc.RenderSize = { (float) RenderWidth(), (float) RenderHeight(), 1.0f / (float) RenderWidth(),
                              1.0f / (float) RenderHeight() };
     _convDesc.Flags = (uint32_t) FSRDConvFlags::NonGammaAlbedo | (dbgMode & (uint32_t) FSRDConvFlags::DebugModeMask);
-    _convDesc.FloorIsolation = cfg.FfxDenoiserFloorIsolation.value_or_default();
 
     if (_isRoughnessPacked)
         _convDesc.Flags |= (uint32_t) FSRDConvFlags::IsRoughnessPacked;

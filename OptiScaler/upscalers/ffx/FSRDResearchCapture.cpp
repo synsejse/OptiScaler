@@ -121,7 +121,7 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
         auto batch = std::make_shared<Batch>();
         batch->device = device;
         batch->list = list;
-        batch->submittedList = ResTrack_Dx12::PrepareResearchSubmission(device, list);
+        batch->submittedList = ResTrack_Dx12::PrepareSubmission(device, list);
         if (!batch->submittedList)
             throw std::runtime_error("research submission hook unavailable");
         batch->width = width;

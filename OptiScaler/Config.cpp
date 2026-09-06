@@ -287,8 +287,6 @@ bool Config::Reload(std::filesystem::path iniPath)
             FfxDenoiserMaxRadiance.set_from_config(readFloat("FSR-RR", "MaxRadiance"));
             FfxDenoiserRadianceClip.set_from_config(readFloat("FSR-RR", "RadianceClipDeviation"));
             FfxDenoiserGaussKernRelax.set_from_config(readFloat("FSR-RR", "GaussianKernelRelaxation"));
-            FfxDenoiserCorrelationBias.set_from_config(readFloat("FSR-RR", "CorrelationBias"));
-            FfxDenoiserFloorIsolation.set_from_config(readFloat("FSR-RR", "FloorIsolation"));
 
             if (auto v = readEnum<FSR4Support>("FSR", "Fsr4ForceModel"))
                 Fsr4ForceModel.set_from_config(*v);
@@ -1150,10 +1148,9 @@ bool Config::SaveIni()
                      GetFloatValue(Instance()->FfxDenoiserRadianceClip.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "GaussianKernelRelaxation",
                      GetFloatValue(Instance()->FfxDenoiserGaussKernRelax.value_for_config()).c_str());
-        ini.SetValue("FSR-RR", "CorrelationBias",
-                     GetFloatValue(Instance()->FfxDenoiserCorrelationBias.value_for_config()).c_str());
-        ini.SetValue("FSR-RR", "FloorIsolation",
-                     GetFloatValue(Instance()->FfxDenoiserFloorIsolation.value_for_config()).c_str());
+        // Retired lighting guesses must not be restored by an older INI.
+        ini.Delete("FSR-RR", "CorrelationBias");
+        ini.Delete("FSR-RR", "FloorIsolation");
         ini.SetValue("FSR", "Fsr4ForceModel", GetIntValue(Instance()->Fsr4ForceModel.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4Preset", GetIntValue(Instance()->Fsr4Preset.value_for_config()).c_str());
         ini.SetValue("FSR", "Fsr4EnableWatermark",

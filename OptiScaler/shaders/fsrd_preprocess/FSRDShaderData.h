@@ -4,116 +4,6 @@
 
 namespace FSRD
 {
-    namespace FloorSeed
-    {
-        constexpr UINT kBackBufferCount = 3;
-
-        enum class Flags : uint32_t
-        {
-            None = 0,
-            LinearDepth = (1 << 0)
-        };
-
-        struct alignas(16) Constants
-        {
-            XMFLOAT4X4 InvProjMatrix;
-            XMFLOAT4 RenderSize;
-
-            float NearPlane;
-            float FarPlane;
-            uint32_t Flags;
-
-            float _Padding[1];
-        };
-
-        union Input
-        {
-            struct Data
-            {
-                ID3D12Resource* InColor;
-                ID3D12Resource* InSpecAlbedo;
-                ID3D12Resource* InDiffAlbedo;
-                ID3D12Resource* InDepth;
-            };
-
-            // The number of D3D12 resources in the struct
-            static constexpr uint32_t kCount = sizeof(Data) / sizeof(ID3D12Resource*);
-
-            Data Resources;
-
-            ID3D12Resource* AsArray[kCount];
-        };
-
-        union Output
-        {
-            struct Data
-            {
-                ID3D12Resource* OutColor;
-                ID3D12Resource* OutEdges;
-            };
-
-            // The number of D3D12 resources in the struct
-            static constexpr uint32_t kCount = sizeof(Data) / sizeof(ID3D12Resource*);
-
-            Data Resources;
-
-            ID3D12Resource* AsArray[kCount];
-        };
-    }
-
-    namespace FloorFilter
-    {
-        constexpr UINT kPasses = 3;
-        constexpr UINT kBackBufferCount = std::max(3 * (kPasses + 1), 1u);
-
-        enum class Flags : uint32_t
-        {
-            None = 0
-        };
-
-        struct alignas(16) Constants
-        {
-            XMFLOAT4 DstTexSize;
-
-            int32_t StepSize;
-            uint32_t Flags;
-
-            float _Padding[2];
-        };
-
-        union Input
-        {
-            struct Data
-            {
-                ID3D12Resource* InColor;
-                ID3D12Resource* InEdgeGuide;
-            };
-
-            // The number of D3D12 resources in the struct
-            static constexpr uint32_t kCount = sizeof(Data) / sizeof(ID3D12Resource*);
-
-            Data Resources;
-
-            ID3D12Resource* AsArray[kCount];
-        };
-
-        union Output
-        {
-            struct Data
-            {
-                ID3D12Resource* OutColor;
-                ID3D12Resource* OutEdgeGuide;
-            };
-
-            // The number of D3D12 resources in the struct
-            static constexpr uint32_t kCount = sizeof(Data) / sizeof(ID3D12Resource*);
-
-            Data Resources;
-
-            ID3D12Resource* AsArray[kCount];
-        };
-    }
-
     namespace Conversion
     {
         constexpr UINT kBackBufferCount = 3;
@@ -132,8 +22,8 @@ namespace FSRD
             float NearPlane; // Near < Far - IsInverted flag accounts for inversion
             float FarPlane;  // Near < Far - IsInverted flag accounts for inversion
 
-            float FloorIsolation;
             uint32_t Flags;  // Dynamic configuration flags. See: ConfigFlags
+            float Padding;
         };
 
         union Input
@@ -148,9 +38,6 @@ namespace FSRD
                 ID3D12Resource* InSpecHitDist; // R - NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance - FP16/FP32
                 ID3D12Resource* InDiffAlbedo;  // RGB - NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo - RGBA32
                 ID3D12Resource* InSpecAlbedo;  // RGB - NVSDK_NGX_Parameter_GBuffer_SpecularAlbedo - RGBA32
-                ID3D12Resource* InBiasMask;    // R8 - NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask
-
-                ID3D12Resource* InBlurColor;
             };
 
             // The number of D3D12 resources in the struct
@@ -204,8 +91,8 @@ namespace FSRD
         {
             XMFLOAT4 DstTexSize; // XY = Tex Size - ZW = 1 / XY
 
-            float CorrelationBias; // Controls the contribution of stable elements to the final image
             uint32_t Flags;
+            float Padding;
 
             XMFLOAT2 SrcTexSize; // Active source extent for debug blits
         };  
@@ -221,8 +108,6 @@ namespace FSRD
                 ID3D12Resource* InFusedAlbedo;
 
                 ID3D12Resource* InSkipSignal;
-                ID3D12Resource* InRawColor;
-                ID3D12Resource* InColorBeforeParticles; // NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles
             };
 
             // The number of D3D12 resources in the struct
@@ -234,3 +119,8 @@ namespace FSRD
         };
     }
     } // namespace FSRD
+
+static_assert(sizeof(FSRD::Conversion::Constants) == 224);
+static_assert(offsetof(FSRD::Conversion::Constants, Flags) == 216);
+static_assert(sizeof(FSRD::Composition::Constants) == 32);
+static_assert(offsetof(FSRD::Composition::Constants, Flags) == 16);

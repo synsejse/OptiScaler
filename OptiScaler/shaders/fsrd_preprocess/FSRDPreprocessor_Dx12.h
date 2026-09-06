@@ -53,8 +53,6 @@ class FSRDPreprocessor_Dx12
         DebugOutNormDotView = 15 << 17 | Debug,
         DebugAlbedoError = 16 << 17 | Debug,
 
-        DebugFloorVariance = 17 << 17 | Debug,
-        DebugFloorColor = 18 << 17 | Debug,
     };
 
     enum class CompFlags : uint32_t
@@ -66,7 +64,6 @@ class FSRDPreprocessor_Dx12
         Debug = 1 << 16,
         DebugModeMask = 0xFF << 16,
 
-        DebugCorrelation = 1 << 17 | Debug,
         DebugSkipSignal = 2 << 17 | Debug,
         DebugDenoiserOutput = 3 << 17 | Debug,
         DebugFusedLighting = 4 << 17 | Debug,
@@ -88,10 +85,9 @@ class FSRDPreprocessor_Dx12
             ID3D12Resource* InSpecHitDist; // R - NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance - FP16/FP32
             ID3D12Resource* InDiffAlbedo; // RGB - NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo - RGBA32
             ID3D12Resource* InSpecAlbedo; // RGB - NVSDK_NGX_Parameter_GBuffer_SpecularAlbedo - RGBA32
-            ID3D12Resource* InBiasMask; // R8 - NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask
         };
 
-        ID3D12Resource* AsArray[9];
+        ID3D12Resource* AsArray[8];
     };
 
     /**
@@ -111,8 +107,6 @@ class FSRDPreprocessor_Dx12
         float NearPlane; // Near < Far
         float FarPlane;  // Near < Far
 
-        float FloorIsolation;
-
         uint32_t Flags; // Dynamic configuration flags. See: ConfigFlags
     };
 
@@ -122,11 +116,7 @@ class FSRDPreprocessor_Dx12
     struct CompositionDesc
     {
         DirectX::XMFLOAT4 DstTexSize; // XY = Tex Size - ZW = 1 / XY
-        float CorrelationBias; // Enhances the contribution of stable elements to the final image
         uint32_t Flags;
-
-        ID3D12Resource* InRawColor;
-        ID3D12Resource* InColorBeforeParticles; // NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles (Optional)
     };
 
   public:

@@ -2908,13 +2908,6 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                     }
                 }
 
-                if (float v = config->FfxDenoiserCorrelationBias.value_or_default();
-                    ImGui::SliderFloat("Correlation Bias", &v, 0, 1))
-                    config->FfxDenoiserCorrelationBias = v;
-
-                if (float v = config->FfxDenoiserFloorIsolation.value_or_default();
-                    ImGui::SliderFloat("Floor Isolation", &v, 0, 1))
-                    config->FfxDenoiserFloorIsolation = v;
             }
         }
 

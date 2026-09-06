@@ -88,7 +88,13 @@ def analyze(directory):
     diff = tex["input_diffuse_albedo"][..., :3].astype(np.float64)
     spec = tex["input_specular_albedo"][..., :3].astype(np.float64)
     depth = tex["converted_depth"][..., 0]
-    valid = (np.abs(depth - meta["far"]) > .01) & ((diff + spec).sum(axis=-1) > .01)
+    valid = np.abs(depth - meta["far"]) > .01
+    if meta.get("pipeline") == "pure_fused":
+        normals = tex["input_normal_roughness"][..., :3]
+        valid &= np.isfinite(normals).all(axis=-1) & ((normals * normals).sum(axis=-1) > 1e-12)
+        valid &= np.isfinite(tex["input_depth"][..., 0])
+    else:
+        valid &= (diff + spec).sum(axis=-1) > .01
     valid &= np.isfinite(raw).all(axis=-1) & np.isfinite(diff + spec).all(axis=-1)
     result = {"directory": str(directory), "frame": meta["frame"], "reset": meta["reset"],
               "floor_isolation": meta["floor_isolation"], "correlation_bias": meta["correlation_bias"],

@@ -2,9 +2,8 @@
 #include "FSRDPreprocessor_Dx12.h"
 #include "FSRDShaderUtils.h"
 #include "FSRDShaderData.h"
+#include "resource_tracking/FSRDSubmission.h"
 #include <fsrd_generated/FSRDInputConv_Shader.h>
-#include <fsrd_generated/FSRDFloorSeed_Shader.h>
-#include <fsrd_generated/FSRDFloor_Shader.h>
 #include <fsrd_generated/FSRDOutputComp_Shader.h>
 
 #include "dx12/ffx_api_dx12.h"
@@ -50,33 +49,86 @@ namespace FSRDFormats
     constexpr DXGI_FORMAT SkipSignal = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     constexpr DXGI_FORMAT OutputBuffer1 = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    constexpr DXGI_FORMAT OutputBuffer2 = DXGI_FORMAT_R16G16B16A16_FLOAT;
-
-    constexpr DXGI_FORMAT SmoothFloor = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    constexpr DXGI_FORMAT EdgeGuide = DXGI_FORMAT_R8_UNORM;
 }
 
 struct ComputeState
 {
     ID3D12Device* m_pDev = nullptr;
-    
     ComPtr<ID3D12RootSignature> m_rootSig;
     ComPtr<ID3D12PipelineState> m_pso;
-    std::vector<FrameDescriptorHeap> m_frameHeaps;
 
-    ComPtr<ID3D12Resource> m_constUploadBuffer;
-    byte* m_cbMappedData = nullptr;
-    UINT m_cbSlotSize = 0;
-    UINT m_cbCurrentFrameIndex = 0;
-    UINT backBufferCount = kBackBufferCount;
-
-    ~ComputeState()
+    struct Storage
     {
-        if (m_constUploadBuffer && m_cbMappedData)
+        FrameDescriptorHeap heap;
+        ComPtr<ID3D12Resource> constants;
+        ComPtr<ID3D12RootSignature> root;
+        ComPtr<ID3D12PipelineState> pipeline;
+        std::vector<ComPtr<ID3D12Resource>> resources;
+        byte* mapped = nullptr;
+
+        ~Storage()
         {
-            m_constUploadBuffer->Unmap(0, nullptr);
-            m_cbMappedData = nullptr;
+            if (constants && mapped)
+                constants->Unmap(0, nullptr);
         }
+    };
+
+    struct Slot
+    {
+        std::shared_ptr<Storage> storage;
+        std::shared_ptr<FSRDSubmission::Ticket> ticket;
+    };
+
+    std::vector<Slot> m_slots;
+    UINT m_cbSlotSize = 0;
+    UINT m_numSrvs = 0;
+    UINT m_numUavs = 0;
+    std::wstring m_cbName;
+
+    std::shared_ptr<Storage> AcquireStorage(ID3D12GraphicsCommandList* list)
+    {
+        auto slot = std::find_if(m_slots.begin(), m_slots.end(),
+                                  [](const auto& item) { return FSRDSubmission::Complete(item.ticket); });
+        if (slot == m_slots.end())
+        {
+            // The game can record more evaluations than its swapchain buffer count during reloads.
+            // Grow without waiting on a command list that the caller has not submitted yet.
+            if (m_slots.size() >= 64)
+                throw std::runtime_error("FSRD dispatch storage limit reached; GPU work has not completed");
+
+            auto storage = std::make_shared<Storage>();
+            D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_UPLOAD };
+            D3D12_RESOURCE_DESC bufferDesc = {};
+            bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bufferDesc.Width = m_cbSlotSize;
+            bufferDesc.Height = 1;
+            bufferDesc.DepthOrArraySize = 1;
+            bufferDesc.MipLevels = 1;
+            bufferDesc.SampleDesc.Count = 1;
+            bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ThrowIfFailed(m_pDev->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                                           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                           IID_PPV_ARGS(&storage->constants)),
+                            "Failed to create FSRD dispatch constants");
+            storage->constants->SetName(m_cbName.c_str());
+            D3D12_RANGE noRead = { 0, 0 };
+            ThrowIfFailed(storage->constants->Map(0, &noRead, reinterpret_cast<void**>(&storage->mapped)),
+                            "Failed to map FSRD dispatch constants");
+            if (!storage->heap.Initialize(m_pDev, m_numSrvs, m_numUavs, 0, 0))
+                throw std::runtime_error("Failed to create FSRD dispatch descriptor heap");
+            storage->root = m_rootSig;
+            storage->pipeline = m_pso;
+            m_slots.push_back({ std::move(storage), {} });
+            slot = std::prev(m_slots.end());
+            if (m_slots.size() == 4 || m_slots.size() == 8 || m_slots.size() == 16)
+                LOG_INFO("FSRD dispatch storage expanded to {} slots for {}", m_slots.size(),
+                           wstring_to_string(m_cbName));
+        }
+
+        // Register ownership BEFORE recording any GPU references. Storage survives destruction of
+        // this feature and is never reused solely because some number of CPU frames has elapsed.
+        slot->ticket = FSRDSubmission::Retain(m_pDev, list, slot->storage);
+        return slot->storage;
     }
 
     void Initialize(
@@ -89,7 +141,11 @@ struct ComputeState
         UINT backBufferCount = kBackBufferCount)
     {
         m_pDev = pDev;
-        this->backBufferCount = backBufferCount;
+        m_slots.reserve(backBufferCount);
+        m_numSrvs = numSrvs;
+        m_numUavs = numUavs;
+        m_cbName = cbName;
+        m_cbSlotSize = AlignTo256(cbDataSize);
 
         // Create Root Signature
         ThrowIfFailed(m_pDev->CreateRootSignature(0, bytecode.data(), bytecode.size(), IID_PPV_ARGS(&m_rootSig)),
@@ -101,36 +157,6 @@ struct ComputeState
         psoDesc.CS = { bytecode.data(), bytecode.size() };
         ThrowIfFailed(m_pDev->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_pso)), "Failed to create PSO");
 
-        // Create Constant Buffer Upload Heap
-        m_cbSlotSize = AlignTo256(cbDataSize);
-        const UINT bufferSize = m_cbSlotSize * backBufferCount;
-
-        D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_UPLOAD };
-        D3D12_RESOURCE_DESC bufferDesc = {};
-        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufferDesc.Width = bufferSize;
-        bufferDesc.Height = 1;
-        bufferDesc.DepthOrArraySize = 1;
-        bufferDesc.MipLevels = 1;
-        bufferDesc.SampleDesc.Count = 1;
-        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-        ThrowIfFailed(m_pDev->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc, 
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_constUploadBuffer)), "Failed to create Constant Buffer");
-        
-        m_constUploadBuffer->SetName(cbName);
-        D3D12_RANGE readRange = { 0, 0 }; 
-        ThrowIfFailed(m_constUploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_cbMappedData)), "Failed to map Constant Buffer");
-
-        m_frameHeaps.resize(backBufferCount);
-
-        // Create Descriptor Heaps
-        for (auto& heap : m_frameHeaps)
-        {
-            if (!heap.Initialize(m_pDev, numSrvs, numUavs, 0, 0))
-                throw std::runtime_error("Failed to initialize FrameDescriptorHeap");
-        }
     }
 
     void Dispatch(
@@ -149,20 +175,24 @@ struct ComputeState
 
         ScopedSkipHeapCapture skipHeapCapture {};
 
-        // Constant Buffer Updates
-        const UINT currentFrame = m_cbCurrentFrameIndex;
-        const UINT currentOffset = currentFrame * m_cbSlotSize;
-        memcpy(m_cbMappedData + currentOffset, cbData.data(), cbData.size());
+        if (cbData.size() > m_cbSlotSize || inputs.size() != m_numSrvs || output.size() != m_numUavs)
+            throw std::runtime_error("FSRD dispatch layout does not match its shader");
 
-        D3D12_GPU_VIRTUAL_ADDRESS cbAddress = m_constUploadBuffer->GetGPUVirtualAddress() + currentOffset;
-        m_cbCurrentFrameIndex = (m_cbCurrentFrameIndex + 1) % backBufferCount;
+        auto storage = AcquireStorage(cmdList);
+        storage->resources.clear();
+        for (auto* resource : inputs)
+            storage->resources.emplace_back(resource);
+        for (auto* resource : output)
+            storage->resources.emplace_back(resource);
+        memcpy(storage->mapped, cbData.data(), cbData.size());
+        const auto cbAddress = storage->constants->GetGPUVirtualAddress();
 
         // Transitions SRV -> UAV
         if (autoBarrierOutput)
             AddBarriers(cmdList, output, outputMips, kSrvState, kUavState);
 
         // Update descriptors
-        FrameDescriptorHeap& currentHeap = m_frameHeaps[currentFrame];
+        FrameDescriptorHeap& currentHeap = storage->heap;
         CreateSRVs(m_pDev, currentHeap, inputs, inputMips);
         CreateUAVs(m_pDev, currentHeap, output, outputMips);
 
@@ -210,8 +240,6 @@ struct FSRDPreprocessor_Dx12::Impl
 {
     ID3D12Device* m_pDev = nullptr;
 
-    ComputeState m_floorSeedShader;
-    ComputeState m_floorFilterShader;
     ComputeState m_convShader;
     ComputeState m_compShader;
 
@@ -223,23 +251,13 @@ struct FSRDPreprocessor_Dx12::Impl
     // Internal storage
     Conversion::Output m_out;
     ComPtr<ID3D12Resource> m_outputBuffer1;
-    ComPtr<ID3D12Resource> m_outputBuffer2;
-
-    // Floor filter
-    ID3D12Resource* m_smoothFloor;
-    ComPtr<ID3D12Resource> m_edgeGuide;
-
-    void Initialize(std::span<const byte> blSeedByteCode, std::span<const byte> blPyramidByteCode,
-                    std::span<const byte> convByteCode, std::span<const byte> compByteCode)
+    ComPtr<ID3D12Resource> m_compositionOutput;
+    void Initialize(std::span<const byte> convByteCode, std::span<const byte> compByteCode)
     {
         ScopedSkipHeapCapture skipHeapCapture {};
 
         LOG_DEBUG("Creating FSRD interop shaders...");
 
-        m_floorSeedShader.Initialize(m_pDev, blSeedByteCode, sizeof(FloorSeed::Constants), 
-            FloorSeed::Input::kCount, FloorSeed::Output::kCount, L"FSRD_FloorSeed_Constants", FloorSeed::kBackBufferCount);
-        m_floorFilterShader.Initialize(m_pDev, blPyramidByteCode, sizeof(FloorFilter::Constants), 
-            FloorFilter::Input::kCount, FloorFilter::Output::kCount, L"FSRD_FloorFilter_Constants", FloorFilter::kBackBufferCount);
         m_convShader.Initialize(m_pDev, convByteCode, sizeof(Conversion::Constants), 
             Conversion::Input::kCount, Conversion::Output::kCount, L"FSRD_Conv_Constants", Conversion::kBackBufferCount);
         m_compShader.Initialize(m_pDev, compByteCode, sizeof(Composition::Constants), 
@@ -253,15 +271,18 @@ struct FSRDPreprocessor_Dx12::Impl
         if (m_maxWidth == width && m_maxHeight == height)
             return;
 
-        m_maxWidth = width;
-        m_maxHeight = height;
+        if (width == 0 || height == 0)
+            throw std::runtime_error("FSRD render capacity must be nonzero");
 
         auto CreateTex = [&](DXGI_FORMAT fmt, LPCWSTR name, UINT mipLevels = 1)
         { 
             return CreateTexture2D(m_pDev, width, height, fmt, name, kSrvState, mipLevels);
         };
 
-        auto& outResources = m_out.Resources;
+        // Publish a complete allocation only. A failed allocation must not leave a half-resized
+        // converter whose dimensions falsely advertise readiness on a subsequent retry.
+        Conversion::Output replacement;
+        auto& outResources = replacement.Resources;
         outResources.Motion = CreateTex(FSRDFormats::Motion, L"FSR_Conv_Motion");
         outResources.Normals = CreateTex(FSRDFormats::Normals, L"FSR_Conv_Normals");
         outResources.SpecAlbedo = CreateTex(FSRDFormats::SpecAlbedo, L"FSR_Conv_SpecAlbedo");
@@ -269,81 +290,15 @@ struct FSRDPreprocessor_Dx12::Impl
         outResources.LinearDepth = CreateTex(FSRDFormats::LinearDepth, L"FSR_Conv_LinearDepth");
         outResources.SkipSignal = CreateTex(FSRDFormats::SkipSignal, L"FSR_Conv_SkipSignal");
 
-        m_outputBuffer1 = CreateTex(FSRDFormats::OutputBuffer1, L"FSR_Conv_OutputBuffer1");
-        // The floor filter still needs two scratch buffers; only buffer 1 is a denoiser output.
-        m_outputBuffer2 = CreateTex(FSRDFormats::OutputBuffer2, L"FSR_Conv_OutputBuffer2");
-
-        m_smoothFloor = nullptr;
-        m_edgeGuide = CreateTex(FSRDFormats::EdgeGuide, L"FSR_Conv_EdgeGuide");
+        auto outputBuffer = CreateTex(FSRDFormats::OutputBuffer1, L"FSR_Conv_OutputBuffer1");
 
         outResources.Radiance = CreateTex(FSRDFormats::Radiance, L"FSR_Conv_Radiance");
         outResources.FusedAlbedo = CreateTex(FSRDFormats::FusedAlbedo, L"FSR_Conv_FusedAlbedo");
-    }
 
-    void DispatchPyramidSeed(ID3D12GraphicsCommandList* cmdList, const ConversionDesc& desc) 
-    {
-        const XMFLOAT2 dispatchSize = { desc.RenderSize.x, desc.RenderSize.y };
-        const bool isDepthLinear = (desc.Flags & (uint32_t) ConvFlags::IsDepthLinear);
-        m_smoothFloor = m_outputBuffer1.Get();
-
-        FloorSeed::Constants constants = 
-        { 
-            .InvProjMatrix = desc.InvProjMatrix,
-            .RenderSize = desc.RenderSize,
-            .NearPlane = desc.NearPlane,
-            .FarPlane = desc.FarPlane,
-            .Flags = isDepthLinear ? uint32_t(FloorSeed::Flags::LinearDepth) : 0u
-        };
-        const auto cbData = GetAsByteSpan(constants);
-
-        // Create median filtered raw color before cross bilateral filtering
-        // Write to mip chain at top level
-        FloorSeed::Input in = { .Resources =  
-        {
-            .InColor = desc.Resources.InColor,
-            .InSpecAlbedo = desc.Resources.InSpecAlbedo,
-            .InDiffAlbedo = desc.Resources.InDiffAlbedo,
-            .InDepth = desc.Resources.InDepth
-        }};
-
-        FloorSeed::Output out = { .Resources = 
-        {
-            .OutColor = m_smoothFloor,
-            .OutEdges = m_edgeGuide.Get()
-        }};
-
-        m_floorSeedShader.Dispatch(cmdList, cbData, in.AsArray, out.AsArray, dispatchSize);
-    }
-
-    void DispatchFloorFilter(ID3D12GraphicsCommandList* cmdList, const ConversionDesc& desc) 
-    {
-        const XMFLOAT2 dispatchSize = { desc.RenderSize.x, desc.RenderSize.y };
-
-        for (int i = 0; i <= FloorFilter::kPasses; i++)
-        {
-            FloorFilter::Constants constants = 
-            {
-                .DstTexSize = desc.RenderSize,
-                .StepSize = 1 << i
-            };
-            const auto cbData = GetAsByteSpan(constants);
-
-            FloorFilter::Input in = { .Resources = 
-            {
-                .InColor = m_smoothFloor,
-                .InEdgeGuide = m_edgeGuide.Get()
-            }};
-
-            FloorFilter::Output out = { .Resources = 
-            {
-                .OutColor = m_outputBuffer2.Get()
-            }};
-
-            m_floorFilterShader.Dispatch(cmdList, cbData, in.AsArray, out.AsArray, dispatchSize);
-
-            std::swap(m_outputBuffer1, m_outputBuffer2);
-            m_smoothFloor = m_outputBuffer1.Get();
-        }
+        m_out = std::move(replacement);
+        m_outputBuffer1 = std::move(outputBuffer);
+        m_maxWidth = width;
+        m_maxHeight = height;
     }
 
     void DispatchPackingShader(ID3D12GraphicsCommandList* cmdList, const ConversionDesc& desc) 
@@ -362,11 +317,8 @@ struct FSRDPreprocessor_Dx12::Impl
             .RenderSize = desc.RenderSize,
             .NearPlane = desc.NearPlane,
             .FarPlane = desc.FarPlane,
-            .FloorIsolation = desc.FloorIsolation,
             .Flags = desc.Flags
         };
-
-        in.Resources.InBlurColor = m_smoothFloor;
 
         const std::span<const byte> convCBData((const byte*) &packConstants, sizeof(packConstants));
         auto outputs = m_out.GetRawResources();
@@ -382,10 +334,6 @@ struct FSRDPreprocessor_Dx12::Impl
             throw std::runtime_error("FSRD render size exceeds allocated buffers");
         m_renderSize = { desc.RenderSize.x, desc.RenderSize.y };
 
-        // Filtered raster lighting estimate
-        DispatchPyramidSeed(cmdList, desc);
-        DispatchFloorFilter(cmdList, desc);
-
         // DLSS-RR to FSR-RR conversion
         DispatchPackingShader(cmdList, desc);
 
@@ -394,24 +342,34 @@ struct FSRDPreprocessor_Dx12::Impl
     void DispatchComposition(ID3D12GraphicsCommandList* cmdList, const CompositionDesc& desc)
     {
         if (!cmdList || !m_maxWidth)
-            return;
+            throw std::runtime_error("FSRD composition has no command list or allocated buffers");
+
+        const UINT width = static_cast<UINT>(desc.DstTexSize.x);
+        const UINT height = static_cast<UINT>(desc.DstTexSize.y);
+        if (width == 0 || height == 0 || width > m_maxWidth || height > m_maxHeight)
+            throw std::runtime_error("FSRD composition extent exceeds allocated buffers");
+
+        // FSR's exposure pass may inspect the underlying allocation, not just renderSize. Never
+        // give it inactive/uninitialized display-capacity padding as part of the composed color.
+        // Recorded dispatch storage retains previous outputs until their submission completes.
+        if (!m_compositionOutput || m_compositionOutput->GetDesc().Width != width ||
+            m_compositionOutput->GetDesc().Height != height)
+            m_compositionOutput = CreateTexture2D(m_pDev, width, height, FSRDFormats::Radiance,
+                                                  L"FSR_Composed_Color", kSrvState);
 
         auto& outResources = m_out.Resources;
         Composition::Input inputs = {};
         Composition::Constants constants = 
         {
             .DstTexSize = desc.DstTexSize,
-            .CorrelationBias = desc.CorrelationBias,
             .Flags = UINT(desc.Flags) 
         };
 
         inputs.Resources = { .InDenoisedRadiance = m_outputBuffer1.Get(),
                              .InFusedAlbedo = outResources.FusedAlbedo.Get(),
-                             .InSkipSignal = outResources.SkipSignal.Get(),
-                             .InRawColor = desc.InRawColor,
-                             .InColorBeforeParticles = desc.InColorBeforeParticles };
+                             .InSkipSignal = outResources.SkipSignal.Get() };
 
-        std::array<ID3D12Resource*, 1> uavs { m_out.Resources.Motion.Get() };
+        std::array<ID3D12Resource*, 1> uavs { m_compositionOutput.Get() };
         const std::span<const byte> cbData((const byte*) &constants, sizeof(constants));
         const XMFLOAT2 dstDim = { constants.DstTexSize.x, constants.DstTexSize.y };
 
@@ -460,8 +418,7 @@ FSRDPreprocessor_Dx12::FSRDPreprocessor_Dx12(std::string_view name, ID3D12Device
     try
     {
         m_impl->m_pDev = pDev;
-        m_impl->Initialize(GetAsByteSpan(FSRDFloorSeed_cso), GetAsByteSpan(FSRDFloor_cso),
-                           GetAsByteSpan(FSRDInputConv_cso), GetAsByteSpan(FSRDOutputComp_cso));
+        m_impl->Initialize(GetAsByteSpan(FSRDInputConv_cso), GetAsByteSpan(FSRDOutputComp_cso));
         m_IsInitialized = true;
     }
     catch (const std::exception& err)
@@ -568,7 +525,7 @@ ID3D12Resource* FSRDPreprocessor_Dx12::GetPreservedLighting() const
 
 ID3D12Resource* FSRDPreprocessor_Dx12::GetCompositionOutput() const 
 { 
-    return m_impl->m_out.Resources.Motion.Get(); 
+    return m_impl->m_compositionOutput.Get();
 }
 
 bool FSRDPreprocessor_Dx12::Blit(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* srcTex,

@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "ResTrack_dx12.h"
 #include "upscalers/ffx/FSRDResearchCapture.h"
+#include "FSRDSubmission.h"
 
 #include <Config.h>
 #include <State.h>
@@ -629,13 +630,21 @@ void ResTrack_Dx12::hkCreateUnorderedAccessView(ID3D12Device* This, ID3D12Resour
 
 #pragma endregion
 
-ID3D12CommandList* ResTrack_Dx12::PrepareResearchSubmission(ID3D12Device* device, ID3D12CommandList* list)
+ID3D12CommandList* ResTrack_Dx12::PrepareSubmission(ID3D12Device* device, ID3D12CommandList* list)
 {
     HookToQueue(device);
     if (o_ExecuteCommandLists == nullptr)
         return nullptr;
+    // This is also used by production FSRD dispatch retention: do not log once per shader dispatch.
+    std::call_once(streamlineRiidInitFlag,
+                   []() { IIDFromString(L"{ADEC44E2-61F0-45C3-AD9F-1B37379284FF}", &streamlineRiid); });
     IUnknown* real = nullptr;
-    return CheckForRealObject("FSRRR research", list, &real) ? static_cast<ID3D12CommandList*>(real) : list;
+    if (SUCCEEDED(list->QueryInterface(streamlineRiid, reinterpret_cast<void**>(&real))) && real)
+    {
+        real->Release(); // The caller owns the wrapper and retains this identity before recording.
+        return static_cast<ID3D12CommandList*>(real);
+    }
+    return list;
 }
 
 void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists,
@@ -697,8 +706,10 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
         if (!found.empty())
         {
+            const auto fsrdSubmission = FSRDSubmission::Preparing(NumCommandLists, ppCommandLists);
             o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
             FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
+            FSRDSubmission::Submitted(This, fsrdSubmission);
 
             for (size_t i = 0; i < found.size(); i++)
             {
@@ -711,8 +722,10 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
     LOG_TRACK("Done NumCommandLists: {}", NumCommandLists);
 
+    const auto fsrdSubmission = FSRDSubmission::Preparing(NumCommandLists, ppCommandLists);
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
     FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
+    FSRDSubmission::Submitted(This, fsrdSubmission);
 }
 
 #pragma region Heap hooks

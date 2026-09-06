@@ -432,6 +432,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderData.h" />
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderUtils.h" />
     <ClInclude Include="upscalers\ffx\FSRDInputMath.h" />
+    <ClInclude Include="resource_tracking\FSRDSubmission.h" />
+    <ClInclude Include="resource_tracking\FSRDSubmissionPolicy.h" />
     <ClInclude Include="shaders\Shader_Dx12.h" />
     <ClInclude Include="shaders\Shader_Dx12Utils.h" />
     <ClInclude Include="shaders\Shader_Vk.h" />
@@ -867,8 +869,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDFloor.hlsl" />
-    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDFloorSeed.hlsl" />
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDInputConv.hlsl" />
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDOutputComp.hlsl" />
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDResearchCopy.hlsl" />

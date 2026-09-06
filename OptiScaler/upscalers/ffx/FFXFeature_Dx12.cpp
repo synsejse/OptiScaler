@@ -93,6 +93,8 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     LOG_FUNC();
 
     auto& cfg = *Config::Instance();
+    // RR has its own public/UI version; these gates describe the SR context created by this base class.
+    const auto upscalerVersion = FFXFeature::Version();
 
     struct ffxDispatchDescUpscale params = { 0 };
     params.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -118,7 +120,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     // Force enable RCAS when in FSR4 debug view mode
     // it crashes when sharpening is disabled
     // Debug view expects RCAS output (now sure why)
-    if (Version() >= feature_version { 4, 0, 2 } && Config::Instance()->FsrDebugView.value_or_default() &&
+    if (upscalerVersion >= feature_version { 4, 0, 2 } && Config::Instance()->FsrDebugView.value_or_default() &&
         !params.enableSharpening)
     {
         params.enableSharpening = true;
@@ -163,7 +165,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
         // WAR for FSR 4's autoexposure shader reading entire underlying resource
         // instead of what's specified by renderSize or color's FfxApiResourceDescription.
         // Only linear has this issue
-        if (Version().major >= 4 && AutoExposure() && !Config::Instance()->FsrNonLinearPQ.value_or_default() &&
+        if (upscalerVersion.major >= 4 && AutoExposure() && !Config::Instance()->FsrNonLinearPQ.value_or_default() &&
             !Config::Instance()->FsrNonLinearSRGB.value_or_default() &&
             !Config::Instance()->FsrNonLinearColorSpace.value_or_default())
         {
@@ -414,7 +416,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
 
     // For FSR 4 as it seems to be missing some conversions from typeless
     // transparencyAndComposition and exposure might be unnecessary here
-    if (Version().major >= 4)
+    if (upscalerVersion.major >= 4)
     {
         ffxResolveTypelessFormat(params.color.description.format);
         ffxResolveTypelessFormat(params.depth.description.format);
@@ -486,7 +488,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &params.preExposure) != NVSDK_NGX_Result_Success)
         params.preExposure = 1.0f;
 
-    if (Version() >= feature_version { 3, 1, 1 } && _velocity != Config::Instance()->FsrVelocity.value_or_default())
+    if (upscalerVersion >= feature_version { 3, 1, 1 } && _velocity != Config::Instance()->FsrVelocity.value_or_default())
     {
         _velocity = Config::Instance()->FsrVelocity.value_or_default();
         ffxConfigureDescUpscaleKeyValue m_upscalerKeyValueConfig {};
@@ -499,7 +501,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
             LOG_WARN("Velocity configure result: {}", (UINT) result);
     }
 
-    if (Version() >= feature_version { 3, 1, 4 })
+    if (upscalerVersion >= feature_version { 3, 1, 4 })
     {
         if (_reactiveScale != Config::Instance()->FsrReactiveScale.value_or_default())
         {

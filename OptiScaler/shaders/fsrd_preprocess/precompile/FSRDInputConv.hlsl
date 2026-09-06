@@ -4,7 +4,7 @@
 #define MainRS \
     "RootFlags(0), " \
     "CBV(b0), " \
-    "DescriptorTable(SRV(t0, numDescriptors = 10), visibility = SHADER_VISIBILITY_ALL), " \
+    "DescriptorTable(SRV(t0, numDescriptors = 8), visibility = SHADER_VISIBILITY_ALL), " \
     "DescriptorTable(UAV(u0, numDescriptors = 8), visibility = SHADER_VISIBILITY_ALL), "
 
 // Dispatch config
@@ -45,9 +45,6 @@ static const uint2 s_ThreadGroupSize = uint2(THREAD_GROUP_SIZE_X, THREAD_GROUP_S
 #define FLAGS_DEBUG_OUT_NORM_DOT_VIEW   (15 << 17 | FLAGS_DEBUG)
 #define FLAGS_DEBUG_ALBEDO_OVERSHOOT    (16 << 17 | FLAGS_DEBUG)
 
-#define FLAGS_DEBUG_FLOOR_VARIANCE      (17 << 17 | FLAGS_DEBUG)
-#define FLAGS_DEBUG_FLOOR_COLOR         (18 << 17 | FLAGS_DEBUG)
-
 // DLSS-RR Inputs
 Texture2D<half3> InColor : register(t0); // RGB - NVSDK_NGX_Parameter_Color
 Texture2D<float> InDepth : register(t1); // R - NVSDK_NGX_Parameter_Depth - hardware or linear - inverted or not
@@ -57,10 +54,6 @@ Texture2D<float> InRoughness : register(t4); // R - May be packed in normals. NV
 Texture2D<float> InSpecHitDist : register(t5); // R - NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance
 Texture2D<half3> InDiffAlbedo : register(t6); // RGB - NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo
 Texture2D<half3> InSpecAlbedo : register(t7); // RGB - NVSDK_NGX_Parameter_GBuffer_SpecularAlbedo
-Texture2D<half> InBiasMask : register(t8);
-
-Texture2D<half4> InBlurColor : register(t9);
-
 // FSR-RR - ffxDispatchDescDenoiserInput1Signal
 // RGB: Demodulated combined lighting, A: Specular Ray Length
 RWTexture2D<half4> OutRadiance : register(u0);
@@ -87,8 +80,8 @@ cbuffer CB_Packing : register(b0)
     float NearPlane;
     float FarPlane;   
     
-    float FloorIsolation;
     uint Flags;
+    float Padding;
 };
 
 bool IsSet(uint mask) { return (Flags & mask) == mask; }
@@ -128,45 +121,40 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     if (px.x >= RenderSize.x || px.y >= RenderSize.y)
         return;
     
-    const float3 rawColor = GetSafeFP16(InColor[px].rgb);
-    float3 floorColor = InBlurColor[px].rgb;
+    // Do not estimate which lighting is raster, emissive or transparent. Preserve the entire
+    // finite source, including negative RGB and the full FP16 range, for the fused round trip.
+    const float3 inputColor = InColor[px].rgb;
+    const float3 rawColor = all(isfinite(inputColor)) ? inputColor : 0.0f;
+    const float2 inputMotion = InMotionVectors[px].rg;
+    const float2 motionIn = all(isfinite(inputMotion)) ? inputMotion : 0.0f;
+    float4 specReflectance = float4(InSpecAlbedo[px].rgb, 0.0f);
+    float4 diffAlbedo = float4(InDiffAlbedo[px].rgb, 0.0f);
     
-    const float rawLuma = GetLuminance(rawColor);
-    const float floorLuma = GetLuminance(floorColor);
-    
-    // Clamp floor to minimum and blend in raw values where similar to preserve microcontrast
-    const float floorSimilarity = GetRelativeSimilarity(floorLuma, rawLuma, 0.2f);
-    floorColor = lerp(floorColor, rawColor, saturate(floorSimilarity));
-    floorColor = FloorIsolation * min(rawColor, floorColor);
-    
-    const float3 denosierColor = rawColor - floorColor;           
-    
-    // Zeroed albedos are unusable sentinels and must be skipped. Depth values at the far plane 
-    // indicate a skybox or other skippable content.
-    float4 specReflectance = float4(GetSafeFP16(InSpecAlbedo[px].rgb), 0.0f);
-    float4 diffAlbedo = float4(GetSafeFP16(InDiffAlbedo[px].rgb), 0.0f);
-    
-    const float3 viewSpacePos = GetViewSpacePos(px);
-    const float linearDepth = abs(viewSpacePos.z);
+    // Check the source before reconstruction: division/clamping can hide invalid depth.
+    const bool validDepth = isfinite(InDepth[px]);
+    const float3 viewSpacePos = validDepth ? GetViewSpacePos(px) : float3(0.0f, 0.0f, FarPlane);
+    const float linearDepth = validDepth && isfinite(viewSpacePos.z) ? abs(viewSpacePos.z) : FarPlane;
     OutLinearDepth[px] = linearDepth;
     
-    const float depthDelta = abs(linearDepth - FarPlane);
-    const float totalAlbedo = dot(specReflectance.rgb + diffAlbedo.rgb, 1.0f);
-    
-    if ((depthDelta > 1e-2f && (totalAlbedo > 1e-2f)) || IsSet(FLAGS_DEBUG))
+    const float4 worldSurfaceNormal = InNormals[px];
+    const bool validSurface = validDepth && all(isfinite(viewSpacePos)) && abs(linearDepth - FarPlane) > 1e-2f &&
+        all(isfinite(worldSurfaceNormal.xyz)) && dot(worldSurfaceNormal.xyz, worldSurfaceNormal.xyz) > 1e-12f;
+
+    // Zero/near-zero material albedos are valid guides, not evidence that lighting should bypass RR.
+    if (validSurface || IsSet(FLAGS_DEBUG))
     {        
         // Normals - FSR-RR requries world normals.
         //
         // [TODO!] DLSS-RR normals may be in view or world space. They will need to be transformed to account
         // for both configurations. Cyberpunk happens to use world normals, thankfully.
-        float4 worldSurfaceNormal = InNormals[px];        
         const float2 octNormal = OctahedralEncode(worldSurfaceNormal.rgb);
         const float materialType = 0.0f;
     
         // DLSS-RR provides 3D normals
         // Linear roughness optionally included in the A channel, or in a separate single-channel 
         // buffer (InRoughness).
-        const float roughness = IsSet(FLAGS_PACKED_ROUGHNESS) ? worldSurfaceNormal.a : InRoughness[px];
+        const float inputRoughness = IsSet(FLAGS_PACKED_ROUGHNESS) ? worldSurfaceNormal.a : InRoughness[px];
+        const float roughness = isfinite(inputRoughness) ? saturate(inputRoughness) : 0.0f;
     
         // Output: RG=OctNormal, B=Roughness, A=MaterialID
         OutNormals[px] = GetSafeFP16(float4(octNormal, roughness, materialType));
@@ -179,10 +167,11 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         prevViewSpacePos.z = abs(prevViewSpacePos.z);
         
         // Camera-only depth delta: NGX's 2D motion cannot recover independent object motion along Z.
-        const float depthDelta = (prevViewSpacePos.z - linearDepth);
+        const float inputDepthDelta = (prevViewSpacePos.z - linearDepth);
+        // Prevent a nonfinite/overflowing derived value from poisoning temporal history.
+        const float depthDelta = isfinite(inputDepthDelta) ? clamp(inputDepthDelta, -65504.0f, 65504.0f) : 0.0f;
     
         // FSR-RR requires Linear Depth Delta in Blue channel
-        const float2 motionIn = InMotionVectors[px].rg; // RG: Pixel Movement
         const float3 motionOut = float3(motionIn, depthDelta);
         OutMotion[px] = half4(motionOut, 0.0f);
 
@@ -196,31 +185,31 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         // DLSS-RR specular albedo is hemispherical specular reflectance at (NoV, roughness).
         // Diffuse albedo is the diffuse component of reflectance.                   
 
-        // Total albedo near or greater than 1 violate conservation of energy
-        // May be sentinel value or bug
+        // These are separate material guides, not weights for splitting the lighting. Neither
+        // NVIDIA's contract nor AMD's fused sample requires their sum to be <= 1.
+        // Retain the overshoot only as an input debug view; do not rewrite either guide with it.
         const float3 albedoOvershoot = max((specReflectance.rgb + diffAlbedo.rgb) - 1.0f, 0.0f);
-        specReflectance.rgb = saturate(specReflectance.rgb - albedoOvershoot);
-        diffAlbedo.rgb -= max((specReflectance.rgb + diffAlbedo.rgb) - 1.0f, 0.0f);
-        
-        specReflectance.rgb = max(specReflectance.rgb, 1e-3f);
-        diffAlbedo.rgb = max(diffAlbedo.rgb, 1e-3f);
 
-        // Demodulate with the exact albedo that will be stored. The old 8-bit output could round
-        // small nonzero albedos to zero and lose their lighting during composition.
+        // Match RGB10A2 storage without inventing a nonzero diffuse/specular component.
+        specReflectance.rgb = all(isfinite(specReflectance.rgb)) ? specReflectance.rgb : 0.0f;
+        diffAlbedo.rgb = all(isfinite(diffAlbedo.rgb)) ? diffAlbedo.rgb : 0.0f;
         specReflectance.rgb = round(saturate(specReflectance.rgb) * 1023.0f) / 1023.0f;
         diffAlbedo.rgb = round(saturate(diffAlbedo.rgb) * 1023.0f) / 1023.0f;
 
         // AMD's fused mode consumes specular ray length in radiance alpha. Null input reads zero.
         const float rawHitDist = InSpecHitDist[px];
-        const half hitDist = isfinite(rawHitDist) ? GetSafeFP16(max(rawHitDist, 0.0f)) : 0.0f;
+        const half hitDist = isfinite(rawHitDist) ? clamp(rawHitDist, 0.0f, 65504.0f) : 0.0f;
         // AMD's native single-signal contract: normalize the combined lighting by a shared albedo.
         // This does not invent separate diffuse or specular lighting.
-        float4 fusedAlbedo = float4(max(specReflectance.rgb, diffAlbedo.rgb), 0.0f);
-        const half3 demodColor = GetSafeFP16(denosierColor / fusedAlbedo.rgb);
+        // AMD's SDK 2.2 sample floors only this denominator, not the material guides.
+        float4 fusedAlbedo = float4(max(1e-3f, max(specReflectance.rgb, diffAlbedo.rgb)), 0.0f);
+        fusedAlbedo.rgb = round(fusedAlbedo.rgb * 1023.0f) / 1023.0f;
+        // Explicit FP16 rounding makes the residual agree with the actually stored signal.
+        const float3 demodColor = f16tof32(f32tof16(clamp(rawColor / fusedAlbedo.rgb, 0.0f, 65504.0f)));
 
-        // Preserve radiance that cannot survive FP16 demodulation rather than clipping it away.
-        const float3 residual = max(0.0f, denosierColor - (demodColor * fusedAlbedo.rgb));
-        floorColor += residual;
+        // This is a numerical remainder, not a guessed lighting separation. Signed residuals
+        // preserve finite negative source values, demodulation overflow and rounding overshoot.
+        const float3 preservedLighting = rawColor - (demodColor * fusedAlbedo.rgb);
 
         [branch]
         if (!IsSet(FLAGS_NON_GAMMA_ALBEDO))
@@ -243,7 +232,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         
         OutSpecAlbedo[px] = GetSafeFP16(specReflectance);
         OutDiffAlbedo[px] = GetSafeFP16(diffAlbedo);
-        OutSkipSignal[px] = GetSafeFP16(float4(floorColor, 0.0f));
+        OutSkipSignal[px] = float4(preservedLighting, 0.0f);
         
         [branch]
         if (IsSet(FLAGS_DEBUG))
@@ -313,14 +302,6 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
                     debugColor = diffAlbedo.rgb;
                     break;
 
-                case FLAGS_DEBUG_FLOOR_VARIANCE:
-                    debugColor = TurboColormap(InBlurColor[px].a);
-                    break;
-                
-                case FLAGS_DEBUG_FLOOR_COLOR:
-                    debugColor = InBlurColor[px].rgb;
-                    break;
-                
                 case FLAGS_DEBUG_ALBEDO_OVERSHOOT:
                     debugColor = albedoOvershoot;
                     break;
@@ -336,7 +317,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     else // Skip
     {
         // This texture is reused for composed color after denoising. Never retain last frame's RGB as motion.
-        OutMotion[px] = half4(InMotionVectors[px].rg, 0.0f, 0.0f);
+        OutMotion[px] = half4(motionIn, 0.0f, 0.0f);
         OutNormals[px] = 0.0f;
         OutSpecAlbedo[px] = 0.0f;
         OutDiffAlbedo[px] = 0.0f;
