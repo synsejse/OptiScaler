@@ -72,6 +72,7 @@ class CaptureUI(unittest.TestCase):
         self.assertIn('Record(batch, "backend_output", texture, true)', output)
         self.assertIn("texture, state, readable", output)
         self.assertIn("texture, readable, state", output)
+        self.assertLess(output.index("D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE"), output.index("FSRD::AddBarrier"))
         self.assertIn("cfg.OutputResourceBarrier.value()", FEATURE)
         self.assertIn('"output_stage"', FEATURE)
 

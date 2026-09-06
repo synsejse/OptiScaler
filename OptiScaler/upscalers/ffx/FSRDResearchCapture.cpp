@@ -359,6 +359,13 @@ void RecordOutput(const Capture& batch, ID3D12Resource* texture, D3D12_RESOURCE_
         batch->partial = true;
         return;
     }
+    if (texture->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+    {
+        // Record will report metadata only. Even transitioning such a resource to
+        // shader-read would violate its creation flags; leave the game's output alone.
+        Record(batch, "backend_output", texture, true);
+        return;
+    }
     constexpr auto readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     FSRD::AddBarrier(batch->list.Get(), texture, state, readable);
     Record(batch, "backend_output", texture, true);
