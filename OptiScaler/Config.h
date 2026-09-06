@@ -462,6 +462,7 @@ class Config
     CustomOptional<int> FfxDenoiserCaptureSamples { 0 };
     CustomOptional<bool> FfxDenoiserResearchCapture { false };
     CustomOptional<bool> FfxDenoiserNativeDebug { false }; // Context creation only; restart required.
+    CustomOptional<bool> FfxDenoiserCyberpunkFogProbe { false }; // Opt-in provenance only; restart required.
 
     CustomOptional<float> FfxDenoiserDisocclusionThreshold { 0.02f };
     CustomOptional<float> FfxDenoiserCrossBlNormStr { 0.7f };
