@@ -561,6 +561,11 @@ bool FSRDPreprocessor_Dx12::DispatchComposition(ID3D12GraphicsCommandList* cmdLi
     return false;
 }
 
+ID3D12Resource* FSRDPreprocessor_Dx12::GetPreservedLighting() const
+{
+    return m_impl->m_out.Resources.SkipSignal.Get();
+}
+
 ID3D12Resource* FSRDPreprocessor_Dx12::GetCompositionOutput() const 
 { 
     return m_impl->m_out.Resources.Motion.Get(); 

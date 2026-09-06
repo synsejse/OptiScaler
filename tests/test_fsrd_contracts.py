@@ -9,6 +9,31 @@ SHADERS = ROOT / "OptiScaler/shaders/fsrd_preprocess"
 
 
 class RRContracts(unittest.TestCase):
+    def test_research_capture_waits_for_actual_submission(self):
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDResearchCapture.cpp").read_text()
+        submitted = source.split("void Submitted(", 1)[1].split("void Poll()", 1)[0]
+        self.assertIn("batch->submittedList", submitted)
+        self.assertIn("queue->Signal", submitted)
+        poll = source.split("void Poll()", 1)[1]
+        self.assertLess(poll.index("GetCompletedValue"), poll.index("->Map("))
+        self.assertIn("completed == UINT64_MAX", poll)
+        self.assertNotIn("WaitForSingleObject", source)
+        self.assertNotIn("Sleep(", source)
+        hook = (ROOT / "OptiScaler/resource_tracking/ResTrack_dx12.cpp").read_text()
+        for section in hook.split("FSRDResearch::Submitted(")[:-1]:
+            self.assertRegex(section, r"o_ExecuteCommandLists\(This, NumCommandLists, ppCommandLists\);\s*$")
+
+    def test_research_capture_is_bounded_and_preserves_channels(self):
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDResearchCapture.cpp").read_text()
+        self.assertIn("registry.pending.size() >= 2", source)
+        self.assertIn("registry.count >= 12", source)
+        self.assertIn("batch->bytes + bytes > MaxBytes", source)
+        shader = (SHADERS / "precompile/FSRDResearchCopy.hlsl").read_text()
+        self.assertIn("RWStructuredBuffer<float4>", shader)
+        self.assertIn("Input.Load(int3(id.xy, 0))", shader)
+        self.assertNotIn("half", shader)
+        self.assertNotIn("saturate", shader)
+
     def test_fused_path_still_allocates_both_floor_scratch_buffers(self):
         source = (SHADERS / "FSRDPreprocessor_Dx12.cpp").read_text()
         allocation = source.split("void SetMaxRenderSize(", 1)[1].split("void DispatchPyramidSeed", 1)[0]
@@ -76,11 +101,11 @@ class RRContracts(unittest.TestCase):
             self.assertLess(shader.index(quantize), shader.index("half3 demodColor"))
         self.assertGreater(round(1e-3 * 1023) / 1023, 0)
 
-    def test_msbuild_generates_all_four_kernels(self):
+    def test_msbuild_generates_all_five_kernels(self):
         tree = ET.parse(ROOT / "OptiScaler/OptiScaler.vcxproj")
         ns = {"m": "http://schemas.microsoft.com/developer/msbuild/2003"}
         kernels = tree.findall(".//m:FSRDShader", ns)
-        self.assertEqual(len(kernels), 4)
+        self.assertEqual(len(kernels), 5)
         for kernel in kernels:
             self.assertTrue((ROOT / "OptiScaler" / kernel.attrib["Include"].replace("\\", "/")).is_file())
         target = tree.find(".//m:Target[@Name='CompileFSRDShaders']", ns)

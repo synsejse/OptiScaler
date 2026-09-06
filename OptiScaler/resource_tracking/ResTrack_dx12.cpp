@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "ResTrack_dx12.h"
+#include "upscalers/ffx/FSRDResearchCapture.h"
 
 #include <Config.h>
 #include <State.h>
@@ -688,6 +689,7 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
         if (!found.empty())
         {
             o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+            FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
 
             for (size_t i = 0; i < found.size(); i++)
             {
@@ -701,6 +703,7 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
     LOG_TRACK("Done NumCommandLists: {}", NumCommandLists);
 
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+    FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
 }
 
 #pragma region Heap hooks

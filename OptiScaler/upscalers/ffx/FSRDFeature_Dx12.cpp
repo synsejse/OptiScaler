@@ -6,6 +6,8 @@
 #include "shaders/fsrd_preprocess/FSRDPreprocessor_Dx12.h"
 #include "MathUtils.h"
 #include "FSRDInputMath.h"
+#include "FSRDResearchCapture.h"
+#include <json.hpp>
 
 using namespace DirectX;
 using namespace OptiMath;
@@ -550,6 +552,9 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     auto& cfg = *Config::Instance();
     const auto& inParams = *InParameters;
 
+    if (cfg.FfxDenoiserResearchCapture.value_or_default())
+        FSRDResearch::Poll();
+
     if (!UpdateSize(InParameters))
         return false;
 
@@ -589,12 +594,95 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         return false;
     }
 
+    FSRDResearch::Capture research;
+    if (cfg.FfxDenoiserResearchCapture.value_or_default())
+    {
+        auto matrix = [](const XMFLOAT4X4& value)
+        {
+            auto result = nlohmann::json::array();
+            for (const auto& row : value.m)
+                result.push_back({ row[0], row[1], row[2], row[3] });
+            return result;
+        };
+        nlohmann::json metadata = {
+            {"render_size", {RenderWidth(), RenderHeight()}},
+            {"reset", _isInReset}, {"hw_depth", _isHWDepth}, {"inverted_depth", DepthInverted()},
+            {"packed_roughness", _isRoughnessPacked},
+            {"floor_isolation", _convDesc.FloorIsolation},
+            {"correlation_bias", cfg.FfxDenoiserCorrelationBias.value_or_default()},
+            {"near", _convDesc.NearPlane}, {"far", _convDesc.FarPlane},
+            {"conversion_flags", _convDesc.Flags},
+            {"inv_view", matrix(_convDesc.InvViewMatrix)},
+            {"inv_projection", matrix(_convDesc.InvProjMatrix)},
+            {"previous_view", matrix(_convDesc.PrevViewMatrix)},
+            {"amd_jitter", {denoiserDesc.jitterOffsets.x, denoiserDesc.jitterOffsets.y}},
+            {"amd_motion_scale", {denoiserDesc.motionVectorScale.x, denoiserDesc.motionVectorScale.y,
+                                    denoiserDesc.motionVectorScale.z}}
+        };
+        for (const char* key : { NVSDK_NGX_Parameter_Jitter_Offset_X, NVSDK_NGX_Parameter_Jitter_Offset_Y,
+                NVSDK_NGX_Parameter_MV_Scale_X, NVSDK_NGX_Parameter_MV_Scale_Y, NVSDK_NGX_Parameter_DLSS_Pre_Exposure })
+        {
+            float value;
+            if (inParams.Get(key, &value) == NVSDK_NGX_Result_Success)
+                metadata["scalars"][key] = value;
+        }
+        research = FSRDResearch::Begin(Device, InCommandList, RenderWidth(), RenderHeight(),
+                                      Handle()->Id, _frameCount, metadata.dump());
+        if (research)
+        {
+            const std::pair<const char*, const char*> inputs[] = {
+                {"input_color", NVSDK_NGX_Parameter_Color},
+                {"input_depth", NVSDK_NGX_Parameter_Depth},
+                {"input_motion", NVSDK_NGX_Parameter_MotionVectors},
+                {"input_normal_roughness", NVSDK_NGX_Parameter_GBuffer_Normals},
+                {"input_roughness", NVSDK_NGX_Parameter_GBuffer_Roughness},
+                {"input_diffuse_albedo", NVSDK_NGX_Parameter_DiffuseAlbedo},
+                {"input_specular_albedo", NVSDK_NGX_Parameter_SpecularAlbedo},
+                {"input_specular_hit_distance", NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance},
+                {"input_diffuse_hit_distance", NVSDK_NGX_Parameter_DLSSD_DiffuseHitDistance},
+                {"input_specular_motion", NVSDK_NGX_Parameter_GBuffer_SpecularMvec},
+                {"input_motion_3d", NVSDK_NGX_Parameter_MotionVectors3D},
+                {"input_specular_direction", NVSDK_NGX_Parameter_DLSSD_SpecularRayDirection},
+                {"input_specular_direction_hit", NVSDK_NGX_Parameter_DLSSD_SpecularRayDirectionHitDistance},
+                {"input_diffuse_direction_hit", NVSDK_NGX_Parameter_DLSSD_DiffuseRayDirectionHitDistance},
+                {"input_reflected_albedo", NVSDK_NGX_Parameter_DLSSD_ReflectedAlbedo},
+                {"input_before_particles", NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles},
+                {"input_before_transparency", NVSDK_NGX_Parameter_DLSSD_ColorBeforeTransparency},
+                {"input_after_transparency", NVSDK_NGX_Parameter_DLSSD_ColorAfterTransparency},
+                {"input_before_fog", NVSDK_NGX_Parameter_DLSSD_ColorBeforeFog},
+                {"input_before_sss", NVSDK_NGX_Parameter_DLSSD_ColorBeforeScreenSpaceSubsurfaceScattering},
+                {"input_before_refraction", NVSDK_NGX_Parameter_DLSSD_ColorBeforeScreenSpaceRefraction},
+                {"input_before_dof", NVSDK_NGX_Parameter_DLSSD_ColorBeforeDepthOfField},
+                {"input_transparency", NVSDK_NGX_Parameter_DLSS_TransparencyLayer},
+                {"input_transparency_opacity", NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity},
+                {"input_transparency_motion", NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs},
+                {"input_bias", NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask},
+                {"input_exposure", NVSDK_NGX_Parameter_ExposureTexture}
+            };
+            for (const auto& [name, key] : inputs)
+            {
+                ID3D12Resource* resource = nullptr;
+                TryGetNGXVoidPointer(inParams, key, resource);
+                FSRDResearch::Record(research, name, resource);
+            }
+            FSRDResearch::Record(research, "converted_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.input));
+            FSRDResearch::Record(research, "converted_fused_albedo", GetD3D12ResFromFFX(fusedSignal.fusedAlbedo));
+            FSRDResearch::Record(research, "converted_motion", GetD3D12ResFromFFX(denoiserDesc.motionVectors));
+            FSRDResearch::Record(research, "converted_normals", GetD3D12ResFromFFX(denoiserDesc.normals));
+            FSRDResearch::Record(research, "converted_depth", GetD3D12ResFromFFX(denoiserDesc.linearDepth));
+            FSRDResearch::Record(research, "converted_diffuse_albedo", GetD3D12ResFromFFX(denoiserDesc.diffuseAlbedo));
+            FSRDResearch::Record(research, "converted_specular_albedo", GetD3D12ResFromFFX(denoiserDesc.specularAlbedo));
+            FSRDResearch::Record(research, "preserved_lighting", FSRDConvShader->GetPreservedLighting());
+        }
+    }
+
     // Dispatch denoiser
     if (!isDenoiseBypassed)
     {
         FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, true);
         isDenoiserReady = DispatchDenoiser(InCommandList, denoiserDesc);
         FSRDConvShader->SetDenoiserOutputsWritable(InCommandList, false);
+        FSRDResearch::Record(research, "denoised_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.output));
 
         if (!isDenoiserReady)
         {
@@ -612,6 +700,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
 
         if (!FSRDConvShader->DispatchComposition(InCommandList, compDesc))
             return false;
+
+        FSRDResearch::Record(research, "composed_color", FSRDConvShader->GetCompositionOutput());
 
         isDenoiserReady = true;
     }

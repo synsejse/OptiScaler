@@ -521,6 +521,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\ffx\FFXFeature_Dx11On12.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Dx12.h" />
     <ClInclude Include="upscalers\ffx\FSRDFeature_Dx12.h" />
+    <ClInclude Include="upscalers\ffx\FSRDResearchCapture.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h" />
     <ClInclude Include="inputs\FfxApi_Dx12.h" />
     <ClInclude Include="inputs\FSR2_Dx12.h" />
@@ -776,6 +777,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx11On12.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDFeature_Dx12.cpp" />
+    <ClCompile Include="upscalers\ffx\FSRDResearchCapture.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Vk.cpp" />
     <ClCompile Include="upscalers\IFeature_Dx11.cpp" />
     <ClCompile Include="upscalers\IFeature_Dx11wDx12.cpp" />
@@ -869,6 +871,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDFloorSeed.hlsl" />
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDInputConv.hlsl" />
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDOutputComp.hlsl" />
+    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDResearchCopy.hlsl" />
   </ItemGroup>
   <Target Name="CompileFSRDShaders" BeforeTargets="ClCompile"
           Inputs="%(FSRDShader.FullPath);$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDPreprocessCommon.hlsli;$(ProjectDir)shaders\shader_tools\dxc.exe;$(ProjectDir)shaders\shader_tools\dxcompiler.dll;$(MSBuildProjectFullPath)"

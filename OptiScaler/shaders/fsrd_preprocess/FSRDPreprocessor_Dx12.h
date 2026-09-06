@@ -182,6 +182,7 @@ class FSRDPreprocessor_Dx12
      * @brief Returns the output from the last composition dispatch. Valid until the next conversion dispatch.
      */
     ID3D12Resource* GetCompositionOutput() const;
+    ID3D12Resource* GetPreservedLighting() const; // Read-only diagnostic access before composition.
 
     /**
      * @brief Copies the contents of the given source texture. Does not automatically set resource barriers.
