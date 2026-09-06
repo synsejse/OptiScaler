@@ -185,3 +185,112 @@ Measurements and per-frame previews are local at `build-artifacts/fsr-rr-diagnos
 ```
 
 No renderer, configuration, installed DLL, capture file or running game was changed for this analysis. Only derived local reports/previews and these findings were written; no build or commit was made.
+
+## Independent GPU replay: encoding and allocation controls
+
+The follow-up investigation added `tools/fsrrr-replay/`, built through the existing
+GitHub **Build (No Signing)** workflow. Runs
+[34060114918](https://github.com/synsejse/OptiScaler/actions/runs/34060114918)
+(`3942e7e5`) and
+[34060301008](https://github.com/synsejse/OptiScaler/actions/runs/34060301008)
+(`5679076a`) both succeeded. The downloaded archives passed `7z t`.
+Only their standalone diagnostic executables were used; **no new proxy DLL was
+installed and Cyberpunk was not launched**.
+
+The replay reads the manual-reset capture ending in `10687`, repacks its seven
+converted inputs into the original DXGI formats, and performs one fresh-context
+RESET dispatch directly through the installed AMD provider on the RX 9060 XT.
+There is no OptiScaler injection, SR, sharpening, or swapchain in this process.
+The original FP16 and depth values repack exactly; RGB10 shader-decoding roundoff
+is at most `2.98e-8`, with the original integer codes recovered. Tests cover every
+finite FP16 bit pattern and every RGB10 code, plus capture immutability and allocation
+size preservation.
+
+Provider: `1.1.0`, ID `8382887756413599744`. Reported defaults for keys 1–6:
+`1, 1, 65504, 50, 0, 0.01`. The provider DLL SHA-256 is
+`f003e1298f7bc09e76578f995f64e46e6f5355f0597b88ff85e9a9922fdf92c6`.
+The allocation-preserving replay executable SHA-256 is
+`5263062249b854e2c786d4617fe5c8808058c63ae409837482375090c93b0ce4`.
+
+### Controls and limitations
+
+- Both runs use the **same captured frame**, camera/jitter, guides, radiance,
+  motion and depth. Unlike the earlier in-game comparisons, stochastic input
+  samples and idle-camera movement cannot change between these replay jobs.
+- Linear mode keeps all albedos unchanged and sets NON_GAMMA_ALBEDO. Sqrt mode
+  sqrt-encodes all three albedos, requantizes to RGB10, and clears that flag,
+  following AMD's SDK 2.2 sample representation. It does not invent lighting or
+  change radiance. The decoded albedo's maximum additional absolute quantization
+  error is `0.000914452`; this is not a mathematically exact encoding equivalence.
+- The first tool allocated only the active 1280×720 rectangle. The second retains
+  the captured **2560×1440 allocation**, with the same 1280×720 active rectangle,
+  and zero-fills uncaptured input texels outside it. Both retain a 2560×1440 context
+  maximum. No claim is made about the original contents of the uncaptured texels.
+- The old manifest lacks exact dispatch duration and live tuning values. Replay
+  uses a recorded assumption of 16.667 ms, provider defaults, and camera delta
+  reconstructed from float32 matrices. These differences, and fresh context versus
+  existing-context RESET, preclude a claim of bit-identical reproduction.
+- Repeating the same allocation-preserving linear job also gives small output
+  differences: mean absolute RGB radiance differences approximately
+  `0.000916, 0.001037, 0.001629`. Their cause is not established. The visible
+  material outlines remain consistent. Tiny encoding differences should not be
+  overinterpreted in the presence of this run-to-run variation.
+
+### Result: the same material outlines, independent of encoding
+
+The original panel rectangle and positive-albedo guards select 73,600 pixels /
+73,370 horizontal pairs in this frame. The comparison uses the same input-derived
+exposure for every preview, the original linear fused albedo for every offline
+recomposition, and original float data for measurements.
+
+| Image | Panel log-RGB gradient RMS | Gradient correlation with fused albedo |
+|---|---:|---:|
+| Captured game input | 0.185794 | 0.041827 |
+| Captured game composition after RESET | 0.305248 | 0.752501 |
+| Replay, linear, active-size allocations | 0.305163 | 0.752698 |
+| Replay, sqrt, active-size allocations | 0.305226 | 0.752831 |
+| Replay, linear, original allocations | 0.305255 | 0.752670 |
+| Replay, sqrt, original allocations | 0.305342 | 0.753128 |
+
+The independent replay visibly reproduces the harsh reflective-panel outlines.
+Neither sample-style albedo encoding nor retaining the original allocation sizes
+removes them. These are selected-region diagnostics, not general denoising quality
+scores or proof that the noisy input is a clean reference. This **does not prove
+an AMD library defect**, but makes OptiScaler's surrounding SR/RCAS work unnecessary
+to reproduce this failure on the saved frame.
+
+Reports and shared-exposure previews:
+
+- `build-artifacts/fsrrr-offline/encoding-active-comparison/`
+- `build-artifacts/fsrrr-offline/encoding-allocated-comparison/`
+- Each replay's `result.json` records the inputs, hashes, dispatch assumptions and
+  provider settings; raw readbacks are `denoised.rgba16f`.
+
+No production input transformation was changed as a result. In particular, these
+results do not justify guessed fog subtraction, constant replacement albedos, a
+synthetic diffuse/specular split, or blending noisy color back into the result.
+
+### Earlier-pass capture investigation
+
+Downloaded portable RenderDoc 1.46 into ignored build artifacts and tested its
+Vulkan layer only against the standalone replay. The layer was found by VKD3D,
+but the replay's provider-enumeration guard rejected the returned count (the tool
+currently reports `count != 1` without logging the actual count). No usable frame
+capture was acquired; **do not claim RenderDoc capture is ready or assume this
+proves that the count was zero**. No RenderDoc launch setting, layer registration,
+or DLL was installed into Heroic/the game or the system.
+
+RenderDoc's [raytracing support documentation](https://github.com/baldurk/renderdoc/blob/v1.46/docs/behind_scenes/raytracing.rst)
+also limits inspection of raytracing work itself: it can preserve its results for
+inspection of subsequent conventional passes, but does not expose its shaders or
+bindings. Its usefulness here would be the conventional lighting/atmosphere
+composition passes, not a promised full raytracing-shader debugger.
+
+The next evidence needed is the actual producer/consumer relationship between
+Cyberpunk's surface lighting, material guides and atmospheric/emissive composition.
+Another ordinary dump of the same final RR inputs cannot recover those missing
+relationships. Resolve the frame-capture/provider limitation or add targeted
+producer instrumentation before asking the user for that test. There is still
+**no validated visual fix** from this investigation. The installed `007fb9bd`
+proxy remains unchanged, SHA-256
+`c76c9c4c861e629b552d4d27966c82197e9d50a8b44368b5e9b5a7d95853de52`.
