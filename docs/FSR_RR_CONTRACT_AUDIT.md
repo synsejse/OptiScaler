@@ -1,5 +1,13 @@
 # DLSS RR → FSR RR contract audit
 
+**Follow-up, 2026-09-07:** the autonomous live tests and exact game-producer
+trace are in [FSR_RR_GUIDE_PRODUCER.md](FSR_RR_GUIDE_PRODUCER.md). Native AMD
+diagnostics are now implemented and tested. Disabling the game's NoV guide
+boost did not fix the defect; a controlled fog-off run strongly implicates
+atmospheric composition, including after brightening the darker comparison.
+Removing fog is not a proposed fix. The initial audit below records the state
+before those follow-up tests.
+
 Research update: 2026-09-07. Branch `research/fsr-rr-fidelity`, inspected commit
 `cca2653593f82a68f396ad5a5eb3a4d084f5263b`.
 
