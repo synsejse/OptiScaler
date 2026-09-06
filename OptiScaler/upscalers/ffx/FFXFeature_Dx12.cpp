@@ -129,7 +129,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
 
     LOG_DEBUG("Jitter Offset: {0}x{1}", params.jitterOffset.x, params.jitterOffset.y);
 
-    unsigned int reset;
+    unsigned int reset = 0;
     InParameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
     params.reset = (reset == 1);
 
@@ -139,9 +139,10 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
 
     params.commandList = InCommandList;
 
-    ID3D12Resource* paramColor;
+    ID3D12Resource* paramColor = nullptr;
     if (InParameters->Get(NVSDK_NGX_Parameter_Color, &paramColor) != NVSDK_NGX_Result_Success)
         InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &paramColor);
+    ID3D12Resource* const originalColor = paramColor;
 
     if (paramColor)
     {
@@ -215,6 +216,9 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
                     srcLocation.SubresourceIndex = 0;
 
                     InCommandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, &srcBox);
+
+                    ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
                     ResourceBarrier(InCommandList, smallerColor[index], D3D12_RESOURCE_STATE_COPY_DEST,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -600,8 +604,8 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, 
     }
 
     // restore resource states
-    if (paramColor && Config::Instance()->ColorResourceBarrier.has_value())
-        ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    if (originalColor && Config::Instance()->ColorResourceBarrier.has_value())
+        ResourceBarrier(InCommandList, originalColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         (D3D12_RESOURCE_STATES) Config::Instance()->ColorResourceBarrier.value());
 
     if (paramVelocity && Config::Instance()->MVResourceBarrier.has_value())

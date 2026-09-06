@@ -12,7 +12,9 @@ This remains a Cyberpunk-oriented adapter, not a lossless translation of every N
 - The denoiser output has an explicit UAV state declaration. It returns to readable state even on failed dispatch. Debug bypasses do not change its state. Converted textures use normal owning objects rather than an aliased union of smart pointers. Conversion and composition storage is retained until a fence on the actual submitting queue completes; fixed frame-count rings are not used as a lifetime guarantee.
 - Separate diffuse/specular guides are preserved, including zero and white/white guides. Only the fused denominator is floored. There is no diffuse-plus-specular energy correction, estimated raster-light floor, guessed particle subtraction, or raw/denoised brightness blend. Obsolete floor/correlation settings are deleted on save.
 - Explicit FP16 rounding precedes the signed numerical residual. Composition remodulates the denoised signal and adds that residual; it preserves representability error and source negatives, not an estimated lighting layer.
-- Skipped pixels initialize motion explicitly: the same texture is reused for composited color later, so unwritten pixels must not retain last frame's RGB values as motion. Invalid camera input also invalidates temporal history before resuming.
+- Skipped pixels initialize motion explicitly. Composition has its own exact-render-size output, so SR auto-exposure cannot scan unused display-capacity padding. Replacing that output during quality changes retains recorded GPU references through completion. Invalid camera input also invalidates temporal history before resuming.
+- Cyberpunk's authored depth motion is decoded from its verified extra Z/W channels using the previous projection; see [producer evidence and limits](FSR_RR_MOTION.md). Other integrations retain the documented camera-only path. Motion scales default independently and nonfinite scalar inputs are rejected.
+- RR and SR provider versions are tracked separately; the RR version must not disable the inherited SR provider's format/exposure handling.
 
 ## What fused lighting means
 
@@ -28,7 +30,7 @@ Genuinely separate signals can retain information that was lost when the rendere
 
 ## Remaining limitations
 
-World-space normals and origin-zero render-resolution resources are expected. The depth-motion channel is reconstructed from camera motion only: standard 2D NGX motion does not supply independent object motion along Z. RGB10A2 guide/normal and FP16 radiance/hit-distance storage still introduce quantization; arbitrarily large FP32 source values cannot be represented. This is not lossless or equivalent to native engine integration. The inherited FFX upscaler still handles the bias mask; before-particles color is capture/debug-only because no exact RR 1.1 mapping is established. Other games, moving-object reprojection and final visual quality require runtime validation; these changes do not by themselves establish the cause of earlier GPU faults.
+World-space normals and origin-zero, single-sample render-resolution resources are expected. Unsupported subrects, jittered/high-resolution motion layouts and late input-barrier configurations are rejected rather than silently misinterpreted. Standard 2D NGX motion does not supply independent object motion along Z outside the verified Cyberpunk path. RGB10A2 guide/normal and FP16 radiance/hit-distance storage still introduce quantization; arbitrarily large FP32 source values cannot be represented. This is not lossless or equivalent to native engine integration. The inherited FFX upscaler still handles the bias mask; before-particles color is capture/debug-only because no exact RR 1.1 mapping is established. Other games, moving-object reprojection and final visual quality require runtime validation; these changes do not by themselves establish the cause of earlier GPU faults.
 
 ## Build and regression checks
 

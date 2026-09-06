@@ -432,6 +432,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderData.h" />
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderUtils.h" />
     <ClInclude Include="upscalers\ffx\FSRDInputMath.h" />
+    <ClInclude Include="upscalers\ffx\FSRDInputValidation.h" />
+    <ClInclude Include="upscalers\ffx\FSRDDepthMotion.h" />
     <ClInclude Include="resource_tracking\FSRDSubmission.h" />
     <ClInclude Include="resource_tracking\FSRDSubmissionPolicy.h" />
     <ClInclude Include="shaders\Shader_Dx12.h" />
@@ -874,7 +876,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDResearchCopy.hlsl" />
   </ItemGroup>
   <Target Name="CompileFSRDShaders" BeforeTargets="ClCompile"
-          Inputs="%(FSRDShader.FullPath);$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDPreprocessCommon.hlsli;$(ProjectDir)shaders\shader_tools\dxc.exe;$(ProjectDir)shaders\shader_tools\dxcompiler.dll;$(MSBuildProjectFullPath)"
+          Inputs="%(FSRDShader.FullPath);$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDPreprocessCommon.hlsli;$(ProjectDir)upscalers\ffx\FSRDDepthMotion.h;$(ProjectDir)shaders\shader_tools\dxc.exe;$(ProjectDir)shaders\shader_tools\dxcompiler.dll;$(MSBuildProjectFullPath)"
           Outputs="$(IntDir)fsrd_generated\%(FSRDShader.Filename)_Shader.h">
     <MakeDir Directories="$(IntDir)fsrd_generated" />
     <Exec Command="&quot;$(ProjectDir)shaders\shader_tools\dxc.exe&quot; -T cs_6_0 -E CSMain -O3 -Qstrip_debug -Qstrip_reflect -Fo &quot;$(IntDir)fsrd_generated\%(FSRDShader.Filename).cso&quot; -Fh &quot;$(IntDir)fsrd_generated\%(FSRDShader.Filename)_Shader.h&quot; -Vn %(FSRDShader.Filename)_cso &quot;%(FSRDShader.FullPath)&quot;" />

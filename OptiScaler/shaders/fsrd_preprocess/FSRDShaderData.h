@@ -17,6 +17,8 @@ namespace FSRD
             XMFLOAT4X4 InvProjMatrix;  // DLSSD ViewToClip^-1 - Projection
             XMFLOAT4X4 PrevViewMatrix; // DLSSD WorldToView from last frame
 
+            XMFLOAT4 PreviousDepthProjection; // Previous A/B/W, independent of NGX motion XY scale
+
             XMFLOAT4 RenderSize;
 
             float NearPlane; // Near < Far - IsInverted flag accounts for inversion
@@ -120,7 +122,9 @@ namespace FSRD
     }
     } // namespace FSRD
 
-static_assert(sizeof(FSRD::Conversion::Constants) == 224);
-static_assert(offsetof(FSRD::Conversion::Constants, Flags) == 216);
+static_assert(sizeof(FSRD::Conversion::Constants) == 240);
+static_assert(offsetof(FSRD::Conversion::Constants, PreviousDepthProjection) == 192);
+static_assert(offsetof(FSRD::Conversion::Constants, RenderSize) == 208);
+static_assert(offsetof(FSRD::Conversion::Constants, Flags) == 232);
 static_assert(sizeof(FSRD::Composition::Constants) == 32);
 static_assert(offsetof(FSRD::Composition::Constants, Flags) == 16);

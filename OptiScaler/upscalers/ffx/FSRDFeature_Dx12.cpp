@@ -6,6 +6,7 @@
 #include "shaders/fsrd_preprocess/FSRDPreprocessor_Dx12.h"
 #include "MathUtils.h"
 #include "FSRDInputMath.h"
+#include "FSRDInputValidation.h"
 #include "FSRDResearchCapture.h"
 #include <json.hpp>
 
@@ -58,6 +59,17 @@ static bool IsUsableMatrix(const XMMATRIX& matrix)
                 return false;
     const float determinant = XMVectorGetX(XMMatrixDeterminant(matrix));
     return std::isfinite(determinant) && std::abs(determinant) > 1e-20f;
+}
+
+// The authenticated Cyberpunk encoding can be linearized without projected XY only for
+// conventional perspective depth. Reject oblique/depth-offset projections rather than guess.
+static bool HasSeparablePerspectiveDepth(const XMMATRIX& matrix)
+{
+    return matrix.r[2].m128_f32[0] == 0.0f && matrix.r[2].m128_f32[1] == 0.0f &&
+           matrix.r[3].m128_f32[0] == 0.0f && matrix.r[3].m128_f32[1] == 0.0f &&
+           matrix.r[3].m128_f32[3] == 0.0f && std::abs(matrix.r[3].m128_f32[2]) == 1.0f &&
+           std::isfinite(matrix.r[2].m128_f32[2]) && std::isfinite(matrix.r[2].m128_f32[3]) &&
+           matrix.r[2].m128_f32[3] != 0.0f;
 }
 
 template <typename T>
@@ -268,9 +280,11 @@ FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InPar
     : FFXFeatureDx12(InHandleId, InParameters), IFeature(InHandleId, SetParameters(InParameters)),
       _pDenoiserCtx(nullptr), _denoiserCtxDesc({}), _denoiserSettings({}), _convDesc({}), _isInReset(false),
       _lastCamPos(0.0f, 0.0f, 0.0f), _invViewMatrix(XMMatrixIdentity()), _viewMatrix(XMMatrixIdentity()),
-      _prevViewMatrix(XMMatrixIdentity()), _projMatrix(XMMatrixIdentity()), _upscaleColorOverride(nullptr),
+      _prevViewMatrix(XMMatrixIdentity()), _projMatrix(XMMatrixIdentity()), _prevProjMatrix(XMMatrixIdentity()),
+      _upscaleColorOverride(nullptr),
       _upscaleFovVertical(0.0f), _upscaleDeltaTime(0.0f)
 {
+    _lastDenoiserFrameTime = Util::MillisecondsNow();
     _moduleLoaded = FfxApiProxy::IsDenoiserReady();
 
     if (_moduleLoaded)
@@ -535,22 +549,51 @@ void FSRDFeatureDx12::OverrideUpscaleDispatch(ffxDispatchDescUpscale& params)
     params.reset |= _isInReset;
 }
 
+void FSRDFeatureDx12::CommitCameraHistory()
+{
+    _prevViewMatrix = _viewMatrix;
+    _prevProjMatrix = _projMatrix;
+    _lastCamPos = GetFloat3Column(_invViewMatrix, 3);
+    _hasCameraHistory = true;
+}
+
 bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
 
     if (!IsInited())
+    {
+        _hasCameraHistory = false;
         return false;
+    }
 
     auto& state = State::Instance();
     auto& cfg = *Config::Instance();
     const auto& inParams = *InParameters;
 
+    if (!FSRD::ValidateInputContract(inParams, cfg, state))
+    {
+        _hasCameraHistory = false;
+        return false;
+    }
+
     if (cfg.FfxDenoiserResearchCapture.value_or_default())
         FSRDResearch::Poll();
 
     if (!UpdateSize(InParameters))
+    {
+        _hasCameraHistory = false;
         return false;
+    }
+
+    if (!FSRD::IsSupportedMotionLayout(JitteredMV(), LowResMV(), RenderWidth(), RenderHeight(), DisplayWidth(),
+                                       DisplayHeight()))
+    {
+        LOG_ERROR("FSR-RR requires non-jittered, render-resolution motion; jittered={} lowRes={} render={}x{} display={}x{}",
+                  JitteredMV(), LowResMV(), RenderWidth(), RenderHeight(), DisplayWidth(), DisplayHeight());
+        _hasCameraHistory = false;
+        return false;
+    }
 
     const auto dbgMode = static_cast<DebugModes>(cfg.FfxDenoiserDebugMode.value_or_default());
     const bool isDebugVis = (uint32_t) dbgMode & (uint32_t) DebugModes::ConversionDebug;
@@ -575,6 +618,11 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     if (uint32_t value = 0; inParams.Get(NVSDK_NGX_Parameter_Reset, &value) == NVSDK_NGX_Result_Success)
         _isInReset |= value > 0;
 
+    // A failed dispatch/composition/upscale must not publish camera or projection history.
+    // Only a completely successful RR evaluation commits it below. Output-only debug
+    // visualization still runs RR and may keep history; actual denoiser bypasses may not.
+    _hasCameraHistory = false;
+
     // Denoiser start
     ffxDispatchDescDenoiserInput1Signal fusedSignal = {};
     ffxDispatchDescDenoiser denoiserDesc = {};
@@ -598,6 +646,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
                 result.push_back({ row[0], row[1], row[2], row[3] });
             return result;
         };
+        XMFLOAT4X4 previousProjection;
+        XMStoreFloat4x4(&previousProjection, XMMatrixTranspose(_prevProjMatrix));
         nlohmann::json metadata = {
             {"render_size", {RenderWidth(), RenderHeight()}},
             {"reset", _isInReset}, {"hw_depth", _isHWDepth}, {"inverted_depth", DepthInverted()},
@@ -610,6 +660,12 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             {"inv_view", matrix(_convDesc.InvViewMatrix)},
             {"inv_projection", matrix(_convDesc.InvProjMatrix)},
             {"previous_view", matrix(_convDesc.PrevViewMatrix)},
+            {"previous_projection", matrix(previousProjection)},
+            {"previous_depth_projection", {_convDesc.PreviousDepthProjection.x,
+                                             _convDesc.PreviousDepthProjection.y,
+                                             _convDesc.PreviousDepthProjection.z}},
+            {"motion_depth_encoding", (_convDesc.Flags & (uint32_t)FSRDConvFlags::CyberpunkDepthMotion)
+                                           ? "cyberpunk_hardware_delta_1000" : "camera_only"},
             {"amd_jitter", {denoiserDesc.jitterOffsets.x, denoiserDesc.jitterOffsets.y}},
             {"amd_motion_scale", {denoiserDesc.motionVectorScale.x, denoiserDesc.motionVectorScale.y,
                                     denoiserDesc.motionVectorScale.z}}
@@ -713,6 +769,9 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
 
         _upscaleColorOverride = nullptr;
 
+        if (isUpscalerReady && isDenoiserReady)
+            CommitCameraHistory();
+
         // _frameCount is incremented by the base implementation
         return isUpscalerReady;
     }
@@ -740,10 +799,13 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         if (!srcTex || !TryGetLoggedResource(inParams, NVSDK_NGX_Parameter_Output, dstTex))
         {
             _frameCount++;
-            return true;
+            return false;
         }
 
-        FSRDConvShader->Blit(InCommandList, srcTex, dstTex);
+        if (!FSRDConvShader->Blit(InCommandList, srcTex, dstTex))
+            return false;
+        if (isDenoiserReady)
+            CommitCameraHistory();
     }
 
     _frameCount++;
@@ -755,7 +817,55 @@ bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandL
                                            ffxDispatchDescDenoiserInput1Signal& signalDesc)
 {
     const auto& cfg = *Config::Instance();
-    const auto& slData = State::Instance().slLastConstants;
+
+    // Keep an independent clock: the subsequent SR evaluation can update its own timer.
+    const double now = Util::MillisecondsNow();
+    const float measuredDeltaTime = static_cast<float>(now - _lastDenoiserFrameTime);
+    _lastDenoiserFrameTime = now;
+
+    float deltaTime = 0.0f;
+    if (!TryGetToggleableNGXParam(inParams, OptiKeys::FSR_FrameTimeDelta, cfg.FsrUseFsrInputValues, deltaTime) ||
+        !std::isfinite(deltaTime) || deltaTime <= 0.0f)
+    {
+        if (inParams.Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &deltaTime) != NVSDK_NGX_Result_Success ||
+            !std::isfinite(deltaTime) || deltaTime <= 0.0f)
+            deltaTime = measuredDeltaTime;
+    }
+    if (!std::isfinite(deltaTime) || deltaTime <= 0.0f)
+    {
+        LOG_ERROR("FSR-RR has no positive finite frame time");
+        return false;
+    }
+
+    const auto ReadOptionalFiniteScalar = [&](const char* key, float& value)
+    {
+        float incoming = value;
+        if (inParams.Get(key, &incoming) == NVSDK_NGX_Result_Success)
+            value = incoming;
+        if (std::isfinite(value))
+            return true;
+        LOG_ERROR("FSR-RR received a nonfinite scalar: {}", key);
+        return false;
+    };
+
+    // NGX scales each motion component into pixels. Missing components independently default
+    // to one pixel multiplier, not one UV multiplier; AMD requires pixels divided by render size.
+    float MVScaleX = 1.0f, MVScaleY = 1.0f, jitterX = 0.0f, jitterY = 0.0f;
+    if (!ReadOptionalFiniteScalar(NVSDK_NGX_Parameter_MV_Scale_X, MVScaleX) ||
+        !ReadOptionalFiniteScalar(NVSDK_NGX_Parameter_MV_Scale_Y, MVScaleY) ||
+        !ReadOptionalFiniteScalar(NVSDK_NGX_Parameter_Jitter_Offset_X, jitterX) ||
+        !ReadOptionalFiniteScalar(NVSDK_NGX_Parameter_Jitter_Offset_Y, jitterY))
+        return false;
+
+    const FfxApiFloatCoords3D motionScale = { MVScaleX / RenderWidth(), MVScaleY / RenderHeight(), 1.0f };
+    // Despite the old RR 1.1 header comment, AMD's SDK 2.2 sample uses projection jitter in NDC.
+    const FfxApiFloatCoords2D jitter = { 2.0f * (jitterX / RenderWidth()), -2.0f * (jitterY / RenderHeight()) };
+    if (!std::isfinite(motionScale.x) || !std::isfinite(motionScale.y) || !std::isfinite(jitter.x) ||
+        !std::isfinite(jitter.y))
+    {
+        LOG_ERROR("FSR-RR motion/jitter conversion produced nonfinite values");
+        return false;
+    }
 
     // Gather DLSS-RR input buffers for conversion and repacking for FSR-RR
     if (!PrepareDenoiseConvInput(inParams))
@@ -770,15 +880,16 @@ bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandL
     const XMVECTOR forward = XMVectorScale(XMVector3Normalize(GetColumn(_invViewMatrix, 2)),
                                            _projMatrix.r[3].m128_f32[2] < 0.0f ? -1.0f : 1.0f);
     const XMFLOAT3 camPos = GetFloat3Column(_invViewMatrix, 3);
-    if (_isInReset)
-        _lastCamPos = camPos;
+    const XMFLOAT3 previousCamPos = _isInReset ? camPos : _lastCamPos;
 
     // Pack dispatch configuration
     dispatchDesc = {
         .commandList = InCommandList,
-        .motionVectorScale = { 1.0f, 1.0f, 1.0f },
+        .motionVectorScale = motionScale,
+        .jitterOffsets = jitter,
         // Camera movement since last frame (PreviousPosition - CurrentPosition)
-        .cameraPositionDelta = { (_lastCamPos.x - camPos.x), (_lastCamPos.y - camPos.y), (_lastCamPos.z - camPos.z) },
+        .cameraPositionDelta = { previousCamPos.x - camPos.x, previousCamPos.y - camPos.y,
+                                 previousCamPos.z - camPos.z },
         .cameraRight = GetFloat3FFX(right),
         .cameraUp = GetFloat3FFX(up),
         .cameraForward = GetFloat3FFX(forward),
@@ -787,6 +898,7 @@ bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandL
         .cameraFar = _convDesc.FarPlane,
         .cameraFovAngleVertical = GetVertFovFromProjectionMatrixRad(_projMatrix),
         .renderSize = { RenderWidth(), RenderHeight() },
+        .deltaTime = deltaTime,
         .frameIndex = (uint32_t) _frameCount,
         .flags = FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO
     };
@@ -796,41 +908,6 @@ bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandL
 
     if (_isInReset)
         dispatchDesc.flags |= FFX_DENOISER_DISPATCH_RESET;
-
-    // Update camera position for next frame
-    _lastCamPos = camPos;
-    _hasCameraHistory = true;
-
-    if (!TryGetToggleableNGXParam(inParams, OptiKeys::FSR_FrameTimeDelta, cfg.FsrUseFsrInputValues,
-                                  dispatchDesc.deltaTime))
-    {
-        if (inParams.Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &dispatchDesc.deltaTime) !=
-                NVSDK_NGX_Result_Success ||
-            dispatchDesc.deltaTime < 1.0f)
-        {
-            dispatchDesc.deltaTime = (float) GetDeltaTime();
-        }
-    }
-
-    // Motion Vector Scaling
-    // Scaling must result in UV space vectors, unlike FSR/DLSS pixel space vectors
-    float MVScaleX = 1.0f, MVScaleY = 1.0f;
-
-    if (inParams.Get(NVSDK_NGX_Parameter_MV_Scale_X, &MVScaleX) == NVSDK_NGX_Result_Success &&
-        inParams.Get(NVSDK_NGX_Parameter_MV_Scale_Y, &MVScaleY) == NVSDK_NGX_Result_Success)
-    {
-        dispatchDesc.motionVectorScale.x = MVScaleX / dispatchDesc.renderSize.width;
-        dispatchDesc.motionVectorScale.y = MVScaleY / dispatchDesc.renderSize.height;
-    }
-
-    float jitterX = 0.0f, jitterY = 0.0f;
-    inParams.Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitterX);
-    inParams.Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitterY);
-
-    // The RR 1.1 header says screen pixels, but AMD's SDK 2.2 sample still
-    // passes the camera projection jitter in NDC, matching RR 1.0.
-    dispatchDesc.jitterOffsets.x = 2.0f * (jitterX / (float) RenderWidth());
-    dispatchDesc.jitterOffsets.y = -2.0f * (jitterY / (float) RenderHeight());
 
     LOG_DEBUG("Jitter NDC [{:.6f}, {:.6f}]", dispatchDesc.jitterOffsets.x, dispatchDesc.jitterOffsets.y);
 
@@ -992,7 +1069,6 @@ bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParam
 
     // Get DLSSD matrices and derive related values
     // World to view/camera space (V)
-    _prevViewMatrix = _viewMatrix;
     _viewMatrix = {};
 
     if (!TryGetNGXMatrix(inParams, NVSDK_NGX_Parameter_DLSS_WORLD_TO_VIEW_MATRIX, _viewMatrix))
@@ -1068,7 +1144,10 @@ bool FSRDFeatureDx12::PrepareDenoiseConvInput(const NVSDK_NGX_Parameter& inParam
         return false;
     }
     if (_isInReset)
+    {
         _prevViewMatrix = _viewMatrix;
+        _prevProjMatrix = _projMatrix;
+    }
     return true;
 }
 
@@ -1093,6 +1172,8 @@ bool FSRDFeatureDx12::ConvertDenoiserBuffers(ID3D12GraphicsCommandList* InComman
 
     // Previous world to view for linear depth delta
     XMStoreFloat4x4(&_convDesc.PrevViewMatrix, XMMatrixTranspose(_prevViewMatrix));
+    _convDesc.PreviousDepthProjection = { _prevProjMatrix.r[2].m128_f32[2], _prevProjMatrix.r[2].m128_f32[3],
+                                           _prevProjMatrix.r[3].m128_f32[2], 0.0f };
 
     // Near and far planes
     const ViewPlanes planes = GetViewPlanes(_projMatrix, DepthInverted());
@@ -1104,6 +1185,20 @@ bool FSRDFeatureDx12::ConvertDenoiserBuffers(ID3D12GraphicsCommandList* InComman
 
     if (!_isHWDepth)
         _convDesc.Flags |= (uint32_t) FSRDConvFlags::IsDepthLinear;
+
+    if (_isInReset)
+        _convDesc.Flags |= (uint32_t) FSRDConvFlags::ResetMotionHistory;
+    else if (_isHWDepth && _stricmp(State::Instance().gameExe.c_str(), "Cyberpunk2077.exe") == 0 &&
+             _convDesc.Resources.InMotionVectors->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+             HasSeparablePerspectiveDepth(_projMatrix) && HasSeparablePerspectiveDepth(_prevProjMatrix))
+    {
+        _convDesc.Flags |= (uint32_t) FSRDConvFlags::CyberpunkDepthMotion;
+        if (!_loggedCyberpunkDepthMotion)
+        {
+            LOG_INFO("FSR-RR using verified Cyberpunk engine depth motion (1000x hardware delta; previous projection)");
+            _loggedCyberpunkDepthMotion = true;
+        }
+    }
 
     LOG_DEBUG("Distpaching FSRD Input Converter");
 

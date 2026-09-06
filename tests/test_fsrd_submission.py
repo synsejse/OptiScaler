@@ -6,6 +6,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SubmissionLifetime(unittest.TestCase):
+    def test_rr_rejects_incompatible_input_contract_before_recording(self):
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
+        evaluate = source.split("bool FSRDFeatureDx12::EvaluateInternal", 1)[1].split(
+            "bool FSRDFeatureDx12::PrepareDenoiserInput", 1)[0]
+        self.assertLess(evaluate.index("FSRD::ValidateInputContract"), evaluate.index("UpdateSize(InParameters)"))
+        self.assertLess(evaluate.index("UpdateSize(InParameters)"), evaluate.index("FSRD::IsSupportedMotionLayout"))
+        self.assertLess(evaluate.index("FSRD::IsSupportedMotionLayout"), evaluate.index("PrepareDenoiserInput(InCommandList"))
+        header = (ROOT / "OptiScaler/upscalers/ffx/FSRDInputValidation.h").read_text()
+        for field in ("ColorResourceBarrier", "MVResourceBarrier", "DepthResourceBarrier"):
+            self.assertIn(f"CheckState(config.{field}", header)
+        self.assertIn("unrealAutoBarriers", header)
+        self.assertIn("state == D3D12_RESOURCE_STATE_COMMON", header)
+        self.assertIn("bits & ~readableStates", header)
+        self.assertIn("!jittered && (lowResolution ||", header)
+        self.assertGreaterEqual(header.count("static_assert("), 12)
+
+    def test_all_consumed_ngx_subrect_origins_are_rejected(self):
+        header = (ROOT / "OptiScaler/upscalers/ffx/FSRDInputValidation.h").read_text()
+        for stem in ("DLSS_Input_Color_Subrect_Base", "DLSS_Input_Depth_Subrect_Base",
+                     "DLSS_Input_MV_SubrectBase", "DLSS_Input_DiffuseAlbedo_Subrect_Base",
+                     "DLSS_Input_SpecularAlbedo_Subrect_Base", "DLSS_Input_Normals_Subrect_Base",
+                     "DLSS_Input_Roughness_Subrect_Base", "DLSSD_SpecularHitDistance_Subrect_Base",
+                     "DLSS_Input_Translucency_SubrectBase", "DLSS_Input_Bias_Current_Color_SubrectBase",
+                     "DLSS_Output_Subrect_Base"):
+            for axis in "XY":
+                self.assertIn(f"NVSDK_NGX_Parameter_{stem}_{axis}", header)
+        self.assertIn("parameters.Get(key, &value) == NVSDK_NGX_Result_Success && value != 0", header)
+
+    def test_sr_copy_restores_original_input_state(self):
+        source = (ROOT / "OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp").read_text()
+        self.assertIn("unsigned int reset = 0", source)
+        self.assertIn("ID3D12Resource* paramColor = nullptr", source)
+        self.assertIn("ID3D12Resource* const originalColor = paramColor", source)
+        copied = source.split("InCommandList->CopyTextureRegion", 1)[1].split("paramColor = smallerColor[index]", 1)[0]
+        self.assertRegex(copied, r"ResourceBarrier\(InCommandList, paramColor, D3D12_RESOURCE_STATE_COPY_SOURCE,\s*"
+                                 r"D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE\)")
+        self.assertIn("ResourceBarrier(InCommandList, originalColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE", source)
+
     def test_rr_version_does_not_overwrite_sr_provider_version(self):
         rr = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
         self.assertIn("state.ffxDenoiserUpscalerVersion = FFXFeature::Version()", rr)

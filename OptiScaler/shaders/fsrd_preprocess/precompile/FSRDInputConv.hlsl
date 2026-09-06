@@ -1,5 +1,6 @@
 // FSR-RR Conversion & Packing Shader
 #include "FSRDPreprocessCommon.hlsli"
+#include "../../../upscalers/ffx/FSRDDepthMotion.h"
 
 #define MainRS \
     "RootFlags(0), " \
@@ -19,6 +20,8 @@ static const uint2 s_ThreadGroupSize = uint2(THREAD_GROUP_SIZE_X, THREAD_GROUP_S
 #define FLAGS_LINEAR_DEPTH              (1 << 1)
 #define FLAGS_PACKED_ROUGHNESS          (1 << 2)
 #define FLAGS_IS_RIGHT_HANDED           (1 << 4)
+#define FLAGS_CYBERPUNK_DEPTH_MOTION     (1 << 5)
+#define FLAGS_RESET_MOTION_HISTORY      (1 << 6)
 
 // Debug Flags
 #define FLAGS_DEBUG                     (1 << 16)
@@ -48,7 +51,7 @@ static const uint2 s_ThreadGroupSize = uint2(THREAD_GROUP_SIZE_X, THREAD_GROUP_S
 // DLSS-RR Inputs
 Texture2D<half3> InColor : register(t0); // RGB - NVSDK_NGX_Parameter_Color
 Texture2D<float> InDepth : register(t1); // R - NVSDK_NGX_Parameter_Depth - hardware or linear - inverted or not
-Texture2D<float3> InMotionVectors : register(t2); // RG - NVSDK_NGX_Parameter_MotionVectors
+Texture2D<float4> InMotionVectors : register(t2); // RG - NGX motion; ZW decoded only for verified Cyberpunk layout
 Texture2D<float4> InNormals : register(t3); // RGB: Normals, A: Roughness (Optional) - NVSDK_NGX_Parameter_GBuffer_Normals
 Texture2D<float> InRoughness : register(t4); // R - May be packed in normals. NVSDK_NGX_Parameter_GBuffer_Roughness
 Texture2D<float> InSpecHitDist : register(t5); // R - NVSDK_NGX_Parameter_DLSSD_SpecularHitDistance
@@ -74,6 +77,8 @@ cbuffer CB_Packing : register(b0)
     float4x4 InvViewMatrix; // DLSSD WorldToView^-1
     float4x4 InvProjMatrix; // DLSSD ViewToClip^-1
     float4x4 PrevViewMatrix; // DLSSD WorldToView from last frame
+
+    float4 PreviousDepthProjection; // Historical clip.z=A*z+B, clip.w=W*z; XYZ=A/B/W
     
     float4 RenderSize; // Resolution of inputs
     
@@ -125,7 +130,8 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     // finite source, including negative RGB and the full FP16 range, for the fused round trip.
     const float3 inputColor = InColor[px].rgb;
     const float3 rawColor = all(isfinite(inputColor)) ? inputColor : 0.0f;
-    const float2 inputMotion = InMotionVectors[px].rg;
+    const float4 sourceMotion = InMotionVectors[px];
+    const float2 inputMotion = sourceMotion.rg;
     const float2 motionIn = all(isfinite(inputMotion)) ? inputMotion : 0.0f;
     float4 specReflectance = float4(InSpecAlbedo[px].rgb, 0.0f);
     float4 diffAlbedo = float4(InDiffAlbedo[px].rgb, 0.0f);
@@ -164,10 +170,20 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         // Find the current pixel in world space and calculate movement in view space
         const float3 worldSpacePos = mul(InvViewMatrix, float4(viewSpacePos, 1.0f)).xyz;
         float3 prevViewSpacePos = mul(PrevViewMatrix, float4(worldSpacePos, 1.0f)).xyz;
+        const float previousClipW = PreviousDepthProjection.z * prevViewSpacePos.z;
         prevViewSpacePos.z = abs(prevViewSpacePos.z);
         
-        // Camera-only depth delta: NGX's 2D motion cannot recover independent object motion along Z.
-        const float inputDepthDelta = (prevViewSpacePos.z - linearDepth);
+        // Generic NGX exposes only XY. Cyberpunk's verified extra channels carry actual
+        // geometry depth movement, including skinned objects; do not guess this for other games.
+        float inputDepthDelta = (prevViewSpacePos.z - linearDepth);
+        if (IsSet(FLAGS_RESET_MOTION_HISTORY))
+            inputDepthDelta = 0.0f;
+        // Cyberpunk's W=0 initializer clamps historical clip W to 0.05. That branch
+        // cannot be inverted near/behind the camera; retain the known camera-only delta.
+        else if (IsSet(FLAGS_CYBERPUNK_DEPTH_MOTION) && (sourceMotion.w != 0.0f || previousClipW > 0.05f))
+            DecodeCyberpunkDepthMotion(InDepth[px], sourceMotion.z, sourceMotion.w, linearDepth,
+                                       PreviousDepthProjection.x, PreviousDepthProjection.y,
+                                       PreviousDepthProjection.z, inputDepthDelta);
         // Prevent a nonfinite/overflowing derived value from poisoning temporal history.
         const float depthDelta = isfinite(inputDepthDelta) ? clamp(inputDepthDelta, -65504.0f, 65504.0f) : 0.0f;
     

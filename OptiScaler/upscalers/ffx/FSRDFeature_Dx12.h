@@ -47,6 +47,8 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool _isHWDepth = false;
     bool _isRoughnessPacked = false;
     bool _hasCameraHistory = false;
+    bool _loggedCyberpunkDepthMotion = false;
+    double _lastDenoiserFrameTime = 0.0;
     uint32_t _lastRenderWidth = 0;
     uint32_t _lastRenderHeight = 0;
 
@@ -58,6 +60,7 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     DirectX::XMMATRIX _viewMatrix;     // World to camera space
     DirectX::XMMATRIX _prevViewMatrix; // Last world to camera space
     DirectX::XMMATRIX _projMatrix;     // Perspective projection matrix
+    DirectX::XMMATRIX _prevProjMatrix; // Last successful RR evaluation's projection
 
     // Upscaler dispatch overrides, applied via OverrideUpscaleDispatch()
     ID3D12Resource* _upscaleColorOverride;
@@ -79,6 +82,8 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     void DestroyDenoiserContext();
 
     bool UpdateSize(const NVSDK_NGX_Parameter* parameters);
+
+    void CommitCameraHistory();
 
     void CaptureInputs(const NVSDK_NGX_Parameter& inParams, const ffxDispatchDescDenoiser& dispatchDesc);
 

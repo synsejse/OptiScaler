@@ -314,6 +314,7 @@ struct FSRDPreprocessor_Dx12::Impl
             .InvViewMatrix = desc.InvViewMatrix,
             .InvProjMatrix = desc.InvProjMatrix,
             .PrevViewMatrix = desc.PrevViewMatrix,
+            .PreviousDepthProjection = desc.PreviousDepthProjection,
             .RenderSize = desc.RenderSize,
             .NearPlane = desc.NearPlane,
             .FarPlane = desc.FarPlane,

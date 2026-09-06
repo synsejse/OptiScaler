@@ -83,8 +83,26 @@ class RRContracts(unittest.TestCase):
 
     def test_sample_jitter_convention_is_preserved(self):
         source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
-        self.assertIn("2.0f * (jitterX / (float) RenderWidth())", source)
-        self.assertIn("-2.0f * (jitterY / (float) RenderHeight())", source)
+        self.assertIn("2.0f * (jitterX / RenderWidth())", source)
+        self.assertIn("-2.0f * (jitterY / RenderHeight())", source)
+        self.assertIn(".jitterOffsets = jitter", source)
+
+    def test_cyberpunk_depth_motion_is_scoped_and_resets(self):
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
+        self.assertIn('_stricmp(State::Instance().gameExe.c_str(), "Cyberpunk2077.exe") == 0', source)
+        self.assertIn("Format == DXGI_FORMAT_R16G16B16A16_FLOAT", source)
+        self.assertIn("HasSeparablePerspectiveDepth(_prevProjMatrix)", source)
+        self.assertIn("_prevProjMatrix = _projMatrix", source)
+        shader = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()
+        self.assertIn("if (IsSet(FLAGS_RESET_MOTION_HISTORY))", shader)
+        self.assertIn("DecodeCyberpunkDepthMotion", shader)
+        self.assertIn("previousClipW > 0.05f", shader)
+
+    def test_motion_scale_defaults_to_pixels_not_uv(self):
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
+        self.assertIn("float MVScaleX = 1.0f, MVScaleY = 1.0f", source)
+        self.assertIn("MVScaleX / RenderWidth(), MVScaleY / RenderHeight(), 1.0f", source)
+        self.assertIn(".motionVectorScale = motionScale", source)
 
     def test_recreated_feature_preserves_rr_layout(self):
         provider = (ROOT / "OptiScaler/upscalers/FeatureProvider_Dx12.cpp").read_text()
@@ -119,6 +137,7 @@ class RRContracts(unittest.TestCase):
         target = tree.find(".//m:Target[@Name='CompileFSRDShaders']", ns)
         self.assertEqual(target.attrib["BeforeTargets"], "ClCompile")
         self.assertIn("FSRDPreprocessCommon.hlsli", target.attrib["Inputs"])
+        self.assertIn("FSRDDepthMotion.h", target.attrib["Inputs"])
 
     def test_skipped_pixels_do_not_reuse_composed_color_as_motion(self):
         source = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()

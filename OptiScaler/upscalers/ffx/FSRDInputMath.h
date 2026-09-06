@@ -1,4 +1,5 @@
 #pragma once
+#include "FSRDDepthMotion.h"
 
 #include <cmath>
 #include <cstdint>

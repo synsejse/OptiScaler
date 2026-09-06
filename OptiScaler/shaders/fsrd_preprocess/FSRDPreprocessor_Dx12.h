@@ -28,6 +28,8 @@ class FSRDPreprocessor_Dx12
         IsDepthLinear = 1 << 1,     // Interprets input depth as already linearized for view space calculations
         IsRoughnessPacked = 1 << 2, // Roughness = InNormals.A - NVSDK_NGX_DLSS_Roughness_Mode_Packed (Init param)
         IsRightHanded = 1 << 4,     // Visible view-space positions have negative Z
+        CyberpunkDepthMotion = 1 << 5, // Verified game-specific hardware-depth motion in Z, not NGX MVScale.Z
+        ResetMotionHistory = 1 << 6, // No previous-frame depth correspondence is available
 
         Debug = 1 << 16, // Denoiser and upscaler bypassed for debug out if this is set
         DebugModeMask = 0xFF << 16,
@@ -101,6 +103,8 @@ class FSRDPreprocessor_Dx12
         DirectX::XMFLOAT4X4 InvViewMatrix;     // DLSSD WorldToView^1 - Camera matrix
         DirectX::XMFLOAT4X4 InvProjMatrix;     // DLSSD ViewToClip^-1 - Projection
         DirectX::XMFLOAT4X4 PrevViewMatrix;    // DLSSD WorldToView from last frame
+
+        DirectX::XMFLOAT4 PreviousDepthProjection; // Historical A/B/W for clip.z=A*z+B, clip.w=W*z
 
         DirectX::XMFLOAT4 RenderSize;    // XY: Resolution of inputs - ZW: 1.0 / Resolution
 

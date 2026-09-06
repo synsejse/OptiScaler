@@ -82,7 +82,7 @@ def load_capture(directory):
 
 def analyze(directory):
     meta, tex = load_capture(directory)
-    if not meta["hw_depth"] or meta["conversion_flags"] != 5:
+    if not meta["hw_depth"] or (meta["conversion_flags"] & ~(32 | 64)) != 5:
         raise ValueError(f"{directory}: analyzer currently supports the captured Cyberpunk hardware-depth, linear-albedo, packed-roughness convention only")
     raw = tex["input_color"][..., :3].astype(np.float64)
     diff = tex["input_diffuse_albedo"][..., :3].astype(np.float64)
@@ -97,6 +97,8 @@ def analyze(directory):
         valid &= (diff + spec).sum(axis=-1) > .01
     valid &= np.isfinite(raw).all(axis=-1) & np.isfinite(diff + spec).all(axis=-1)
     result = {"directory": str(directory), "frame": meta["frame"], "reset": meta["reset"],
+              "pipeline": meta.get("pipeline", "legacy_fused"),
+              "motion_depth_encoding": meta.get("motion_depth_encoding", "camera_only"),
               "floor_isolation": meta["floor_isolation"], "correlation_bias": meta["correlation_bias"],
               "valid_pixel_fraction": float(valid.mean()), "inventory": meta["textures"],
               "channel_stats": {name: [stats(value[..., c]) for c in range(4)] for name, value in tex.items()}}
@@ -163,10 +165,29 @@ def analyze(directory):
     for channel in (2, 3):
         result[f"motion_{channel}_versus_camera_depth_delta_error"] = stats(np.abs(motion[..., channel] - expected_z)[valid])
     result["motion_w_binary_fraction"] = fraction((motion[..., 3] == 0) | (motion[..., 3] == 1))
-    # Empirical Cyberpunk hypothesis only: the extra Z channel resembles 1000 times a
-    # hardware-depth delta. W is binary but its meaning is not established. Report both
-    # groups; never treat a fitted/observed encoding as an authenticated engine contract.
-    clip_previous = previous @ np.linalg.inv(meta["inv_projection"])
+    if meta["conversion_flags"] & 64:
+        result["reset_motion_depth_abs_error"] = stats(tex["converted_motion"][..., 2][valid])
+    elif meta["conversion_flags"] & 32:
+        # Mirror the verified producer conversion, including its guarded fallback. This checks
+        # conversion arithmetic, not independent temporal image quality or correspondence.
+        a, b, w = map(np.float32, meta["previous_depth_projection"])
+        hw = tex["input_depth"][..., 0]
+        z, writer = tex["input_motion"][..., 2], tex["input_motion"][..., 3]
+        previous_hw = hw + z / np.float32(1000)
+        denominator = w * previous_hw - a
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            previous_z = b / denominator
+        decoded = (np.isfinite(z) & np.isfinite(previous_z) & (previous_z * w > 0) &
+                   (previous_hw >= 0) & (previous_hw <= 1) & (hw >= 0) & (hw <= 1) &
+                   ((writer == 1) | ((writer == 0) & (w * previous[..., 2] > .05))))
+        engine_delta = np.abs(previous_z) - depth
+        stored = np.clip(engine_delta, -65504, 65504).astype(np.float16).astype(np.float32)
+        result["decoded_engine_motion_fraction"] = fraction(decoded[valid])
+        result["decoded_motion_storage_abs_error"] = stats(
+            np.abs(stored - tex["converted_motion"][..., 2])[valid & decoded])
+    # The installed Cyberpunk producers now authenticate this representation; see FSR_RR_MOTION.md.
+    # Comparing it with camera motion remains a diagnostic, not an object-motion ground truth.
+    clip_previous = previous @ np.asarray(meta.get("previous_projection", np.linalg.inv(meta["inv_projection"])))
     hw_previous = clip_previous[..., 2] / clip_previous[..., 3]
     predicted_z = 1000 * (hw_previous - tex["input_depth"][..., 0])
     nearby = valid & (depth > .1) & (depth < 100)

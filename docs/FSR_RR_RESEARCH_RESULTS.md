@@ -1,5 +1,7 @@
 # Cyberpunk RR input-fidelity research — 2026-09-06
 
+This document preserves the **original pre-fix capture run**. Its “current path” and installation status describe build `be887e88`, not the latest branch. Follow-up work removed the measured lighting/material heuristics and authenticated Cyberpunk's motion producer; see [current implementation](FSR_RR.md) and [motion evidence](FSR_RR_MOTION.md).
+
 ## Conclusion
 
 The largest measured input changes are **lighting heuristics and specular-albedo sanitization**, not motion-X/Y compression. Keep AMD's native fused mode; do not restore a guessed diffuse/specular split. There is promising evidence that Cyberpunk already carries depth-motion information in the otherwise-unused Z channel, but its encoding is not an authenticated engine contract yet.
