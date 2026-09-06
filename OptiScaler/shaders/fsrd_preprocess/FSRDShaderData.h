@@ -1,5 +1,6 @@
 #pragma once
 #include "FSRDShaderUtils.h"
+#include <array>
 
 namespace FSRD
 {
@@ -117,20 +118,6 @@ namespace FSRD
     {
         constexpr UINT kBackBufferCount = 3;
 
-        // ffxDispatchDescDenoiserInput1Signal
-        struct Mode1Signal
-        {
-            ComPtr<ID3D12Resource> Radiance;    // RGB: Combined noisy color A: Specular Ray Length - RGBA16_FLOAT
-            ComPtr<ID3D12Resource> FusedAlbedo; // RGB: max(specularAlbedo, diffuseAlbedo) A: NoV - RGBA8_UNORM
-        };
-
-        // ffxDispatchDescDenoiserInput2Signals
-        struct Mode2Signal
-        {
-            ComPtr<ID3D12Resource> SpecRadiance; // RGB: Noisy specular lighting A: Specular Ray Length - RGBA16_FLOAT
-            ComPtr<ID3D12Resource> DiffRadiance; // RGB: Noisy diffuse lighting - RGBA16_FLOAT
-        };
-
         /**
          * @brief Constant buffer data passed to the conversion shader.
          */
@@ -178,48 +165,33 @@ namespace FSRD
          * @brief Output resources formatted for direct consumption by FSR Ray Regeneration.
          * All resources are automatically transitioned to SRV state after dispatch.
          */
-        union Output
+        struct Output
         {
             struct Data
             {
-                union
-                {
-                    Mode1Signal Mode1Inputs;
-                    Mode2Signal Mode2Inputs;
-                };
-
-                ComPtr<ID3D12Resource> Motion; // RG: Standard TSR motion vectors, B: Linear Depth Delta (CurrentLinearDepth - PrevLinearDepth) - RGBA16_FLOAT
+                ComPtr<ID3D12Resource>
+                    Radiance; // RGB: Demodulated combined lighting, A: Specular Ray Length - RGBA16_FLOAT
+                ComPtr<ID3D12Resource>
+                    FusedAlbedo; // RGB: max(specularAlbedo, diffuseAlbedo), A: unused - RGB10A2_UNORM
+                ComPtr<ID3D12Resource>
+                    Motion; // RG: TSR motion, B: abs(PrevLinearDepth) - abs(CurrentLinearDepth) - RGBA16_FLOAT
                 ComPtr<ID3D12Resource> Normals; // RG: Octahedrally encoded normals, B: Linear Roughness, A: Material Type (Optional) - RGB10A2_UNORM
-                ComPtr<ID3D12Resource> SpecAlbedo; // RGB: Specular Albedo, A: saturate(dot(Normal, ViewDir)) - RGBA8_UNORM
-                ComPtr<ID3D12Resource> DiffAlbedo; // RGB: Diffuse Albedo, A: Metalness (heuristic approximate) - RGBA8_UNORM
+                ComPtr<ID3D12Resource> SpecAlbedo;  // RGB: Specular Albedo, A: unused in RR 1.1 - RGB10A2_UNORM
+                ComPtr<ID3D12Resource> DiffAlbedo;  // RGB: Diffuse Albedo, A: unused in RR 1.1 - RGB10A2_UNORM
                 ComPtr<ID3D12Resource> LinearDepth; // R - R32_FLOAT
-
                 ComPtr<ID3D12Resource> SkipSignal;
-
-                Data() {}
-                ~Data() {}
             };
 
-            Output()
+            static constexpr uint32_t kCount = 8;
+            Data Resources {};
+
+            // Explicit UAV order (u0..u7). No union aliasing of live ComPtr objects or manual destruction.
+            std::array<ID3D12Resource*, kCount> GetRawResources() const
             {
-                for (auto& resource : AsArray)
-                    resource = ComPtr<ID3D12Resource>();
+                return { Resources.Radiance.Get(),    Resources.FusedAlbedo.Get(), Resources.Motion.Get(),
+                         Resources.Normals.Get(),     Resources.SpecAlbedo.Get(),  Resources.DiffAlbedo.Get(),
+                         Resources.LinearDepth.Get(), Resources.SkipSignal.Get() };
             }
-
-            ~Output()
-            {
-                for (auto& resource : AsArray)
-                    resource.~ComPtr();
-            }
-
-            // The number of D3D12 resources in the struct
-            static constexpr uint32_t kCount = sizeof(Data) / sizeof(ID3D12Resource*);
-
-            Data Resources;
-
-            ComPtr<ID3D12Resource> AsArray[kCount];
-
-            ID3D12Resource* AsRawArray[kCount];
         };
     }
 
@@ -245,11 +217,8 @@ namespace FSRD
         {
             struct Data
             {
-                ID3D12Resource* InDenoisedSignal1;
-                ID3D12Resource* InAlbedo1;
-
-                ID3D12Resource* InDenoisedSignal2;
-                ID3D12Resource* InAlbedo2;
+                ID3D12Resource* InDenoisedRadiance;
+                ID3D12Resource* InFusedAlbedo;
 
                 ID3D12Resource* InSkipSignal;
                 ID3D12Resource* InRawColor;

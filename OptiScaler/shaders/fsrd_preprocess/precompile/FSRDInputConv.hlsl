@@ -18,7 +18,6 @@ static const uint2 s_ThreadGroupSize = uint2(THREAD_GROUP_SIZE_X, THREAD_GROUP_S
 #define FLAGS_NON_GAMMA_ALBEDO          (1 << 0)
 #define FLAGS_LINEAR_DEPTH              (1 << 1)
 #define FLAGS_PACKED_ROUGHNESS          (1 << 2)
-#define FLAGS_MODE_2_SIGNAL             (1 << 3)
 #define FLAGS_IS_RIGHT_HANDED           (1 << 4)
 
 // Debug Flags
@@ -62,15 +61,11 @@ Texture2D<half> InBiasMask : register(t8);
 
 Texture2D<half4> InBlurColor : register(t9);
 
-// FSR-RR - ffxDispatchDescDenoiserInput1Signal or ffxDispatchDescDenoiserInput2Signals
-//
-// Mode 1: RGB: Noisy fused lighting A: Specular Ray Length
-// Mode 2: RGB: Noisy specular lighting A: Specular Ray Length
-RWTexture2D<half4> OutSignal1 : register(u0); 
-
-// Mode 1: RGB Fused Albedo: max(specularAlbedo, diffuseAlbedo) A: Unused in RR 1.1
-// Mode 2: RGB: Noisy diffuse lighting for Mode 2
-RWTexture2D<half4> OutSignal2 : register(u1);
+// FSR-RR - ffxDispatchDescDenoiserInput1Signal
+// RGB: Demodulated combined lighting, A: Specular Ray Length
+RWTexture2D<half4> OutRadiance : register(u0);
+// RGB: max(specularAlbedo, diffuseAlbedo), A: Unused in RR 1.1
+RWTexture2D<half4> OutFusedAlbedo : register(u1);
 
 // ffxDispatchDescDenoiser
 RWTexture2D<half4> OutMotion : register(u2); // RG: Standard TSR motion vectors, B: abs(PrevLinearDepth) - abs(CurrentLinearDepth)
@@ -215,59 +210,28 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         specReflectance.rgb = round(saturate(specReflectance.rgb) * 1023.0f) / 1023.0f;
         diffAlbedo.rgb = round(saturate(diffAlbedo.rgb) * 1023.0f) / 1023.0f;
 
-        // Both AMD modes consume specular ray length in radiance alpha. Null input reads zero.
+        // AMD's fused mode consumes specular ray length in radiance alpha. Null input reads zero.
         const float rawHitDist = InSpecHitDist[px];
         const half hitDist = isfinite(rawHitDist) ? GetSafeFP16(max(rawHitDist, 0.0f)) : 0.0f;
-        half3 demodColor = 0.0f;
-        float4 fusedAlbedo = 0.0f;
-        
+        // AMD's native single-signal contract: normalize the combined lighting by a shared albedo.
+        // This does not invent separate diffuse or specular lighting.
+        float4 fusedAlbedo = float4(max(specReflectance.rgb, diffAlbedo.rgb), 0.0f);
+        const half3 demodColor = GetSafeFP16(denosierColor / fusedAlbedo.rgb);
+
+        // Preserve radiance that cannot survive FP16 demodulation rather than clipping it away.
+        const float3 residual = max(0.0f, denosierColor - (demodColor * fusedAlbedo.rgb));
+        floorColor += residual;
+
         [branch]
-        if (IsSet(FLAGS_MODE_2_SIGNAL)) // Heuristic split, not genuine separate lighting.
-        {          
-            const float3 specWeight = saturate(specReflectance.rgb);
-            const float3 diffWeight = saturate(diffAlbedo.rgb);
-            const float3 rcpTotalWeight = rcp(diffWeight + specWeight);
+        if (!IsSet(FLAGS_NON_GAMMA_ALBEDO))
+            fusedAlbedo = sqrt(fusedAlbedo);
 
-            const float3 specularColor = denosierColor * (specWeight * rcpTotalWeight);
-            const float3 diffuseColor = denosierColor - specularColor;
-
-            half3 demodSpecular = GetSafeFP16(specularColor / specReflectance.rgb);
-            half3 demodDiffuse = GetSafeFP16(diffuseColor / diffAlbedo.rgb);
-            
-            // Anything that can't survive modulation and clamping should be skipped
-            const float3 remodColor = (demodSpecular * specReflectance.rgb) + (demodDiffuse * diffAlbedo.rgb);
-            const float3 residual = max(0.0f, denosierColor - remodColor);
-            floorColor += residual;
-            
-            
-            [branch]
-            if (!IsSet(FLAGS_DEBUG))
-            {
-                OutSignal1[px] = half4(demodSpecular, hitDist);
-                OutSignal2[px] = half4(demodDiffuse, 0.0f);
-            }
-            else
-                demodColor = demodDiffuse + demodSpecular;
+        [branch]
+        if (!IsSet(FLAGS_DEBUG))
+        {
+            OutRadiance[px] = half4(demodColor, hitDist);
+            OutFusedAlbedo[px] = GetSafeFP16(fusedAlbedo);
         }
-        else // Primary radiance packing - Mode 1 Signal
-        {           
-            fusedAlbedo = float4(max(specReflectance.rgb, diffAlbedo.rgb), 0.0f);
-            demodColor = GetSafeFP16(denosierColor / fusedAlbedo.rgb);
-            
-            const float3 residual = max(0.0f, denosierColor - (demodColor * fusedAlbedo.rgb));
-            floorColor += residual;
-            
-            [branch]
-            if (!IsSet(FLAGS_NON_GAMMA_ALBEDO))
-                fusedAlbedo = sqrt(fusedAlbedo);
-            
-            [branch]
-            if (!IsSet(FLAGS_DEBUG))
-            {
-                OutSignal1[px] = half4(demodColor, hitDist);
-                OutSignal2[px] = GetSafeFP16(fusedAlbedo);
-            }
-        }        
                 
         // May be for better perceptual encoding efficiency in some configurations
         [branch]
@@ -366,7 +330,7 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
                     break;
             }
         
-            OutSignal1[px] = half4(debugColor, 1.0f);
+            OutRadiance[px] = half4(debugColor, 1.0f);
         }
     }
     else // Skip
@@ -376,8 +340,8 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         OutNormals[px] = 0.0f;
         OutSpecAlbedo[px] = 0.0f;
         OutDiffAlbedo[px] = 0.0f;
-        OutSignal1[px] = 0.0f;
-        OutSignal2[px] = 0.0f;
+        OutRadiance[px] = 0.0f;
+        OutFusedAlbedo[px] = 0.0f;
         OutSkipSignal[px] = half4(rawColor, 1.0f);
     }
 }

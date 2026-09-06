@@ -9,30 +9,31 @@ SHADERS = ROOT / "OptiScaler/shaders/fsrd_preprocess"
 
 
 class RRContracts(unittest.TestCase):
-    def test_both_modes_allocate_floor_scratch(self):
+    def test_fused_path_still_allocates_both_floor_scratch_buffers(self):
         source = (SHADERS / "FSRDPreprocessor_Dx12.cpp").read_text()
         allocation = source.split("void SetMaxRenderSize(", 1)[1].split("void DispatchPyramidSeed", 1)[0]
-        common = allocation.split("if (m_isMode2)", 1)[0]
         for name in ("m_outputBuffer1", "m_outputBuffer2"):
-            self.assertIn(f"{name} = CreateTex", common)
+            self.assertIn(f"{name} = CreateTex", allocation)
 
-    def test_hit_distance_is_shared_by_both_modes(self):
+    def test_fused_radiance_retains_hit_distance_and_material_guides(self):
         source = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()
         kernel = source.split("void CSMain", 1)[1]
-        self.assertLess(kernel.index("const half hitDist"), kernel.index("if (IsSet(FLAGS_MODE_2_SIGNAL))"))
-        self.assertIn("half4(demodColor, hitDist)", kernel)
-        self.assertIn("half4(demodSpecular, hitDist)", kernel)
+        self.assertIn("OutRadiance[px] = half4(demodColor, hitDist)", kernel)
+        self.assertIn("max(specReflectance.rgb, diffAlbedo.rgb)", kernel)
+        self.assertIn("denosierColor / fusedAlbedo.rgb", kernel)
+        for output in ("OutSpecAlbedo", "OutDiffAlbedo", "OutNormals", "OutMotion", "OutLinearDepth"):
+            self.assertIn(f"{output}[px] =", kernel)
         self.assertNotIn("roughness < 0.2", kernel)
 
     def test_fused_composition_receives_raw_color(self):
         source = (SHADERS / "FSRDPreprocessor_Dx12.cpp").read_text()
         composition = source.split("void DispatchComposition", 1)[1].split("void Blit", 1)[0]
-        self.assertEqual(composition.count(".InRawColor = desc.InRawColor"), 2)
+        self.assertEqual(composition.count(".InRawColor = desc.InRawColor"), 1)
 
     def test_all_denoiser_outputs_declare_uav(self):
         source = (SHADERS / "FSRDPreprocessor_Dx12.cpp").read_text()
         outputs = re.findall(r"\.output\s*=\s*ffxApiGetResourceDX12\([^,]+,\s*(\w+)\)", source)
-        self.assertEqual(len(outputs), 3)
+        self.assertEqual(len(outputs), 1)
         self.assertTrue(all("FFX_API_RESOURCE_STATE_UNORDERED_ACCESS" in value for value in outputs))
 
     def test_partial_groups_reach_composition_barrier(self):
@@ -72,7 +73,7 @@ class RRContracts(unittest.TestCase):
         for name in ("specReflectance", "diffAlbedo"):
             quantize = f"round(saturate({name}.rgb) * 1023.0f) / 1023.0f"
             self.assertIn(quantize, shader)
-            self.assertLess(shader.index(quantize), shader.index("half3 demodSpecular"))
+            self.assertLess(shader.index(quantize), shader.index("half3 demodColor"))
         self.assertGreater(round(1e-3 * 1023) / 1023, 0)
 
     def test_msbuild_generates_all_four_kernels(self):
@@ -90,6 +91,49 @@ class RRContracts(unittest.TestCase):
         source = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()
         skipped = source.split("else // Skip", 1)[1]
         self.assertIn("OutMotion[px] = half4(InMotionVectors[px].rg, 0.0f, 0.0f)", skipped)
+
+    def test_guessed_split_is_removed_not_just_hidden(self):
+        feature = ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp"
+        paths = [*SHADERS.glob("*.h"), *SHADERS.glob("*.cpp"), *SHADERS.glob("precompile/*.hlsl"), feature]
+        for path in paths:
+            source = path.read_text()
+            for symbol in ("Mode2Signal", "Mode2Inputs", "isMode2", "FLAGS_MODE_2_SIGNAL",
+                           "FFX_DENOISER_MODE_2_SIGNALS", "ffxDispatchDescDenoiserInput2Signals",
+                           "demodSpecular", "demodDiffuse", "specWeight", "InDenoisedSignal2"):
+                self.assertNotIn(symbol, source, str(path))
+        self.assertIn(".mode = FFX_DENOISER_MODE_1_SIGNAL", feature.read_text())
+
+    def test_old_configuration_cannot_reactivate_split(self):
+        config = (ROOT / "OptiScaler/Config.cpp").read_text()
+        self.assertIn('ini.Delete("FSR-RR", "DenoiserMode")', config)
+        self.assertNotIn('readInt("FSR-RR", "DenoiserMode")', config)
+        self.assertNotRegex((ROOT / "OptiScaler.ini").read_text(), r"(?m)^DenoiserMode=")
+        for name in ("Config.h", "State.h", "menu/menu_common.h", "menu/menu_common.cpp"):
+            source = (ROOT / "OptiScaler" / name).read_text()
+            self.assertNotIn("FfxDenoiserMode", source)
+            self.assertNotIn("ffxDenoiserMode", source)
+
+    def test_fused_composition_descriptor_layout_matches_shader(self):
+        source = (SHADERS / "FSRDShaderData.h").read_text().split("namespace Composition", 1)[1]
+        names = re.findall(r"ID3D12Resource\* (\w+);", source)
+        shader = (SHADERS / "precompile/FSRDOutputComp.hlsl").read_text()
+        textures = re.findall(r"Texture2D<[^>]+> (\w+) : register\(t(\d+)\)", shader)
+        self.assertEqual(names, [name for name, _ in textures])
+        self.assertEqual([int(slot) for _, slot in textures], list(range(5)))
+        self.assertIn("SRV(t0, numDescriptors = 5)", shader)
+
+    def test_conversion_resources_have_regular_ownership_and_explicit_uav_order(self):
+        source = (SHADERS / "FSRDShaderData.h").read_text().split("namespace Conversion", 1)[1]
+        output = source.split("struct Output", 1)[1].split("namespace Composition", 1)[0]
+        self.assertNotIn("union", output.split("// Explicit UAV order", 1)[0])
+        self.assertNotIn("~ComPtr", output)
+        resources = re.findall(r"Resources\.(\w+)\.Get\(\)", output)
+        self.assertEqual(resources, ["Radiance", "FusedAlbedo", "Motion", "Normals", "SpecAlbedo", "DiffAlbedo",
+                                     "LinearDepth", "SkipSignal"])
+        shader = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()
+        textures = re.findall(r"RWTexture2D<[^>]+> Out(\w+) : register\(u(\d+)\)", shader)
+        self.assertEqual(resources, [name for name, _ in textures])
+        self.assertEqual([int(slot) for _, slot in textures], list(range(8)))
 
 
 if __name__ == "__main__":

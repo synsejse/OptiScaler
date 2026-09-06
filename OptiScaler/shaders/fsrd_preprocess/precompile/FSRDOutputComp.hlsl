@@ -3,7 +3,7 @@
 #define MainRS \
     "RootFlags(0), " \
     "CBV(b0), " \
-    "DescriptorTable(SRV(t0, numDescriptors = 7), visibility = SHADER_VISIBILITY_ALL), " \
+    "DescriptorTable(SRV(t0, numDescriptors = 5), visibility = SHADER_VISIBILITY_ALL), " \
     "DescriptorTable(UAV(u0, numDescriptors = 1), visibility = SHADER_VISIBILITY_ALL), " \
     "StaticSampler(s0, " \
         "filter = FILTER_MIN_MAG_MIP_LINEAR, " \
@@ -34,7 +34,6 @@ DECLARE_LDS_ARRAY_2D(half4, g_DenoisedColor, KERNEL_SIZE);
 // Feature Flags
 #define FLAGS_RAW_SOURCE_BLIT           (1 << 0)
 #define FLAGS_SCALE_SRC                 (1 << 1)
-#define FLAGS_MODE_2_SIGNAL             (1 << 2)
 
 // Debug Flags
 #define FLAGS_DEBUG                     (1 << 16)
@@ -43,22 +42,16 @@ DECLARE_LDS_ARRAY_2D(half4, g_DenoisedColor, KERNEL_SIZE);
 #define FLAGS_DEBUG_CORRELATION_BIAS    (1 << 17 | FLAGS_DEBUG)
 #define FLAGS_DEBUG_SKIP_SIGNAL         (2 << 17 | FLAGS_DEBUG)
 #define FLAGS_DEBUG_DENOISER_OUTPUT     (3 << 17 | FLAGS_DEBUG)
-#define FLAGS_DEBUG_SPECULAR_COLOR      (4 << 17 | FLAGS_DEBUG)
-#define FLAGS_DEBUG_DIFFUSE_COLOR       (5 << 17 | FLAGS_DEBUG)
+#define FLAGS_DEBUG_FUSED_LIGHTING      (4 << 17 | FLAGS_DEBUG)
 
-// Mode 1/2 Signal
-Texture2D<half4> InDenoisedSignal1 : register(t0); // Fused or specular denoiser output
-Texture2D<half4> InAlbedo1 : register(t1); // Fused or specular albedo
-
-// Mode 2 Signal
-Texture2D<half4> InDenoisedSignal2 : register(t2); // Diffuse denoiser output
-Texture2D<half4> InAlbedo2 : register(t3); // Diffuse albedo
+Texture2D<half4> InDenoisedRadiance : register(t0); // Demodulated combined denoiser output
+Texture2D<half4> InFusedAlbedo : register(t1); // Fused albedo
 
 // Secondary buffers
-Texture2D<half4> InSkipSignal : register(t4);
+Texture2D<half4> InSkipSignal : register(t2);
 
-Texture2D<half3> InRawColor : register(t5);
-Texture2D<half4> InColorBeforeParticles : register(t6);
+Texture2D<half3> InRawColor : register(t3);
+Texture2D<half4> InColorBeforeParticles : register(t4);
 
 RWTexture2D<half4> OutColor : register(u0);
 
@@ -164,25 +157,8 @@ void PopulateSharedMemory(const uint2 groupID, const int2 gtID)
         {
             const int2 smID = int2(smFlatID % s_SM_Size.x, smFlatID / s_SM_Size.x);
             const int2 px = clamp(pxOrigin + smID, int2(0, 0), maxBounds);
-            float3 denoisedColor;
-            float3 totalAlbedo;
-            
-            [branch]
-            if (IsSet(FLAGS_MODE_2_SIGNAL))
-            {
-                const float3 denoisedSpecColor = InDenoisedSignal1[px].rgb;
-                const float3 denoisedDiffColor = InDenoisedSignal2[px].rgb;
-                const float3 specReflectance = InAlbedo1[px].rgb;
-                const float3 diffAlbedo = InAlbedo2[px].rgb;
-                
-                totalAlbedo = specReflectance + diffAlbedo;
-                denoisedColor = (denoisedSpecColor * specReflectance) + (denoisedDiffColor * diffAlbedo);
-            }
-            else
-            {
-                totalAlbedo = InAlbedo1[px].rgb;
-                denoisedColor = InDenoisedSignal1[px].rgb * totalAlbedo;
-            }
+            const float3 totalAlbedo = InFusedAlbedo[px].rgb;
+            float3 denoisedColor = InDenoisedRadiance[px].rgb * totalAlbedo;
             
             denoisedColor += InSkipSignal[px].rgb;
 
@@ -222,12 +198,12 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         if (IsSet(FLAGS_SCALE_SRC))
         {
             uint width, height;
-            InDenoisedSignal1.GetDimensions(width, height);
+            InDenoisedRadiance.GetDimensions(width, height);
             const float2 srcPixel = clamp(uv * SrcTexSize, 0.5f, SrcTexSize - 0.5f);
-            OutColor[px] = InDenoisedSignal1.SampleLevel(LinearSampler, srcPixel / float2(width, height), 0);
+            OutColor[px] = InDenoisedRadiance.SampleLevel(LinearSampler, srcPixel / float2(width, height), 0);
         }
         else
-            OutColor[px] = InDenoisedSignal1[px];
+            OutColor[px] = InDenoisedRadiance[px];
     }
     else
     {
@@ -252,18 +228,11 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
                 case FLAGS_DEBUG_SKIP_SIGNAL:
                     OutColor[px] = half4(InSkipSignal[px].rgb, 1.0f);
                     break;
-                case FLAGS_DEBUG_SPECULAR_COLOR:
-                    OutColor[px] = half4(InDenoisedSignal1[px].rgb * InAlbedo1[px].rgb, 1.0f);
-                    break;
-                case FLAGS_DEBUG_DIFFUSE_COLOR:
-                    OutColor[px] = half4(InDenoisedSignal2[px].rgb * InAlbedo2[px].rgb, 1.0f);
+                case FLAGS_DEBUG_FUSED_LIGHTING:
+                    OutColor[px] = half4(InDenoisedRadiance[px].rgb * InFusedAlbedo[px].rgb, 1.0f);
                     break;
                 default:
-                    if (IsSet(FLAGS_MODE_2_SIGNAL))
-                        OutColor[px] = half4(InDenoisedSignal1[px].rgb + InDenoisedSignal2[px].rgb, 1.0f);
-                    else
-                        OutColor[px] = half4(InDenoisedSignal1[px].rgb, 1.0f);
-                
+                    OutColor[px] = half4(InDenoisedRadiance[px].rgb, 1.0f);
                     break;
             }    
         }

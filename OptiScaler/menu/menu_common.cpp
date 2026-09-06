@@ -2822,41 +2822,10 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         {
             if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())
             {
-                if (!state.ffxDenoiserModes.empty())
-                {
-                    if (_ffxDenoiserMode == -1)
-                        _ffxDenoiserMode = config->FfxDenoiserMode.value_or_default();
-
-                    const char* currentEnum = state.ffxDenoiserModeNames[_ffxDenoiserMode];
-
-                    if (ImGui::BeginCombo("Denoiser Mode", currentEnum))
-                    {
-                        for (const int mode : state.ffxDenoiserModes)
-                        {
-                            bool isSelected = mode == _ffxDenoiserMode;
-
-                            if (ImGui::Selectable(state.ffxDenoiserModeNames[mode], &isSelected))
-                                _ffxDenoiserMode = mode;
-
-                            if (isSelected)
-                                ImGui::SetItemDefaultFocus();
-                        }
-
-                        ImGui::EndCombo();
-                    }
-                    ShowHelpMarker("Fused mode denoises the combined lighting supplied by DLSS RR. "
-                                   "Split mode estimates diffuse/specular lighting from albedo weights; "
-                                   "these are not genuine separate lighting inputs. It is experimental.");
-
-                    ImGui::SameLine();
-
-                    if (ImGui::Button("Change Mode") && _ffxDenoiserMode != config->FfxDenoiserMode.value_or_default())
-                    {
-                        config->FfxDenoiserMode = _ffxDenoiserMode;
-                        state.newBackend = currentBackend;
-                        MARK_ALL_BACKENDS_CHANGED();
-                    }
-                }
+                ImGui::TextUnformatted("Lighting: Fused");
+                ShowHelpMarker("Uses AMD's single-signal denoiser for the game's combined lighting.\n"
+                               "Diffuse/specular albedo, normals, roughness and motion remain separate guides.\n"
+                               "No synthetic diffuse/specular lighting split is performed.");
 
                 if (float v = config->FfxDenoiserDisocclusionThreshold.value_or_default();
                     ImGui::SliderFloat("Disocclusion Threshold", &v, 0.01f, 0.05f, "%.3f"))

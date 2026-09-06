@@ -208,8 +208,7 @@ enum class DebugModes : uint64_t
     Correlation = (uint64_t) FSRDCompFlags::DebugCorrelation << CompositionDebugOffset,
     SkipSignal = (uint64_t) FSRDCompFlags::DebugSkipSignal << CompositionDebugOffset,
     DenoiserOutput = (uint64_t) FSRDCompFlags::DebugDenoiserOutput << CompositionDebugOffset,
-    Signal1 = (uint64_t) FSRDCompFlags::DebugSignal1 << CompositionDebugOffset,
-    Signal2 = (uint64_t) FSRDCompFlags::DebugSignal2 << CompositionDebugOffset,
+    FusedLighting = (uint64_t) FSRDCompFlags::DebugFusedLighting << CompositionDebugOffset,
 };
 
 static FSRDConvFlags GetConvDebugFlags(DebugModes mode)
@@ -266,20 +265,13 @@ constexpr auto kDebugModes = std::to_array<ModeNamePair>({
     { "FloorVariance", (uint64_t) DebugModes::FloorVariance },
     { "FloorColor", (uint64_t) DebugModes::FloorColor },
 
-    { "Signal1", (uint64_t) DebugModes::Signal1 },
-    { "Signal2", (uint64_t) DebugModes::Signal2 },
-});
-
-constexpr auto kDenoiserModes = std::to_array<std::pair<const char*, int>>({
-    { "Fused (recommended)", 1 },
-    { "Split (heuristic)", 0 },
+    { "FusedLighting", (uint64_t) DebugModes::FusedLighting },
 });
 
 FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InParameters)
     : FFXFeatureDx12(InHandleId, InParameters), IFeature(InHandleId, SetParameters(InParameters)),
-      _pDenoiserCtx(nullptr), _denoiserCtxDesc({}), _denoiserSettings({}), _convDesc({}), _isMode2(false),
-      _isInReset(false), _lastCamPos(0.0f, 0.0f, 0.0f), _invViewMatrix(XMMatrixIdentity()),
-      _viewMatrix(XMMatrixIdentity()),
+      _pDenoiserCtx(nullptr), _denoiserCtxDesc({}), _denoiserSettings({}), _convDesc({}), _isInReset(false),
+      _lastCamPos(0.0f, 0.0f, 0.0f), _invViewMatrix(XMMatrixIdentity()), _viewMatrix(XMMatrixIdentity()),
       _prevViewMatrix(XMMatrixIdentity()), _projMatrix(XMMatrixIdentity()), _upscaleColorOverride(nullptr),
       _upscaleFovVertical(0.0f), _upscaleDeltaTime(0.0f)
 {
@@ -352,19 +344,6 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
     state.ffxDenoiserUpscalerVersion = Version();
     parse_version(state.ffxDenoiserVersionNames[cfg.FfxDenoiserIndex.value_or_default()]);
 
-    // Get current mode and populate mode map
-    _isMode2 = cfg.FfxDenoiserMode.value_or_default() == 0;
-    state.ffxDenoiserModes.reserve(kDenoiserModes.size());
-    state.ffxDenoiserModeNames.reserve(kDenoiserModes.size());
-    state.ffxDenoiserModes.clear();
-    state.ffxDenoiserModeNames.clear();
-
-    for (const auto& mode : kDenoiserModes)
-    {
-        state.ffxDenoiserModes.push_back(mode.second);
-        state.ffxDenoiserModeNames.emplace(mode.second, mode.first);
-    }
-
     ffxOverrideVersion vidOverride = { .header = { .type = FFX_API_DESC_TYPE_OVERRIDE_VERSION },
                                        .versionId =
                                            state.ffxDenoiserVersionIds[cfg.FfxDenoiserIndex.value_or_default()] };
@@ -375,16 +354,15 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
                                              .device = Device };
     // Chain: ContextDesc -> BackendDesc -> OverrideVersion
     // Composited radiance with fused albedo without a dominant light source
-    _denoiserCtxDesc = {
-        .header = { .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER,
-                    // Chain backend desc into context desc
-                    .pNext = &backendDesc.header },
-        .version = FFX_DENOISER_VERSION,
-        // Reserve once. A quality change resets history, never frees in-flight RR resources.
-        .maxRenderSize = { std::max(RenderWidth(), DisplayWidth()), std::max(RenderHeight(), DisplayHeight()) },
-        .mode = static_cast<uint32_t>(_isMode2 ? FFX_DENOISER_MODE_2_SIGNALS : FFX_DENOISER_MODE_1_SIGNAL),
-        .flags = 0
-    };
+    _denoiserCtxDesc = { .header = { .type = FFX_API_CREATE_CONTEXT_DESC_TYPE_DENOISER,
+                                     // Chain backend desc into context desc
+                                     .pNext = &backendDesc.header },
+                         .version = FFX_DENOISER_VERSION,
+                         // Reserve once. A quality change resets history, never frees in-flight RR resources.
+                         .maxRenderSize = { std::max(RenderWidth(), DisplayWidth()),
+                                            std::max(RenderHeight(), DisplayHeight()) },
+                         .mode = FFX_DENOISER_MODE_1_SIGNAL,
+                         .flags = 0 };
 
 #ifdef _DEBUG
     LOG_INFO("Debug checking enabled for denoiser!");
@@ -424,7 +402,7 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
     ApplyProviderDefault(cfg.FfxDenoiserDisocclusionThreshold, _denoiserSettings.disocclusionThreshold);
 
     // Create DLSS-RR to FSR-RR input converter
-    FSRDConvShader = std::make_unique<FSRDPreprocessor_Dx12>("FSRD Converter", Device, _isMode2);
+    FSRDConvShader = std::make_unique<FSRDPreprocessor_Dx12>("FSRD Converter", Device);
 
     if (!FSRDConvShader->IsInit())
         return false;
@@ -599,28 +577,16 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         _isInReset |= value > 0;
 
     // Denoiser start
-    ffxDispatchDescDenoiserInput1Signal mode1Signal = {};
-    ffxDispatchDescDenoiserInput2Signals mode2Signal = {};
+    ffxDispatchDescDenoiserInput1Signal fusedSignal = {};
     ffxDispatchDescDenoiser denoiserDesc = {};
     bool isDenoiserReady = false;
 
     // Pull configuration and input buffers for DLSS-RR from the param table, convert and
     // repack input buffers into intermediate FSR-RR input buffers, and configure descriptors.
-    if (_isMode2)
+    if (!PrepareDenoiserInput(InCommandList, *InParameters, denoiserDesc, fusedSignal))
     {
-        if (!PrepareDenoiserInput(InCommandList, *InParameters, denoiserDesc, mode2Signal))
-        {
-            _hasCameraHistory = false;
-            return false;
-        }
-    }
-    else
-    {
-        if (!PrepareDenoiserInput(InCommandList, *InParameters, denoiserDesc, mode1Signal))
-        {
-            _hasCameraHistory = false;
-            return false;
-        }
+        _hasCameraHistory = false;
+        return false;
     }
 
     // Dispatch denoiser
@@ -684,12 +650,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         else if (dbgMode == DebugModes::RawColor)
             TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Color, srcTex);
         else if (isDebugVis)
-        {
-            if (_isMode2)
-                srcTex = GetD3D12ResFromFFX(mode2Signal.specularRadiance.input);
-            else
-                srcTex = GetD3D12ResFromFFX(mode1Signal.radiance.input);
-        }
+            srcTex = GetD3D12ResFromFFX(fusedSignal.radiance.input);
         else
             srcTex = FSRDConvShader->GetCompositionOutput();
 
@@ -708,10 +669,9 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     return isDenoiserReady || isDenoiseBypassed;
 }
 
-template <typename SignalDescT>
 bool FSRDFeatureDx12::PrepareDenoiserInput(ID3D12GraphicsCommandList* InCommandList,
                                            const NVSDK_NGX_Parameter& inParams, ffxDispatchDescDenoiser& dispatchDesc,
-                                           SignalDescT& signalDesc)
+                                           ffxDispatchDescDenoiserInput1Signal& signalDesc)
 {
     const auto& cfg = *Config::Instance();
     const auto& slData = State::Instance().slLastConstants;

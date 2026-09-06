@@ -278,7 +278,6 @@ bool Config::Reload(std::filesystem::path iniPath)
             DlssReactiveMaskBias.set_from_config(readFloat("FSR", "DlssReactiveMaskBias"));
 
             // FSR-RR
-            FfxDenoiserMode.set_from_config(readInt("FSR-RR", "DenoiserMode"));
             FfxDenoiserCaptureSamples.set_from_config(readInt("FSR-RR", "CaptureSamples"));
             FfxDenoiserDisocclusionThreshold.set_from_config(
                 readFloat("FSR-RR", "DisocclusionThreshold"));
@@ -1132,7 +1131,8 @@ bool Config::SaveIni()
                      GetFloatValue(Instance()->DlssReactiveMaskBias.value_for_config()).c_str());
 
         // FSR-RR
-        ini.SetValue("FSR-RR", "DenoiserMode", GetIntValue(Instance()->FfxDenoiserMode.value_for_config()).c_str());
+        // The albedo-weighted split was removed. Old INIs cannot re-enable it.
+        ini.Delete("FSR-RR", "DenoiserMode");
         ini.SetValue("FSR-RR", "CaptureSamples",
                      GetIntValue(Instance()->FfxDenoiserCaptureSamples.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "DisocclusionThreshold",

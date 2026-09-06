@@ -39,10 +39,6 @@ namespace FSRDFormats
     constexpr DXGI_FORMAT Radiance = DXGI_FORMAT_R16G16B16A16_FLOAT;
     constexpr DXGI_FORMAT FusedAlbedo = DXGI_FORMAT_R10G10B10A2_UNORM;
 
-    // ffxDispatchDescDenoiserInput2Signals
-    constexpr DXGI_FORMAT SpecRadiance = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    constexpr DXGI_FORMAT DiffRadiance = DXGI_FORMAT_R16G16B16A16_FLOAT;
-
     // ffxDispatchDescDenoiser
     constexpr DXGI_FORMAT Motion = DXGI_FORMAT_R16G16B16A16_FLOAT;
     constexpr DXGI_FORMAT Normals = DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -213,7 +209,6 @@ struct ComputeState
 struct FSRDPreprocessor_Dx12::Impl
 {
     ID3D12Device* m_pDev = nullptr;
-    bool m_isMode2;
 
     ComputeState m_floorSeedShader;
     ComputeState m_floorFilterShader;
@@ -234,16 +229,10 @@ struct FSRDPreprocessor_Dx12::Impl
     ID3D12Resource* m_smoothFloor;
     ComPtr<ID3D12Resource> m_edgeGuide;
 
-    void Initialize(
-        std::span<const byte> blSeedByteCode, 
-        std::span<const byte> blPyramidByteCode, 
-        std::span<const byte> convByteCode, 
-        std::span<const byte> compByteCode, 
-        bool isMode2
-    )
+    void Initialize(std::span<const byte> blSeedByteCode, std::span<const byte> blPyramidByteCode,
+                    std::span<const byte> convByteCode, std::span<const byte> compByteCode)
     {
         ScopedSkipHeapCapture skipHeapCapture {};
-        m_isMode2 = isMode2;
 
         LOG_DEBUG("Creating FSRD interop shaders...");
 
@@ -281,28 +270,14 @@ struct FSRDPreprocessor_Dx12::Impl
         outResources.SkipSignal = CreateTex(FSRDFormats::SkipSignal, L"FSR_Conv_SkipSignal");
 
         m_outputBuffer1 = CreateTex(FSRDFormats::OutputBuffer1, L"FSR_Conv_OutputBuffer1");
-        // The floor filter ping-pongs both buffers even when only one signal is denoised.
+        // The floor filter still needs two scratch buffers; only buffer 1 is a denoiser output.
         m_outputBuffer2 = CreateTex(FSRDFormats::OutputBuffer2, L"FSR_Conv_OutputBuffer2");
 
         m_smoothFloor = nullptr;
         m_edgeGuide = CreateTex(FSRDFormats::EdgeGuide, L"FSR_Conv_EdgeGuide");
 
-        if (m_isMode2)
-        {
-            outResources.Mode2Inputs = 
-            {
-                .SpecRadiance = CreateTex(FSRDFormats::SpecRadiance, L"FSR_Conv_SpecRadiance"),
-                .DiffRadiance = CreateTex(FSRDFormats::DiffRadiance, L"FSR_Conv_DiffRadiance")
-            };
-        }
-        else
-        {
-            outResources.Mode1Inputs = 
-            {
-                .Radiance = CreateTex(FSRDFormats::Radiance, L"FSR_Conv_Radiance"),
-                .FusedAlbedo = CreateTex(FSRDFormats::FusedAlbedo, L"FSR_Conv_FusedAlbedo")
-            };
-        }
+        outResources.Radiance = CreateTex(FSRDFormats::Radiance, L"FSR_Conv_Radiance");
+        outResources.FusedAlbedo = CreateTex(FSRDFormats::FusedAlbedo, L"FSR_Conv_FusedAlbedo");
     }
 
     void DispatchPyramidSeed(ID3D12GraphicsCommandList* cmdList, const ConversionDesc& desc) 
@@ -393,11 +368,9 @@ struct FSRDPreprocessor_Dx12::Impl
 
         in.Resources.InBlurColor = m_smoothFloor;
 
-        if (m_isMode2)
-            packConstants.Flags |= UINT(ConvFlags::Mode2Signal);
-
         const std::span<const byte> convCBData((const byte*) &packConstants, sizeof(packConstants));
-        m_convShader.Dispatch(cmdList, convCBData, in.AsArray, m_out.AsRawArray, dispatchSize, true);
+        auto outputs = m_out.GetRawResources();
+        m_convShader.Dispatch(cmdList, convCBData, in.AsArray, outputs, dispatchSize, true);
     }
 
     void DispatchConversion(ID3D12GraphicsCommandList* cmdList, const ConversionDesc& desc) 
@@ -432,33 +405,11 @@ struct FSRDPreprocessor_Dx12::Impl
             .Flags = UINT(desc.Flags) 
         };
 
-        if (m_isMode2)
-        {
-            auto& signalData = outResources.Mode2Inputs;
-
-            inputs.Resources = 
-            {
-                .InDenoisedSignal1 = m_outputBuffer1.Get(),
-                .InAlbedo1 = outResources.SpecAlbedo.Get(),
-                .InDenoisedSignal2 = m_outputBuffer2.Get(),
-                .InAlbedo2 = outResources.DiffAlbedo.Get(),
-                .InSkipSignal = outResources.SkipSignal.Get(),
-                .InRawColor = desc.InRawColor,
-                .InColorBeforeParticles = desc.InColorBeforeParticles
-            };
-
-            constants.Flags |= UINT(CompFlags::Mode2Signal);
-        }
-        else
-        {
-            auto& signalData = outResources.Mode1Inputs;
-
-            inputs.Resources = { .InDenoisedSignal1 = m_outputBuffer1.Get(),
-                                 .InAlbedo1 = signalData.FusedAlbedo.Get(),
-                                 .InSkipSignal = outResources.SkipSignal.Get(),
-                                 .InRawColor = desc.InRawColor,
-                                 .InColorBeforeParticles = desc.InColorBeforeParticles };
-        }  
+        inputs.Resources = { .InDenoisedRadiance = m_outputBuffer1.Get(),
+                             .InFusedAlbedo = outResources.FusedAlbedo.Get(),
+                             .InSkipSignal = outResources.SkipSignal.Get(),
+                             .InRawColor = desc.InRawColor,
+                             .InColorBeforeParticles = desc.InColorBeforeParticles };
 
         std::array<ID3D12Resource*, 1> uavs { m_out.Resources.Motion.Get() };
         const std::span<const byte> cbData((const byte*) &constants, sizeof(constants));
@@ -486,7 +437,7 @@ struct FSRDPreprocessor_Dx12::Impl
             return;
 
         Composition::Input inputs = {};
-        inputs.Resources.InDenoisedSignal1 = srcTex;
+        inputs.Resources.InDenoisedRadiance = srcTex;
 
         const Composition::Constants constants = {
             .DstTexSize = { dstDim.x, dstDim.y, (1.0f / dstDim.x), (1.0f / dstDim.y) },
@@ -503,16 +454,14 @@ struct FSRDPreprocessor_Dx12::Impl
 
 // Public interface
 
-FSRDPreprocessor_Dx12::FSRDPreprocessor_Dx12(std::string_view name, ID3D12Device* pDev, bool isMode2) :
-    m_impl(std::make_unique<Impl>()), 
-    m_InstanceName(name),
-    m_IsInitialized(false)
+FSRDPreprocessor_Dx12::FSRDPreprocessor_Dx12(std::string_view name, ID3D12Device* pDev)
+    : m_impl(std::make_unique<Impl>()), m_InstanceName(name), m_IsInitialized(false)
 {
     try
     {
         m_impl->m_pDev = pDev;
         m_impl->Initialize(GetAsByteSpan(FSRDFloorSeed_cso), GetAsByteSpan(FSRDFloor_cso),
-                           GetAsByteSpan(FSRDInputConv_cso), GetAsByteSpan(FSRDOutputComp_cso), isMode2);
+                           GetAsByteSpan(FSRDInputConv_cso), GetAsByteSpan(FSRDOutputComp_cso));
         m_IsInitialized = true;
     }
     catch (const std::exception& err)
@@ -579,43 +528,21 @@ void FSRDPreprocessor_Dx12::GetSignal(ffxDispatchDescDenoiserInput1Signal& signa
                                       ffxDispatchDescDenoiser& dispatchDesc) const
 {
     auto& outResources = m_impl->m_out.Resources;
-    auto& signalData = outResources.Mode1Inputs;
 
     signalDesc = { .header = { .type = FFX_API_DISPATCH_DESC_INPUT_1_SIGNAL_TYPE_DENOISER },
-                   .radiance = { .input = ffxApiGetResourceDX12(signalData.Radiance.Get(),
+                   .radiance = { .input = ffxApiGetResourceDX12(outResources.Radiance.Get(),
                                                                 FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ),
                                  .output = ffxApiGetResourceDX12(m_impl->m_outputBuffer1.Get(),
                                                                  FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) },
-                   .fusedAlbedo =
-                       ffxApiGetResourceDX12(signalData.FusedAlbedo.Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ) };
-
-    SetDescResources(m_impl->m_out, signalDesc.header, dispatchDesc);
-}
-
-void FSRDPreprocessor_Dx12::GetSignal(ffxDispatchDescDenoiserInput2Signals& signalDesc,
-                                      ffxDispatchDescDenoiser& dispatchDesc) const
-{
-    auto& outResources = m_impl->m_out.Resources;
-    auto& signalData = outResources.Mode2Inputs;
-
-    signalDesc = {
-        .header = { .type = FFX_API_DISPATCH_DESC_INPUT_2_SIGNALS_TYPE_DENOISER },
-        .specularRadiance = { .input = ffxApiGetResourceDX12(signalData.SpecRadiance.Get(),
-                                                             FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ),
-                              .output = ffxApiGetResourceDX12(m_impl->m_outputBuffer1.Get(),
-                                                              FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) },
-        .diffuseRadiance = { .input = ffxApiGetResourceDX12(signalData.DiffRadiance.Get(),
-                                                            FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ),
-                             .output = ffxApiGetResourceDX12(m_impl->m_outputBuffer2.Get(),
-                                                             FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) },
-    };
+                   .fusedAlbedo = ffxApiGetResourceDX12(outResources.FusedAlbedo.Get(),
+                                                        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ) };
 
     SetDescResources(m_impl->m_out, signalDesc.header, dispatchDesc);
 }
 
 void FSRDPreprocessor_Dx12::SetDenoiserOutputsWritable(ID3D12GraphicsCommandList* cmdList, bool writable)
 {
-    std::array<ID3D12Resource*, 2> buffers = { m_impl->m_outputBuffer1.Get(), m_impl->m_outputBuffer2.Get() };
+    std::array<ID3D12Resource*, 1> buffers = { m_impl->m_outputBuffer1.Get() };
     AddBarriers(cmdList, buffers, writable ? kSrvState : kUavState, writable ? kUavState : kSrvState);
 }
 

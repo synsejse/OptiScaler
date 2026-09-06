@@ -266,8 +266,6 @@ class State
     std::vector<uint64_t> ffxDenoiserVersionIds {};
     feature_version ffxDenoiserUpscalerVersion {};
 
-    std::vector<int> ffxDenoiserModes {};
-    std::unordered_map<int, const char*> ffxDenoiserModeNames {};
 
     std::vector<uint64_t> ffxDenoiserDebugModes {};
     std::unordered_map<uint64_t, const char*> ffxDenoiserDebugModeNames {};
