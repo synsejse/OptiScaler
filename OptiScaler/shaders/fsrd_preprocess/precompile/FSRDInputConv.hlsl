@@ -371,6 +371,8 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     }
     else // Skip
     {
+        // This texture is reused for composed color after denoising. Never retain last frame's RGB as motion.
+        OutMotion[px] = half4(InMotionVectors[px].rg, 0.0f, 0.0f);
         OutNormals[px] = 0.0f;
         OutSpecAlbedo[px] = 0.0f;
         OutDiffAlbedo[px] = 0.0f;

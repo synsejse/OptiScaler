@@ -609,12 +609,18 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     if (_isMode2)
     {
         if (!PrepareDenoiserInput(InCommandList, *InParameters, denoiserDesc, mode2Signal))
+        {
+            _hasCameraHistory = false;
             return false;
+        }
     }
     else
     {
         if (!PrepareDenoiserInput(InCommandList, *InParameters, denoiserDesc, mode1Signal))
+        {
+            _hasCameraHistory = false;
             return false;
+        }
     }
 
     // Dispatch denoiser

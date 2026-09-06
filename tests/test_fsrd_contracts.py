@@ -86,6 +86,11 @@ class RRContracts(unittest.TestCase):
         self.assertEqual(target.attrib["BeforeTargets"], "ClCompile")
         self.assertIn("FSRDPreprocessCommon.hlsli", target.attrib["Inputs"])
 
+    def test_skipped_pixels_do_not_reuse_composed_color_as_motion(self):
+        source = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()
+        skipped = source.split("else // Skip", 1)[1]
+        self.assertIn("OutMotion[px] = half4(InMotionVectors[px].rg, 0.0f, 0.0f)", skipped)
+
 
 if __name__ == "__main__":
     unittest.main()
