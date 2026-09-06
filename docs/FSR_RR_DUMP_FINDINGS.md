@@ -2,7 +2,7 @@
 
 Captured 2026-09-06, frames 8831 and 58531, installed source `9218fa28bae1311eff1ddf4f0a25eb08ce12aa61`.
 
-**Latest finding:** the second capture reproduces strong specular-guide outlines on metal panels with zero diffuse albedo and an empty auxiliary RGBA layer. The investigation is broader than fog: see [second capture](#second-capture-reflective-metal-panels). The first-capture discussion below retains the atmospheric hypothesis as one possible contributor, not a proven sole cause.
+**Latest finding:** the [controlled identity/reset captures](#controlled-identity-and-denoiser-reset-captures) preserve the image with identity filtering, but reproduce the material outlines on the explicitly reset AMD frame. Stale temporal history alone does not explain the failure. The second capture also reproduces strong specular-guide outlines on metal panels with zero diffuse albedo and an empty auxiliary RGBA layer. The investigation is broader than fog; the first-capture discussion below retains the atmospheric hypothesis as one possible contributor, not a proven sole cause.
 
 ## Result
 
@@ -129,3 +129,59 @@ Reproduce the additional subset and translation measurements:
   '/home/synse/Games/Heroic/Games/Cyberpunk 2077/bin/x64/FSRRR-captures/dump-20260906-195626-007Z-2-324-1000000-58531' \
   build-artifacts/fsr-rr-capture-9218fa28/user-dump-58531
 ```
+
+## Controlled identity and denoiser-reset captures
+
+The user ran build `007fb9bd` and performed the normal → identity → denoiser-only reset sequence. The installed version is confirmed by the game log. Available complete directories under `bin/x64/FSRRR-captures`:
+
+| Mode | Directory | RR executed | RR reset | Bridge SR reset |
+|---|---|---|---|---|
+| Normal | `dump-20260906-204702-463Z-2-324-1000000-9590` | Yes | No | No |
+| Identity | `dump-20260906-204709-314Z-3-324-1000000-10069` | No | No | No |
+| Manual reset | `dump-20260906-204718-551Z-4-324-1000000-10687` | Yes | Yes | No |
+
+Each contains 21 textures / 337.5 MiB, with correct file sizes, finite values in every captured channel, `debug_mode=0`, `partial=false`, `evaluation_succeeded=true`, and base `reset=false`. The reset-frame manifest has `diagnostic_manual_reset=true`, and the log confirms the reset dispatch at frame 10687 before successful submission/completion. The SDK 2.2 header defines this flag as resetting history accumulation, and the bridge passes it unchanged to AMD's dispatch. This records an explicit reset request; AMD's private internal histories are not captured.
+
+Projection matrices match. Relative to normal, camera displacement is approximately 0.0051 world units and forward rotation is 0.0717° in identity / 0.0081° in reset. These are nearly stationary, separate samples, not identical images or consecutive history frames. Stochastic noise, idle sway and animated atmosphere remain. Comparisons below use each capture's own original input; they do not perform unregistered image subtraction across frames.
+
+### Identity control passes; the reset frame still has the outlines
+
+- Identity `denoised_radiance` is **exactly equal in all four channels** to `converted_radiance`, as intended. No AMD filtering ran.
+- Actual GPU identity composition preserves original input luminance within **0.09754% maximum relative error** over valid surfaces. RGB absolute maximum is 0.0625 on high-HDR samples; median is 0.00001526. Do not confuse the large absolute highlight error with the much smaller relative error, or describe finite-format arithmetic as bit-exact. The raw/composed previews retain the same smooth panel appearance and noise.
+- Normal composition has pronounced material/rib outlines. They are present again on the **explicit denoiser-reset frame**, before SR or later RCAS. Reset changes the result and brightness, but does not remove this structural artifact.
+- Motion X/Y is exactly unchanged in all three runs. Identity does not establish that every guide's semantics or all reprojection parameters are correct.
+
+The fixed panel rectangle is `x=[330,650), y=[190,420)`: 73,600 valid pixels and 73,370 horizontal pairs in each frame. The same log-RGB gradient diagnostic used above gives:
+
+| Mode | Input gradient RMS | Composed gradient RMS | Ratio | Input → composed gradient correlation with fused albedo |
+|---|---:|---:|---:|---:|
+| Normal | 0.18189 | 0.32244 | 1.77× | 0.0385 → 0.8362 |
+| Identity | 0.18312 | 0.18313 | 1.00004× | 0.0542 → 0.0542 |
+| Denoiser reset | 0.18579 | 0.30525 | 1.64× | 0.0418 → 0.7525 |
+
+A stricter common mask requires a pixel to be valid, have exactly zero diffuse RGB, exactly zero auxiliary RGBA, and all fused-albedo channels above 0.002 in **all three captures**. This leaves 2,503 pixels / 2,354 horizontal pairs in the same rectangle. Converted fused albedo exactly equals converted specular albedo throughout this common selection.
+
+| Mode, common specular-only/empty-aux subset | Input → composed gradient RMS | Ratio | Input → composed albedo correlation |
+|---|---:|---:|---:|
+| Normal | 0.07567 → 0.23126 | 3.06× | 0.0569 → 0.8206 |
+| Identity | 0.07970 → 0.07970 | 1.00007× | 0.0663 → 0.0663 |
+| Denoiser reset | 0.08387 → 0.23158 | 2.76× | 0.0384 → 0.8929 |
+
+These ratios are selected-region structural diagnostics, **not whole-frame sharpness, quality scores, or proof of incorrect denoising from a noisy reference alone**. The aligned material patterns in the previews provide the accompanying visual evidence. Empty auxiliary RGBA still does not prove that all atmosphere is absent.
+
+### What this establishes and what remains
+
+Conversion and normal GPU recomposition do not introduce the reported outlines when filtering is identity. The failure needs AMD filtering with the current signal/guide mapping and subsequent remodulation; it is not explained merely by accumulated stale history, SR sharpening, or RCAS. This is **not proof of an AMD library defect** or proof that all bridge inputs satisfy AMD's semantic contract. Reset does not remove current-frame guide, camera or signal interpretation errors.
+
+The next correctness investigation is the radiance/material-guide contract and, where necessary, the engine producers: whether the supplied combined scene color is appropriate to demodulate and filter as surface lighting, and whether its material/specular guides represent the required response. NVIDIA's [RR guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS_RR.md#41-buffers-to-tag) specifies noisy input color plus separate linear material guides and optional transparency-related inputs. AMD's downloaded SDK 2.2 sample constructs fused radiance from actual diffuse/specular surface-lighting terms, separately preserving primary emission. An identity round trip cannot validate that semantic mapping after filtering. No arbitrary fog subtraction, guessed lighting split, changed guide values or continuous-history-reset workaround is justified by these captures.
+
+Measurements and per-frame previews are local at `build-artifacts/fsr-rr-diagnostics-007fb9bd/analysis/`. Each preview pair uses the same exposure for its input and composition; the separate per-frame preview exposure multipliers differ slightly and must not be used for cross-frame brightness measurements. `comparison.json` uses original float data and records the exact masks, statistics and camera deltas. Reproduce it with:
+
+```sh
+/tmp/optiscaler-fidelity-python/bin/python \
+  build-artifacts/fsr-rr-diagnostics-007fb9bd/compare_diagnostics.py \
+  '/home/synse/Games/Heroic/Games/Cyberpunk 2077/bin/x64/FSRRR-captures' \
+  build-artifacts/fsr-rr-diagnostics-007fb9bd/analysis/comparison.json
+```
+
+No renderer, configuration, installed DLL, capture file or running game was changed for this analysis. Only derived local reports/previews and these findings were written; no build or commit was made.

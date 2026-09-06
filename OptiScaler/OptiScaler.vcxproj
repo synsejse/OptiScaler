@@ -887,6 +887,10 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   <Target Name="TestFSRDContracts" AfterTargets="Build"
           Condition="'$(GITHUB_ACTIONS)' == 'true' Or '$(RunFSRDTests)' == 'true'">
     <Exec Command="&quot;$(ProjectDir)..\tests\run_fsrd_tests.cmd&quot; &quot;$(ProjectDir)..&quot; &quot;$(IntDir)fsrd_tests&quot;" />
+    <Exec Command="&quot;$(ProjectDir)..\tools\fsrrr-replay\build.cmd&quot; &quot;$(ProjectDir)..&quot; &quot;$(IntDir)fsrrr_replay&quot;" />
+    <MakeDir Directories="$(ProjectDir)..\x64\Release\a\Diagnostics" />
+    <Copy SourceFiles="$(IntDir)fsrrr_replay\fsrrr-replay.exe;$(ProjectDir)..\tools\fsrrr-replay\README.md"
+          DestinationFolder="$(ProjectDir)..\x64\Release\a\Diagnostics" />
   </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
