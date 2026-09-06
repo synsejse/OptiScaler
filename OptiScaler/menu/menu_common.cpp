@@ -19,7 +19,7 @@
 
 #include <upscaler_time/UpscalerTime_Vk.h>
 #include <upscalers/ffx/FSRDResearchCapture.h>
-#include <upscalers/ffx/FSRDFeature_Dx12.h>
+#include <upscalers/ffx/FSRDDiagnostics.h>
 
 #include <imgui/imgui_internal.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -2884,9 +2884,8 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                         ImGui::SetTooltip("%s", dumpStatus.directory.c_str());
                 }
 
-                if (currentFeature && currentFeature->GetUpscalerType() == Upscaler::FSRD)
+                if (auto* rr = currentFeature ? currentFeature->GetFsrRRDiagnostics() : nullptr)
                 {
-                    auto* rr = static_cast<FSRDFeatureDx12*>(currentFeature);
                     const bool normalView = config->FfxDenoiserDebugMode.value_or_default() == 0;
                     bool identity = rr->IdentityDenoiserRequested();
                     ImGui::BeginDisabled(!normalView || rr->DenoiserResetPending() || dumpStatus.busy);
@@ -2914,7 +2913,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                         if (ImGui::SmallButton("Cancel reset"))
                             rr->CancelDenoiserReset();
                     }
-                    if (const auto frame = rr->LastDiagnosticResetFrame(); frame != FSRDFeatureDx12::NoDiagnosticFrame)
+                    if (const auto frame = rr->LastDiagnosticResetFrame(); frame != FSRD::Diagnostics::NoDiagnosticFrame)
                         ImGui::Text("Reset recorded at RR frame %llu", static_cast<unsigned long long>(frame));
                 }
 

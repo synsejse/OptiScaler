@@ -38,6 +38,11 @@ struct DetailedGpuTime
     bool includedInUpscalerTime = false;
 };
 
+namespace FSRD
+{
+struct Diagnostics;
+}
+
 class IFeature
 {
   private:
@@ -120,6 +125,7 @@ class IFeature
     std::string ShortName() const { return UpscalerShortName(GetUpscalerType()); }; // Without the version
     virtual std::optional<double> ReadUpscalerTime(void* commandQueue) { return std::nullopt; }
     virtual void ReadDetailedGpuTimes(void* commandQueue, std::vector<DetailedGpuTime>& detailedGpuTimes) {};
+    virtual FSRD::Diagnostics* GetFsrRRDiagnostics() { return nullptr; }
 
     virtual size_t JitterCount() { return _jitterInfo.size(); }
 

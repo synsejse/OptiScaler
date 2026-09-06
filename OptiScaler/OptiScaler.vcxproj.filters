@@ -821,6 +821,9 @@
     <ClInclude Include="upscalers\ffx\FSRDDiagnosticPolicy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDDiagnostics.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>

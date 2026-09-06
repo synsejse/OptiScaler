@@ -1,4 +1,5 @@
 #include "../OptiScaler/upscalers/ffx/FSRDDiagnosticPolicy.h"
+#include "../OptiScaler/upscalers/ffx/FSRDDiagnostics.h"
 #include <cassert>
 #include <iostream>
 
@@ -6,6 +7,20 @@ using FSRD::PlanDiagnostics;
 
 int main()
 {
+    FSRD::Diagnostics controls;
+    assert(!controls.IdentityDenoiserRequested() && !controls.DenoiserResetPending());
+    assert(controls.LastDiagnosticResetFrame() == FSRD::Diagnostics::NoDiagnosticFrame);
+    controls.SetIdentityDenoiser(true);
+    controls.RequestDenoiserReset();
+    assert(controls.IdentityDenoiserRequested() && controls.DenoiserResetPending());
+    controls.CancelDenoiserReset();
+    assert(!controls.DenoiserResetPending());
+    controls.lastResetFrame.store(123);
+    assert(controls.LastDiagnosticResetFrame() == 123);
+    FSRD::Diagnostics recreated;
+    assert(!recreated.IdentityDenoiserRequested() && !recreated.DenoiserResetPending());
+    assert(recreated.LastDiagnosticResetFrame() == FSRD::Diagnostics::NoDiagnosticFrame);
+
     // Ordinary rendering is unchanged after initialization.
     constexpr auto normal = PlanDiagnostics(true, false, false, false, true, false, false);
     static_assert(!normal.identity && normal.runDenoiser && !normal.resetDenoiser && !normal.resetUpscaler);

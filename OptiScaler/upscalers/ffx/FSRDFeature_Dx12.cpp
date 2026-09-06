@@ -641,9 +641,9 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     // Snapshot the UI request once for this evaluation. Request the dump here, on
     // the render thread after input preparation, so the reset and capture cannot
     // land on different frames. A busy capture defers the manual reset request.
-    const bool identityRequested = _identityDenoiser.load();
+    const bool identityRequested = _diagnostics.identityDenoiser.load();
     const bool manualDenoiserReset = dbgMode == DebugModes::None && !identityRequested &&
-        _resetDenoiserHistory.load() && FSRDResearch::Request(Handle()->Id);
+        _diagnostics.resetDenoiserHistory.load() && FSRDResearch::Request(Handle()->Id);
     const auto diagnosticPlan = FSRD::PlanDiagnostics(dbgMode == DebugModes::None, identityRequested,
         isDenoiseBypassed, _isInReset, denoiserHadHistory, _identityWasActive, manualDenoiserReset);
     _diagnosticUpscaleReset = diagnosticPlan.resetUpscaler;
@@ -789,8 +789,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             FSRDResearch::Record(research, "denoised_radiance", GetD3D12ResFromFFX(fusedSignal.radiance.output));
             if (isDenoiserReady && manualDenoiserReset)
             {
-                _resetDenoiserHistory.store(false);
-                _lastDiagnosticResetFrame.store(_frameCount);
+                _diagnostics.resetDenoiserHistory.store(false);
+                _diagnostics.lastResetFrame.store(_frameCount);
                 LOG_INFO("FSR-RR diagnostic denoiser-only reset recorded at frame {}", _frameCount);
             }
         }
