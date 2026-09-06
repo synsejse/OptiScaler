@@ -120,11 +120,13 @@ def prepare(capture, destination, encoding, delta_ms, adapter):
         "schema": 1, "capture": str(capture.resolve()), "encoding": encoding, "adapter": adapter,
         "source_manifest_sha256": hashlib.sha256((capture / "manifest.json").read_bytes()).hexdigest(),
         "max_render_size": [max(width, metadata["display_size"][0]), max(height, metadata["display_size"][1])],
+        "output_size": [entries["denoised_radiance"]["resource_width"], entries["denoised_radiance"]["resource_height"]],
         "dispatch": dispatch,
         "limitations": ["One fresh-context RESET dispatch, not a temporal sequence.",
                         "Frame duration is supplied, not recorded in this capture.",
                         "Provider defaults are used; live tuning values were not captured.",
                         "Sqrt mode requantizes linear albedo to RGB10; radiance is unchanged.",
+                        "Captured allocation sizes are retained; uncaptured texels outside the active rectangle are zero-filled.",
                         "Camera delta is reconstructed from captured float32 matrices."],
         "textures": [],
     }
@@ -133,6 +135,7 @@ def prepare(capture, destination, encoding, delta_ms, adapter):
         filename = name + ".bin"
         (destination / filename).write_bytes(packed)
         job["textures"].append({"name": name, "file": filename, "format": fmt,
+                                "resource_size": [entries[name]["resource_width"], entries[name]["resource_height"]],
                                 "bytes": len(packed), "sha256": hashlib.sha256(packed).hexdigest(),
                                 "native_repack_max_error": error,
                                 "sqrt_decoded_max_error": experiment_error})

@@ -111,6 +111,7 @@ static int run(int argc, wchar_t** argv)
         throw std::runtime_error("Replay requires valid dimensions and explicit RESET");
     // Validate paths and file sizes before loading a provider or creating GPU resources.
     std::map<std::string, std::vector<char>> bytes;
+    std::map<std::string, std::pair<uint32_t, uint32_t>> resourceSizes;
     const std::map<std::string, uint32_t> expected {
         { "converted_radiance", 10 }, { "converted_motion", 10 }, { "converted_depth", 41 },
         { "converted_normals", 24 }, { "converted_diffuse_albedo", 24 },
@@ -124,6 +125,11 @@ static int run(int argc, wchar_t** argv)
         if (!expected.contains(name) || expected.at(name) != fmt || bytes.contains(name) ||
             filename.has_parent_path() || filename.is_absolute() || filename.empty())
             throw std::runtime_error("Invalid or duplicate texture entry");
+        const auto sizeJson = entry.value("resource_size", json::array({ w, h }));
+        uint32_t resourceW = sizeJson.at(0), resourceH = sizeJson.at(1);
+        if (resourceW < w || resourceH < h || resourceW > 8192 || resourceH > 8192)
+            throw std::runtime_error("Invalid texture allocation dimensions");
+        resourceSizes[name] = { resourceW, resourceH };
         size_t size = size_t(w) * h * (fmt == 10 ? 8 : 4);
         const auto path = jobPath.parent_path() / filename;
         if (fs::file_size(path) != size || entry.at("bytes").get<size_t>() != size)
@@ -238,7 +244,8 @@ static int run(int argc, wchar_t** argv)
     for (const auto& [name, fmt] : expected)
     {
         auto& tex = inputs[name];
-        tex = texture(device.Get(), w, h, DXGI_FORMAT(fmt), D3D12_RESOURCE_STATE_COPY_DEST);
+        const auto [resourceW, resourceH] = resourceSizes.at(name);
+        tex = texture(device.Get(), resourceW, resourceH, DXGI_FORMAT(fmt), D3D12_RESOURCE_STATE_COPY_DEST);
         auto desc = tex->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
         UINT rows = 0;
@@ -248,9 +255,11 @@ static int run(int argc, wchar_t** argv)
         void* mapped = nullptr;
         D3D12_RANGE noRead { 0, 0 };
         check(upload->Map(0, &noRead, &mapped), "Map upload");
-        for (UINT y = 0; y < rows; ++y)
+        memset(mapped, 0, size_t(total));
+        const size_t activeRowSize = size_t(w) * (fmt == 10 ? 8 : 4);
+        for (UINT y = 0; y < h; ++y)
             memcpy(static_cast<char*>(mapped) + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
-                   bytes.at(name).data() + size_t(y) * rowSize, size_t(rowSize));
+                   bytes.at(name).data() + size_t(y) * activeRowSize, activeRowSize);
         upload->Unmap(0, nullptr);
         D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
         src.pResource = upload.Get();
@@ -262,7 +271,11 @@ static int run(int argc, wchar_t** argv)
         barrier(list.Get(), tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, readState);
         uploads.push_back(upload);
     }
-    auto output = texture(device.Get(), w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const auto outputSize = job.value("output_size", json::array({ w, h }));
+    uint32_t outputW = outputSize.at(0), outputH = outputSize.at(1);
+    if (outputW < w || outputH < h || outputW > 8192 || outputH > 8192)
+        throw std::runtime_error("Invalid output allocation dimensions");
+    auto output = texture(device.Get(), outputW, outputH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto resource = [&](const char* name) { return ffxApiGetResourceDX12(inputs.at(name).Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ); };
     ffxDispatchDescDenoiserInput1Signal signal {};
     signal.header.type = FFX_API_DISPATCH_DESC_INPUT_1_SIGNAL_TYPE_DENOISER;

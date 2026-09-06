@@ -2,7 +2,7 @@
 
 Diagnostic tool, not a game mod. Runs one fresh-context RESET dispatch through a
 locally supplied AMD RR 1.1 provider, on an explicitly named adapter. It neither
-starts the game nor installs DLLs. Raw captures/vendor DLLs are never uploaded to CI.
+starts the game nor installs DLLs. Captured game data is never uploaded to CI.
 
 Build with the existing **Build (No Signing)** GitHub workflow. Its contract-test
 target also builds this executable into the artifact's `Diagnostics` directory.
@@ -24,13 +24,21 @@ fsrrr-replay.exe NEW-linear-job/job.json ABSOLUTE-PATH/amd_fidelityfx_denoiser_d
 fsrrr-replay.exe NEW-sqrt-job/job.json ABSOLUTE-PATH/amd_fidelityfx_denoiser_dx12.dll NEW-sqrt-result
 ```
 
+Compare both results locally (also requires Pillow):
+
+```sh
+python tools/fsrrr-replay/compare.py CAPTURE NEW-comparison NEW-linear-result NEW-sqrt-result
+```
+
 Do not replace any game or prefix files for this test. Required DXVK/VKD3D DLLs
 may be copied alongside the replay executable when using Wine. Results are tightly
 packed little-endian RGBA FP16, plus JSON recording the provider/default settings,
 camera/dispatch data, source manifest and input hashes. Output paths must be new.
 
 The baseline restores native texture formats from shader-visible values and
-checks repacking error. Sqrt mode sqrt-encodes **all three albedos**, requantizes
+checks repacking error. Original allocation sizes are retained separately from the
+active render rectangle; uncaptured texels outside it are zero-filled, not reconstructed.
+Sqrt mode sqrt-encodes **all three albedos**, requantizes
 to RGB10, and clears NON_GAMMA_ALBEDO, matching the SDK 2.2 sample's representation.
 Radiance/depth/motion/normals do not change. The resulting small albedo quantization
 difference is recorded; this is not an exactly equivalent mathematical input.
