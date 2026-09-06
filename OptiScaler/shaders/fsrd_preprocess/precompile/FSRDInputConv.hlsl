@@ -210,6 +210,11 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         specReflectance.rgb = max(specReflectance.rgb, 1e-3f);
         diffAlbedo.rgb = max(diffAlbedo.rgb, 1e-3f);
 
+        // Demodulate with the exact albedo that will be stored. The old 8-bit output could round
+        // small nonzero albedos to zero and lose their lighting during composition.
+        specReflectance.rgb = round(saturate(specReflectance.rgb) * 1023.0f) / 1023.0f;
+        diffAlbedo.rgb = round(saturate(diffAlbedo.rgb) * 1023.0f) / 1023.0f;
+
         // Both AMD modes consume specular ray length in radiance alpha. Null input reads zero.
         const float rawHitDist = InSpecHitDist[px];
         const half hitDist = isfinite(rawHitDist) ? GetSafeFP16(max(rawHitDist, 0.0f)) : 0.0f;

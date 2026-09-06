@@ -37,7 +37,7 @@ namespace FSRDFormats
 {
     // ffxDispatchDescDenoiserInput1Signal
     constexpr DXGI_FORMAT Radiance = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    constexpr DXGI_FORMAT FusedAlbedo = DXGI_FORMAT_R8G8B8A8_UNORM;
+    constexpr DXGI_FORMAT FusedAlbedo = DXGI_FORMAT_R10G10B10A2_UNORM;
 
     // ffxDispatchDescDenoiserInput2Signals
     constexpr DXGI_FORMAT SpecRadiance = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -46,8 +46,9 @@ namespace FSRDFormats
     // ffxDispatchDescDenoiser
     constexpr DXGI_FORMAT Motion = DXGI_FORMAT_R16G16B16A16_FLOAT;
     constexpr DXGI_FORMAT Normals = DXGI_FORMAT_R10G10B10A2_UNORM;
-    constexpr DXGI_FORMAT SpecAlbedo = DXGI_FORMAT_R8G8B8A8_UNORM;
-    constexpr DXGI_FORMAT DiffAlbedo = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Match AMD's sample: higher precision at the same four bytes/pixel. Alpha is unused in RR 1.1.
+    constexpr DXGI_FORMAT SpecAlbedo = DXGI_FORMAT_R10G10B10A2_UNORM;
+    constexpr DXGI_FORMAT DiffAlbedo = DXGI_FORMAT_R10G10B10A2_UNORM;
     constexpr DXGI_FORMAT LinearDepth = DXGI_FORMAT_R32_FLOAT;
 
     constexpr DXGI_FORMAT SkipSignal = DXGI_FORMAT_R16G16B16A16_FLOAT;

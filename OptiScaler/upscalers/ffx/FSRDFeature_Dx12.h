@@ -23,6 +23,9 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
 
     bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
 
+    // The generic backend-recreation path only copies SR parameters. Preserve the RR input layout too.
+    void CopyRRCreateParameters(NVSDK_NGX_Parameter* parameters) const;
+
   private:
     struct DenoiserSettings
     {

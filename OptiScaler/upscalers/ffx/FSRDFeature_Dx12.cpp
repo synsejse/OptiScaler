@@ -331,6 +331,15 @@ bool FSRDFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
     return false;
 }
 
+void FSRDFeatureDx12::CopyRRCreateParameters(NVSDK_NGX_Parameter* parameters) const
+{
+    parameters->Set(NVSDK_NGX_Parameter_Use_HW_Depth,
+                    static_cast<int>(_isHWDepth ? NVSDK_NGX_DLSS_Depth_Type_HW : NVSDK_NGX_DLSS_Depth_Type_Linear));
+    parameters->Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode,
+                    static_cast<int>(_isRoughnessPacked ? NVSDK_NGX_DLSS_Roughness_Mode_Packed
+                                                       : NVSDK_NGX_DLSS_Roughness_Mode_Unpacked));
+}
+
 bool FSRDFeatureDx12::CreateDenoiserContext()
 {
     ScopedSkipSpoofingGlobal skipSpoofingGlobal {};

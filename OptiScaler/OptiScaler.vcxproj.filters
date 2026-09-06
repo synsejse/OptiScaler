@@ -815,16 +815,7 @@
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderUtils.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDFloor_Shader.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDFloorSeed_Shader.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDInputConv_Shader.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDOutputComp_Shader.h">
+    <ClInclude Include="upscalers\ffx\FSRDInputMath.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h">

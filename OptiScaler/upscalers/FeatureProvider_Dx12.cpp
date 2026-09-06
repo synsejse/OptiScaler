@@ -155,6 +155,9 @@ bool FeatureProvider_Dx12::ChangeFeature(Upscaler upscaler, ID3D12Device* device
             contextData->createParams->Set(NVSDK_NGX_Parameter_OutHeight, dc->DisplayHeight());
             contextData->createParams->Set(NVSDK_NGX_Parameter_PerfQualityValue, dc->PerfQualityValue());
 
+            if (dc->GetUpscalerType() == Upscaler::FSRD)
+                static_cast<FSRDFeatureDx12*>(dc)->CopyRRCreateParameters(contextData->createParams);
+
             dc = nullptr;
 
             State::Instance().currentFeature = nullptr;

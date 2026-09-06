@@ -55,6 +55,26 @@ class RRContracts(unittest.TestCase):
         self.assertIn("2.0f * (jitterX / (float) RenderWidth())", source)
         self.assertIn("-2.0f * (jitterY / (float) RenderHeight())", source)
 
+    def test_recreated_feature_preserves_rr_layout(self):
+        provider = (ROOT / "OptiScaler/upscalers/FeatureProvider_Dx12.cpp").read_text()
+        self.assertIn("CopyRRCreateParameters(contextData->createParams)", provider)
+        source = (ROOT / "OptiScaler/upscalers/ffx/FSRDFeature_Dx12.cpp").read_text()
+        copy = source.split("void FSRDFeatureDx12::CopyRRCreateParameters", 1)[1].split("\n}", 1)[0]
+        self.assertIn("NVSDK_NGX_Parameter_Use_HW_Depth", copy)
+        self.assertIn("NVSDK_NGX_Parameter_DLSS_Roughness_Mode", copy)
+        self.assertNotIn("static bool s_is", source)
+
+    def test_albedo_storage_matches_demodulation(self):
+        source = (SHADERS / "FSRDPreprocessor_Dx12.cpp").read_text()
+        for name in ("FusedAlbedo", "SpecAlbedo", "DiffAlbedo"):
+            self.assertIn(f"{name} = DXGI_FORMAT_R10G10B10A2_UNORM", source)
+        shader = (SHADERS / "precompile/FSRDInputConv.hlsl").read_text()
+        for name in ("specReflectance", "diffAlbedo"):
+            quantize = f"round(saturate({name}.rgb) * 1023.0f) / 1023.0f"
+            self.assertIn(quantize, shader)
+            self.assertLess(shader.index(quantize), shader.index("half3 demodSpecular"))
+        self.assertGreater(round(1e-3 * 1023) / 1023, 0)
+
     def test_msbuild_generates_all_four_kernels(self):
         tree = ET.parse(ROOT / "OptiScaler/OptiScaler.vcxproj")
         ns = {"m": "http://schemas.microsoft.com/developer/msbuild/2003"}
