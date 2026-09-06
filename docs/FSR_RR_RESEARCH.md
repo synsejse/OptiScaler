@@ -1,5 +1,7 @@
 # FSR RR fidelity research
 
+The [2026-09-06 Cyberpunk results](FSR_RR_RESEARCH_RESULTS.md) include actual texture measurements, the heuristic-bypass run and a benchmark-reload GPU fault. Do not treat the diagnostic build as stability-qualified.
+
 This branch adds opt-in diagnostic capture, not a new quality preset. Normal rendering is unchanged when `[FSR-RR] ResearchCapture=false` (the default).
 
 With the setting enabled, place `FSRRR-capture.request` beside the executable containing a short alphanumeric/underscore/hyphen label. The next two evaluations of the selected RR feature capture the inputs and converted resources. Results appear under `FSRRR-captures/<label>-<pid>-<feature>-<frame>/`. The trigger is consumed. Limits: twelve frames per process, two pending batches, 48 textures and 512 MiB readback per frame. Full active render rectangles are captured from origin zero; smaller optional textures retain their own dimensions.

@@ -1,12 +1,14 @@
 """Numerical checks for the offline researcher; skipped in standard CI without NumPy."""
 import unittest
+from pathlib import Path
 
 try:
     import numpy as np
 except ImportError:
     raise unittest.SkipTest("Offline texture analysis requires NumPy")
 
-from analyze_fsrd_textures import decode_octahedral, geometric_positions, stats
+from analyze_fsrd_textures import (capture_identity, decode_octahedral, fraction, geometric_positions,
+                                   hardware_depth_to_view_z, stats)
 
 
 class TextureAnalysis(unittest.TestCase):
@@ -33,6 +35,25 @@ class TextureAnalysis(unittest.TestCase):
         self.assertEqual(result["count"], 4)
         self.assertEqual(result["nonfinite"], 2)
         self.assertEqual(result["mean"], 1.5)
+
+    def test_empty_fraction_is_not_reported_as_zero(self):
+        self.assertIsNone(fraction([]))
+        self.assertEqual(fraction([False, True]), .5)
+
+    def test_pair_identity_includes_pid_and_complete_label(self):
+        self.assertEqual(capture_identity(Path("current-with-hyphens-324-1000000-10")),
+                         ("current-with-hyphens", "324", "1000000"))
+        self.assertNotEqual(capture_identity(Path("current-324-1000000-10")),
+                            capture_identity(Path("current-325-1000000-11")))
+
+    def test_reversed_hardware_depth_conversion(self):
+        # Infinite reversed perspective: device depth = near / positive view Z.
+        inv = np.eye(4)
+        inv[2:, 2:] = [[0, 50], [1, 0]]
+        np.testing.assert_allclose(hardware_depth_to_view_z(np.array([.02, .002]), inv), [1, 10])
+        inv[0, 2] = .1
+        with self.assertRaises(ValueError):
+            hardware_depth_to_view_z(.02, inv)
 
 
 if __name__ == "__main__":

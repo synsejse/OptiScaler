@@ -21,6 +21,28 @@ def normalize(v):
     return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-20)
 
 
+def fraction(values):
+    """An empty selection is unmeasured, not zero percent."""
+    values = np.asarray(values)
+    return float(values.mean()) if values.size else None
+
+
+def capture_identity(directory):
+    """Keep labels containing hyphens intact and do not pair different process/feature IDs."""
+    fields = directory.name.rsplit("-", 3)
+    if len(fields) != 4:
+        raise ValueError(f"Invalid capture directory: {directory}")
+    return tuple(fields[:3])
+
+
+def hardware_depth_to_view_z(depth, inverse_projection):
+    """Only the simple perspective projection observed in these Cyberpunk captures."""
+    inv = np.asarray(inverse_projection)
+    if not np.allclose(inv[:2, 2:], 0):
+        raise ValueError("Depth reconstruction needs projected XY for this projection")
+    return (depth * inv[2, 2] + inv[3, 2]) / (depth * inv[2, 3] + inv[3, 3])
+
+
 def decode_octahedral(uv):
     xy = uv.astype(np.float64) * 2 - 1
     z = 1 - np.abs(xy).sum(axis=-1)
@@ -60,6 +82,8 @@ def load_capture(directory):
 
 def analyze(directory):
     meta, tex = load_capture(directory)
+    if not meta["hw_depth"] or meta["conversion_flags"] != 5:
+        raise ValueError(f"{directory}: analyzer currently supports the captured Cyberpunk hardware-depth, linear-albedo, packed-roughness convention only")
     raw = tex["input_color"][..., :3].astype(np.float64)
     diff = tex["input_diffuse_albedo"][..., :3].astype(np.float64)
     spec = tex["input_specular_albedo"][..., :3].astype(np.float64)
@@ -74,9 +98,13 @@ def analyze(directory):
         converted = tex[f"converted_{name}_albedo"][..., :3]
         difference = np.abs(converted - original)
         result[f"{name}_albedo_abs_error"] = stats(difference[valid])
-        result[f"{name}_albedo_pixels_changed_over_1pct"] = float(np.any(difference[valid] > .01, axis=-1).mean())
-        result[f"{name}_albedo_outside_0_1_fraction"] = float(np.any((original[valid] < 0) | (original[valid] > 1), axis=-1).mean())
-    result["albedo_sum_over_1_fraction"] = float(np.any((diff + spec)[valid] > 1, axis=-1).mean())
+        result[f"{name}_albedo_pixels_changed_over_1pct"] = fraction(np.any(difference[valid] > .01, axis=-1))
+        result[f"{name}_albedo_outside_0_1_fraction"] = fraction(np.any((original[valid] < 0) | (original[valid] > 1), axis=-1))
+    result["albedo_sum_over_1_fraction"] = fraction(np.any((diff + spec)[valid] > 1, axis=-1))
+    spec_changed = valid & np.any(np.abs(spec - tex["converted_specular_albedo"][..., :3]) > .01, axis=-1)
+    result["specular_changed_pixels_both_albedos_white_fraction"] = fraction(
+        (np.all(diff == 1, axis=-1) & np.all(spec == 1, axis=-1))[spec_changed])
+    result["specular_changed_pixels_depth"] = stats(depth[spec_changed])
     normals = tex["input_normal_roughness"][..., :3].astype(np.float64)
     result["normal_input_length"] = stats(np.linalg.norm(normals[valid], axis=-1))
     decoded = decode_octahedral(tex["converted_normals"][..., :2])
@@ -92,9 +120,19 @@ def analyze(directory):
     finite_hit = valid & np.isfinite(hit) & (hit >= 0)
     result["hit_distance_abs_error"] = stats(np.abs(hit - converted_hit)[finite_hit])
     result["hit_distance_relative_error"] = stats((np.abs(hit - converted_hit) / np.maximum(hit, 1e-5))[finite_hit])
-    result["hit_distance_above_fp16_fraction"] = float((hit[finite_hit] > 65504).mean())
+    result["hit_distance_above_fp16_fraction"] = fraction(hit[finite_hit] > 65504)
+    result["hit_distance_above_shader_clamp_fraction"] = fraction(hit[finite_hit] > 65500)
 
     lum = raw @ np.array((.2126, .7152, .0722))
+    result["input_negative_color_channel_fraction"] = fraction(raw < 0)
+    result["input_above_shader_color_clamp_fraction"] = fraction(raw > 65500)
+    if "input_bias" in tex:
+        result["bias_nonzero_pixel_fraction"] = fraction(tex["input_bias"][..., 0] != 0)
+    if "input_before_particles" in tex:
+        before = tex["input_before_particles"][..., :3].astype(np.float64)
+        result["before_particles_abs_difference"] = stats(np.abs(raw - before))
+        result["before_particles_different_pixel_fraction"] = fraction(np.any(raw != before, axis=-1))
+        result["before_particles_negative_rgb_residual_fraction"] = fraction(raw - before < 0)
     skip = tex["preserved_lighting"][..., :3].astype(np.float64)
     skip_lum = skip @ np.array((.2126, .7152, .0722))
     lit = valid & (lum > 1e-4)
@@ -110,7 +148,7 @@ def analyze(directory):
     result["composition_abs_change_from_pure_denoised"] = stats(np.abs(composed - denoised)[valid])
     change = np.abs((composed - denoised) @ np.array((.2126, .7152, .0722))) / np.maximum(lum, 1e-10)
     result["composition_relative_luma_change"] = stats(change[lit])
-    result["composition_pixels_over_10pct_luma_change"] = float((change[lit] > .1).mean())
+    result["composition_pixels_over_10pct_luma_change"] = fraction(change[lit] > .1)
 
     view, world, previous = geometric_positions(tex["input_depth"][..., 0], meta)
     expected_z = np.abs(previous[..., 2]) - np.abs(view[..., 2])
@@ -118,6 +156,18 @@ def analyze(directory):
     result["camera_depth_delta_abs_error"] = stats(np.abs(expected_z - tex["converted_motion"][..., 2])[valid])
     for channel in (2, 3):
         result[f"motion_{channel}_versus_camera_depth_delta_error"] = stats(np.abs(motion[..., channel] - expected_z)[valid])
+    result["motion_w_binary_fraction"] = fraction((motion[..., 3] == 0) | (motion[..., 3] == 1))
+    # Empirical Cyberpunk hypothesis only: the extra Z channel resembles 1000 times a
+    # hardware-depth delta. W is binary but its meaning is not established. Report both
+    # groups; never treat a fitted/observed encoding as an authenticated engine contract.
+    clip_previous = previous @ np.linalg.inv(meta["inv_projection"])
+    hw_previous = clip_previous[..., 2] / clip_previous[..., 3]
+    predicted_z = 1000 * (hw_previous - tex["input_depth"][..., 0])
+    nearby = valid & (depth > .1) & (depth < 100)
+    for w_value in (0, 1):
+        mask = nearby & (motion[..., 3] == w_value)
+        result[f"motion_z_1000x_hardware_camera_delta_abs_error_w{w_value}"] = stats(
+            np.abs(motion[..., 2] - predicted_z)[mask])
 
     # Compare two normal-space hypotheses on locally smooth depth surfaces. Shading normals can differ
     # from geometric normals, so this is evidence, not proof of space or exact surface correspondence.
@@ -141,9 +191,52 @@ def main():
     parser.add_argument("capture_root", type=Path)
     args = parser.parse_args()
     reports = []
-    for manifest in sorted(args.capture_root.glob("*/manifest.json")):
+    manifests = sorted(args.capture_root.glob("*/manifest.json"))
+    for manifest in manifests:
         reports.append(analyze(manifest.parent))
-    print(json.dumps({"captures": reports}, indent=2, allow_nan=False))
+    pairs = []
+    loaded = [(path.parent, *load_capture(path.parent)) for path in manifests]
+    for directory, current, textures in loaded:
+        for previous_directory, previous, previous_textures in loaded:
+            if (current["feature"] != previous["feature"] or current["frame"] != previous["frame"] + 1
+                    or current["render_size"] != previous["render_size"] or current["reset"]
+                    or capture_identity(directory) != capture_identity(previous_directory)):
+                continue
+            motion = textures["input_motion"].astype(np.float64)
+            h, w, _ = motion.shape
+            y, x = np.mgrid[:h, :w]
+            scale = current["amd_motion_scale"]
+            px = np.rint(x + motion[..., 0] * scale[0] * w).astype(np.int64)
+            py = np.rint(y + motion[..., 1] * scale[1] * h).astype(np.int64)
+            inside = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+            px = np.clip(px, 0, w - 1)
+            py = np.clip(py, 0, h - 1)
+            current_depth = textures["converted_depth"][..., 0]
+            old_depth = previous_textures["converted_depth"][py, px, 0]
+            reconstructed_delta = old_depth.astype(np.float64) - current_depth
+            camera_delta = textures["converted_motion"][..., 2].astype(np.float64)
+            surface = inside & (current_depth > .1) & (current_depth < 100) & (old_depth > .1) & (old_depth < 100)
+            # Restrict comparison to modest depth changes; this still cannot establish correspondence
+            # at object boundaries/disocclusions and is explicitly not a proposed production depth delta.
+            surface &= np.abs(reconstructed_delta) < .1 * np.maximum(current_depth, 1)
+            pair = {
+                "previous": str(previous_directory), "current": str(directory),
+                "screen_motion_reprojected_depth_delta_minus_camera": stats((reconstructed_delta - camera_delta)[surface]),
+                "channel_z_minus_reprojected_depth_delta": stats((motion[..., 2] - reconstructed_delta)[surface]),
+                "channel_w_minus_reprojected_depth_delta": stats((motion[..., 3] - reconstructed_delta)[surface]),
+                "limitations": "Nearest-depth reprojection, no independent object correspondence or jitter correction, disocclusions remain; capture stalls affect frame spacing. Not ground truth."
+            }
+            if np.allclose(current["inv_projection"], previous["inv_projection"]):
+                hypothesized_hw_previous = textures["input_depth"][..., 0] + motion[..., 2] / 1000
+                hypothesized_linear_previous = hardware_depth_to_view_z(hypothesized_hw_previous, current["inv_projection"])
+                for group in (0, 1):
+                    mask = surface & (motion[..., 3] == group)
+                    pair[f"camera_previous_depth_error_w{group}"] = stats(
+                        np.abs(current_depth + camera_delta - old_depth)[mask])
+                    pair[f"hypothesized_z_previous_depth_error_w{group}"] = stats(
+                        np.abs(hypothesized_linear_previous - old_depth)[mask])
+            pairs.append(pair)
+    print(json.dumps({"captures": reports, "consecutive_pairs": pairs}, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":
