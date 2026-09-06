@@ -147,7 +147,8 @@ typedef struct ffxDispatchDescDenoiserInput1Signal          ///< Requires FFX_DE
 {
     ffxDispatchDescHeader       header;
     struct FfxApiDenoiserSignal radiance;                   ///< Composited radiance signal in/out. Input alpha channel should contain specular ray length.
-    struct FfxApiResource       fusedAlbedo;                ///< RGB: max(specularAlbedo, diffuseAlbedo) A: NoV - sqrt encoding assumed unless <c>FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO</c> is provided. (sqrt(fused_albedo, NoV))
+    struct FfxApiResource fusedAlbedo; ///< RGB: max(specularAlbedo, diffuseAlbedo); alpha unused in RR 1.1. Sqrt
+                                       ///< encoding unless FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO is provided.
 } ffxDispatchDescDenoiserInput1Signal;
 
 #define FFX_API_DISPATCH_DESC_INPUT_DOMINANT_LIGHT_TYPE_DENOISER FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, 0x07)

@@ -235,7 +235,7 @@ namespace FSRD
             float CorrelationBias; // Controls the contribution of stable elements to the final image
             uint32_t Flags;
 
-            float _Padding[2];
+            XMFLOAT2 SrcTexSize; // Active source extent for debug blits
         };  
 
         /**
@@ -264,4 +264,4 @@ namespace FSRD
             ID3D12Resource* AsArray[kCount];
         };
     }
-}
+    } // namespace FSRD

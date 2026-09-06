@@ -5,7 +5,7 @@
 #include <DirectXMath.h>
 
 /**
- * @brief Unfied denoiser-upscaler utilising AMD FSR Ray Regeneration and Super Resolution with
+ * @brief Unified denoiser-upscaler utilising AMD FSR Ray Regeneration and Super Resolution with
  * DLSS-RR inputs. Extends the FFX (FSR 3.1/4) upscaler implementation.
  */
 class FSRDFeatureDx12 : public FFXFeatureDx12
@@ -41,8 +41,11 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     bool _isInReset;
     uint32_t _captureSamples = 0;
 
-    static bool s_isHWDepth;
-    static bool s_isRoughnessPacked;
+    bool _isHWDepth = false;
+    bool _isRoughnessPacked = false;
+    bool _hasCameraHistory = false;
+    uint32_t _lastRenderWidth = 0;
+    uint32_t _lastRenderHeight = 0;
 
     FSRDConvDesc _convDesc;
     DirectX::XMFLOAT3 _lastCamPos; // Last world space camera position
@@ -72,7 +75,7 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
 
     void DestroyDenoiserContext();
 
-    void UpdateSize();
+    bool UpdateSize(const NVSDK_NGX_Parameter* parameters);
 
     void CaptureInputs(const NVSDK_NGX_Parameter& inParams, const ffxDispatchDescDenoiser& dispatchDesc);
 

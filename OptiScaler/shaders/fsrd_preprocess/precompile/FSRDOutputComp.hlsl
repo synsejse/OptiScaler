@@ -71,7 +71,7 @@ cbuffer CB_Comp : register(b0)
     float CorrelationBias;
     uint Flags;
     
-    float2 _Padding;
+    float2 SrcTexSize; // Active source subrect for debug blits; allocation may be larger.
 }
 
 bool IsSet(uint mask) { return (Flags & mask) == mask; }
@@ -213,18 +213,19 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     const uint2 px = groupID.xy * s_ThreadGroupSize + gtID.xy;
     const float2 uv = (float2(px) + 0.5f) * DstTexSize.zw;
     
-    if (px.x >= DstTexSize.x || px.y >= DstTexSize.y)
-    {
-        OutColor[px] = 0.0f;
-        return;
-    }
-    
     [branch]
     if (IsSet(FLAGS_RAW_SOURCE_BLIT))
     {
+        if (px.x >= DstTexSize.x || px.y >= DstTexSize.y)
+            return;
         [branch]
         if (IsSet(FLAGS_SCALE_SRC))
-            OutColor[px] = InDenoisedSignal1.SampleLevel(LinearSampler, uv, 0);
+        {
+            uint width, height;
+            InDenoisedSignal1.GetDimensions(width, height);
+            const float2 srcPixel = clamp(uv * SrcTexSize, 0.5f, SrcTexSize - 0.5f);
+            OutColor[px] = InDenoisedSignal1.SampleLevel(LinearSampler, srcPixel / float2(width, height), 0);
+        }
         else
             OutColor[px] = InDenoisedSignal1[px];
     }
@@ -232,6 +233,10 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     {
         const int2 smID = gtID.xy + s_SM_HaloOffset;      
         PopulateSharedMemory(groupID.xy, gtID.xy);
+
+        // Every lane must reach the group barrier, including partial edge groups.
+        if (px.x >= DstTexSize.x || px.y >= DstTexSize.y)
+            return;
 
         // Correlate raw RT input with denoiser output
         float lowConfWeight = GetRawColorSimilarity(gtID.xy) * CorrelationBias;

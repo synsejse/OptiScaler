@@ -21,43 +21,42 @@ struct ffxDispatchDescDenoiser;
 class FSRDPreprocessor_Dx12
 {
   public:
-
     enum class ConvFlags : uint32_t
     {
         None = 0,
 
-        NonGammaAlbedo =        1 << 0, // If set, FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO should ALSO be set
-        IsDepthLinear =         1 << 1, // Interprets input depth as already linearized for view space calculations
-        IsRoughnessPacked =     1 << 2, // Roughness = InNormals.A - NVSDK_NGX_DLSS_Roughness_Mode_Packed (Init param)
-        Mode2Signal =           1 << 3, // Enables mode 2 denoiser outputs with discrete diffuse and specular lighting
-        IsRightHanded =         1 << 4, // If set, then +Z is treated as the direction pointing away from the camera
+        NonGammaAlbedo = 1 << 0,    // If set, FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO should ALSO be set
+        IsDepthLinear = 1 << 1,     // Interprets input depth as already linearized for view space calculations
+        IsRoughnessPacked = 1 << 2, // Roughness = InNormals.A - NVSDK_NGX_DLSS_Roughness_Mode_Packed (Init param)
+        Mode2Signal = 1 << 3,       // Enables mode 2 denoiser outputs with discrete diffuse and specular lighting
+        IsRightHanded = 1 << 4,     // Visible view-space positions have negative Z
 
-        Debug =                 1 << 16, // Denoiser and upscaler bypassed for debug out if this is set
-        DebugModeMask =         0xFF << 16,
+        Debug = 1 << 16, // Denoiser and upscaler bypassed for debug out if this is set
+        DebugModeMask = 0xFF << 16,
 
-        DebugOutRadiance =      Debug, // Default debug vis
+        DebugOutRadiance = Debug, // Default debug vis
 
-        DebugInSpecHitDist =    1 << 17 | Debug,
-        DebugInDepth =          2 << 17 | Debug,
-        DebugInMotion =         3 << 17 | Debug,
-        DebugInNormals =        4 << 17 | Debug,
-        DebugInRoughness =      5 << 17 | Debug,
-        DebugInDiffAlbedo =     6 << 17 | Debug,
-        DebugInSpecAlbedo =     7 << 17 | Debug,
+        DebugInSpecHitDist = 1 << 17 | Debug,
+        DebugInDepth = 2 << 17 | Debug,
+        DebugInMotion = 3 << 17 | Debug,
+        DebugInNormals = 4 << 17 | Debug,
+        DebugInRoughness = 5 << 17 | Debug,
+        DebugInDiffAlbedo = 6 << 17 | Debug,
+        DebugInSpecAlbedo = 7 << 17 | Debug,
 
-        DebugOutFusedAlbedo =   8 << 17 | Debug,
-        DebugOutLinearDepth =   9 << 17 | Debug,
-        DebugOutMotion =        10 << 17 | Debug,
-        DebugOutNormals =       11 << 17 | Debug,
-        DebugOutSpecAlbedo =    12 << 17 | Debug,
-        DebugOutDiffAlbedo =    13 << 17 | Debug,
+        DebugOutFusedAlbedo = 8 << 17 | Debug,
+        DebugOutLinearDepth = 9 << 17 | Debug,
+        DebugOutMotion = 10 << 17 | Debug,
+        DebugOutNormals = 11 << 17 | Debug,
+        DebugOutSpecAlbedo = 12 << 17 | Debug,
+        DebugOutDiffAlbedo = 13 << 17 | Debug,
 
-        DebugOutDepthDelta =    14 << 17 | Debug,
-        DebugOutNormDotView =   15 << 17 | Debug,
-        DebugAlbedoError =      16 << 17 | Debug,
+        DebugOutDepthDelta = 14 << 17 | Debug,
+        DebugOutNormDotView = 15 << 17 | Debug,
+        DebugAlbedoError = 16 << 17 | Debug,
 
-        DebugFloorVariance =    17 << 17 | Debug,
-        DebugFloorColor =       18 << 17 | Debug,
+        DebugFloorVariance = 17 << 17 | Debug,
+        DebugFloorColor = 18 << 17 | Debug,
     };
 
     enum class CompFlags : uint32_t
@@ -167,6 +166,9 @@ class FSRDPreprocessor_Dx12
      * @return True if dispatch completed successfully
      */
     bool DispatchConversion(ID3D12GraphicsCommandList* cmdList, const ConversionDesc& desc);
+
+    // Pair around the actual denoiser dispatch, including failed dispatches. Bypasses leave buffers readable.
+    void SetDenoiserOutputsWritable(ID3D12GraphicsCommandList* cmdList, bool writable);
 
     /**
      * @brief Configures input/output resources after input conversion for FSR-RR with Mode-1 fused inputs.

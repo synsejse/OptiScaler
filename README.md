@@ -4,6 +4,8 @@
 > [!WARNING]
 > **FSR-RR 1.1 is the compatibility ceiling for this Cyberpunk integration.** RR 1.2 removes the fused one- and two-signal inputs used here and instead requires separate direct/indirect diffuse and specular radiance signals. Cyberpunk's DLSS Ray Reconstruction integration does not expose those split inputs, so an exact RR 1.2 port is impossible unless the game itself provides additional rendering buffers; reconstructing them inside OptiScaler changes exposure and temporal behavior and is not equivalent.
 
+[FSR-RR modes, input contracts, limitations and build checks](docs/FSR_RR.md)
+
 <div align="center">
 
   ![Logo](https://github.com/user-attachments/assets/c7dad5da-0b29-4710-8a57-b58e4e407abd)
@@ -196,4 +198,3 @@ This project uses [FreeType](https://gitlab.freedesktop.org/freetype/freetype) l
   </tr>
  </tbody>
 </table>
-

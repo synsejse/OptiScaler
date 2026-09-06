@@ -60,7 +60,6 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     
     if (px.x >= DstTexSize.x || px.y >= DstTexSize.y)
     {
-        OutColor[px] = float4(0, 0, 0, 0);
         return;
     }
         

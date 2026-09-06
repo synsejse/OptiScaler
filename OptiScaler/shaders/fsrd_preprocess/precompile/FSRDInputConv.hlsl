@@ -64,19 +64,19 @@ Texture2D<half4> InBlurColor : register(t9);
 
 // FSR-RR - ffxDispatchDescDenoiserInput1Signal or ffxDispatchDescDenoiserInput2Signals
 //
-// Mode 1: RGB: Noisy fused lighting
+// Mode 1: RGB: Noisy fused lighting A: Specular Ray Length
 // Mode 2: RGB: Noisy specular lighting A: Specular Ray Length
 RWTexture2D<half4> OutSignal1 : register(u0); 
 
-// Mode 1: RGB Fused Albedo: max(specularAlbedo, diffuseAlbedo) A: NoV
+// Mode 1: RGB Fused Albedo: max(specularAlbedo, diffuseAlbedo) A: Unused in RR 1.1
 // Mode 2: RGB: Noisy diffuse lighting for Mode 2
 RWTexture2D<half4> OutSignal2 : register(u1);
 
 // ffxDispatchDescDenoiser
-RWTexture2D<half4> OutMotion : register(u2); // RG: Standard TSR motion vectors, B: Linear Depth Delta (CurrentLinearDepth - PrevLinearDepth)
+RWTexture2D<half4> OutMotion : register(u2); // RG: Standard TSR motion vectors, B: abs(PrevLinearDepth) - abs(CurrentLinearDepth)
 RWTexture2D<half4> OutNormals : register(u3); // RG: Octahedrally encoded normals, B: Linear Roughness, A: Material Type (Optional)
-RWTexture2D<half4> OutSpecAlbedo : register(u4); // RGB: Specular Albedo, A: dot(Normal, ViewDir)
-RWTexture2D<half4> OutDiffAlbedo : register(u5); // RGB: Diffuse Albedo, A: Metalness (heuristic approximate)
+RWTexture2D<half4> OutSpecAlbedo : register(u4); // RGB: Specular Albedo, A: Unused in RR 1.1
+RWTexture2D<half4> OutDiffAlbedo : register(u5); // RGB: Diffuse Albedo, A: Unused in RR 1.1
 RWTexture2D<float> OutLinearDepth : register(u6);
 
 RWTexture2D<half4> OutSkipSignal : register(u7);
@@ -108,15 +108,17 @@ float3 GetViewSpacePos(const int2 px)
     [branch]
     if (IsSet(FLAGS_LINEAR_DEPTH))
     {
-        viewSpacePos = InvProjectPosition(float3(uv, 1.0f), InvProjMatrix);
-        viewSpacePos *= (inDepth / viewSpacePos.z);
+        // Interior depth avoids an infinite far plane at either 0 or 1.
+        viewSpacePos = InvProjectPosition(float3(uv, 0.5f), InvProjMatrix);
+        viewSpacePos *= (abs(inDepth) / abs(viewSpacePos.z));
     }
     else
     {
         viewSpacePos = InvProjectPosition(float3(uv, inDepth), InvProjMatrix);       
     }
     
-    viewSpacePos.z = clamp(abs(viewSpacePos.z), NearPlane, FarPlane);
+    // Preserve signed Z for world reconstruction. Only the depth supplied to AMD is absolute.
+    viewSpacePos.z = clamp(abs(viewSpacePos.z), NearPlane, FarPlane) * (IsSet(FLAGS_IS_RIGHT_HANDED) ? -1.0f : 1.0f);
     return viewSpacePos;
 }
 
@@ -150,9 +152,10 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
     float4 diffAlbedo = float4(GetSafeFP16(InDiffAlbedo[px].rgb), 0.0f);
     
     const float3 viewSpacePos = GetViewSpacePos(px);
-    OutLinearDepth[px] = viewSpacePos.z;
+    const float linearDepth = abs(viewSpacePos.z);
+    OutLinearDepth[px] = linearDepth;
     
-    const float depthDelta = abs(viewSpacePos.z - FarPlane);
+    const float depthDelta = abs(linearDepth - FarPlane);
     const float totalAlbedo = dot(specReflectance.rgb + diffAlbedo.rgb, 1.0f);
     
     if ((depthDelta > 1e-2f && (totalAlbedo > 1e-2f)) || IsSet(FLAGS_DEBUG))
@@ -180,7 +183,8 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         float3 prevViewSpacePos = mul(PrevViewMatrix, float4(worldSpacePos, 1.0f)).xyz;
         prevViewSpacePos.z = abs(prevViewSpacePos.z);
         
-        const float depthDelta = (prevViewSpacePos.z - viewSpacePos.z);
+        // Camera-only depth delta: NGX's 2D motion cannot recover independent object motion along Z.
+        const float depthDelta = (prevViewSpacePos.z - linearDepth);
     
         // FSR-RR requires Linear Depth Delta in Blue channel
         const float2 motionIn = InMotionVectors[px].rg; // RG: Pixel Movement
@@ -206,12 +210,14 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
         specReflectance.rgb = max(specReflectance.rgb, 1e-3f);
         diffAlbedo.rgb = max(diffAlbedo.rgb, 1e-3f);
 
-        half hitDist = hitDist = 0.0f;
+        // Both AMD modes consume specular ray length in radiance alpha. Null input reads zero.
+        const float rawHitDist = InSpecHitDist[px];
+        const half hitDist = isfinite(rawHitDist) ? GetSafeFP16(max(rawHitDist, 0.0f)) : 0.0f;
         half3 demodColor = 0.0f;
         float4 fusedAlbedo = 0.0f;
         
         [branch]
-        if (IsSet(FLAGS_MODE_2_SIGNAL)) // Primary radiance packing - Mode 2 Signal
+        if (IsSet(FLAGS_MODE_2_SIGNAL)) // Heuristic split, not genuine separate lighting.
         {          
             const float3 specWeight = saturate(specReflectance.rgb);
             const float3 diffWeight = saturate(diffAlbedo.rgb);
@@ -228,8 +234,6 @@ void CSMain(uint3 groupID : SV_GroupID, uint3 gtID : SV_GroupThreadID)
             const float3 residual = max(0.0f, denosierColor - remodColor);
             floorColor += residual;
             
-            // Mask out specular tracking if the surface isn't smooth enough
-            hitDist = GetSafeFP16(InSpecHitDist[px] * (roughness < 0.2f));
             
             [branch]
             if (!IsSet(FLAGS_DEBUG))

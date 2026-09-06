@@ -458,7 +458,7 @@ class Config
 
     // FSR-RR (FFX Denoiser / FSR Ray Regeneration)
     CustomOptional<int> FfxDenoiserIndex { 0 };
-    CustomOptional<int> FfxDenoiserMode { 0 };
+    CustomOptional<int> FfxDenoiserMode { 1 }; // Fused lighting; split mode is an approximation
     CustomOptional<uint64_t> FfxDenoiserDebugMode { 0 };
     CustomOptional<int> FfxDenoiserCaptureSamples { 0 };
 

@@ -431,10 +431,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\fsrd_preprocess\FSRDPreprocessor_Dx12.h" />
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderData.h" />
     <ClInclude Include="shaders\fsrd_preprocess\FSRDShaderUtils.h" />
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDFloor_Shader.h" />
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDFloorSeed_Shader.h" />
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDInputConv_Shader.h" />
-    <ClInclude Include="shaders\fsrd_preprocess\precompile\FSRDOutputComp_Shader.h" />
+    <ClInclude Include="upscalers\ffx\FSRDInputMath.h" />
     <ClInclude Include="shaders\Shader_Dx12.h" />
     <ClInclude Include="shaders\Shader_Dx12Utils.h" />
     <ClInclude Include="shaders\Shader_Vk.h" />
@@ -862,7 +859,28 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <None Include="shaders\magnifier\precompile\Magnifier_Shader_Vk.spv" />
     <None Include="Source.def" />
   </ItemGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDFloor.hlsl" />
+    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDFloorSeed.hlsl" />
+    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDInputConv.hlsl" />
+    <FSRDShader Include="shaders\fsrd_preprocess\precompile\FSRDOutputComp.hlsl" />
+  </ItemGroup>
+  <Target Name="CompileFSRDShaders" BeforeTargets="ClCompile"
+          Inputs="%(FSRDShader.FullPath);$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDPreprocessCommon.hlsli;$(ProjectDir)shaders\shader_tools\dxc.exe;$(ProjectDir)shaders\shader_tools\dxcompiler.dll;$(MSBuildProjectFullPath)"
+          Outputs="$(IntDir)fsrd_generated\%(FSRDShader.Filename)_Shader.h">
+    <MakeDir Directories="$(IntDir)fsrd_generated" />
+    <Exec Command="&quot;$(ProjectDir)shaders\shader_tools\dxc.exe&quot; -T cs_6_0 -E CSMain -O3 -Qstrip_debug -Qstrip_reflect -Fo &quot;$(IntDir)fsrd_generated\%(FSRDShader.Filename).cso&quot; -Fh &quot;$(IntDir)fsrd_generated\%(FSRDShader.Filename)_Shader.h&quot; -Vn %(FSRDShader.Filename)_cso &quot;%(FSRDShader.FullPath)&quot;" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="TestFSRDContracts" AfterTargets="Build"
+          Condition="'$(GITHUB_ACTIONS)' == 'true' Or '$(RunFSRDTests)' == 'true'">
+    <Exec Command="&quot;$(ProjectDir)..\tests\run_fsrd_tests.cmd&quot; &quot;$(ProjectDir)..&quot; &quot;$(IntDir)fsrd_tests&quot;" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

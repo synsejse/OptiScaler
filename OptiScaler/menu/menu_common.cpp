@@ -2844,8 +2844,9 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
 
                         ImGui::EndCombo();
                     }
-                    ShowHelpMarker("Sets the denoising mode. "
-                                   "Higher modes are generally higher quality, but more demanding.");
+                    ShowHelpMarker("Fused mode denoises the combined lighting supplied by DLSS RR. "
+                                   "Split mode estimates diffuse/specular lighting from albedo weights; "
+                                   "these are not genuine separate lighting inputs. It is experimental.");
 
                     ImGui::SameLine();
 
