@@ -1,6 +1,7 @@
 # Cyberpunk pre-Fog ray regeneration
 
-Implementation status: continuous-mode CPU regression testing is in progress.
+Implementation status: continuous-mode CPU regression tests pass; native
+validation is still in progress.
 The predecessor `b1fcdb09` completed 18,000 consecutive native denoised frames
 with movement and a positive user visual check. This does not yet validate the
 new continuous ownership/restart implementation in the game.
@@ -41,10 +42,29 @@ off for other installations; an unsupported executable is not patched.
   producer/consumer command-list Reset generations, and all CPU readers.
 - CPU reader leases live in native callback scopes, not GPU-retained plans.
   Submission-owned resource graphs remain acyclic.
+- The same producer submission can own a lighting plan which owns ray-copy
+  Work. Work must therefore observe its completion ticket weakly; only the
+  non-GPU-retained frame controller owns the strong producer receipt. A strong
+  Work-to-ticket link created a real loading-time buffer leak in `832be9d2`.
+  The same-list owner-chain regression fails with that old link and passes
+  with the weak observation plus controller receipt (`43700e67`).
 - Expected scene, native-reset, view, render-size or settings changes stop new
   work and drain old work before starting a fresh context/history. A submitted
   producer with no consumer may retire only after its own fence and newer list
   Reset; it never commits denoiser history.
+- Old scene lists may never be reset/reused after loading. Once final fences,
+  actual returns and CPU quiescence are proven, a restarting window may transfer
+  its recording vetoes into at most 128 process-wide replay guards. They retain
+  exact COM list identities and generations, not frame buffers or the AMD context.
+  Same/older/unknown recordings are still rejected before native submission;
+  only a newer observed Reset retires a guard. Publication precedes removing the
+  old watch, and submission rechecks guards after window admission, closing the
+  transfer race. Capacity/identity failures retain the old window, never evict
+  an unproven guard. This restart path is undergoing native validation.
+- A wholly unrecorded frame may be discarded after a preparation refusal only
+  with no declared producer, embedded consumer, private-command evidence,
+  retained submission ticket, pending return, or live CPU callback. This is
+  distinct from draining submitted work and never acknowledges history.
 - Unknown generations, missing returns, failed signals and unsafe dependencies
   are not discarded to keep rendering. An undrainable session stays stopped.
   A partially recorded unsafe dependency still terminates only the authenticated

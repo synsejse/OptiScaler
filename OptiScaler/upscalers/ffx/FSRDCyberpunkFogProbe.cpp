@@ -23,6 +23,7 @@
 #include "FSRDCyberpunkPrivateResetSource.h"
 #include "FSRDCyberpunkPrivateResetPolicy.h"
 #include "FSRDCyberpunkTemporalWindowPolicy.h"
+#include "FSRDReplayGuardPolicy.h"
 #include "FSRDCyberpunkTemporalCamera.h"
 #include "FSRDPrivateDenoise.h"
 
@@ -496,6 +497,7 @@ struct TemporalWindow
     bool ledgerSaved = false;
     uint32_t returnEvidencePending = 0;
     bool ledgerEvidenceLost = false;
+    bool drainDiagnosticLogged = false;
 };
 // No provider/COM destruction during DLL teardown; runtime retirement is explicit.
 auto& temporalWindow = *new std::atomic<std::shared_ptr<TemporalWindow>>;
@@ -5986,6 +5988,133 @@ bool RetireUnrecordedTemporalFrame(TemporalWindow& window, const std::shared_ptr
     return true;
 }
 
+constexpr size_t MaxRetiredReplayGuards = 128;
+struct RetiredReplayGuards
+{
+    std::mutex mutex;
+    FSRD::ReplayGuardPolicy::Guards<MaxRetiredReplayGuards> policy;
+    // Identity ownership prevents an unrelated new list reusing an old address.
+    // No frame, provider context, Work, texture or ticket is retained here.
+    std::array<ComPtr<IUnknown>, MaxRetiredReplayGuards> identities;
+    std::atomic<bool> pending { false };
+};
+RetiredReplayGuards& ReplayGuards()
+{
+    static auto* guards = new RetiredReplayGuards; // No COM calls at DLL teardown.
+    return *guards;
+}
+
+bool PublishReplayGuards(const PrivateResetPacket& frame)
+{
+    std::array recordings { frame.producer, frame.consumer };
+    if (uintptr_t(frame.producerIdentity.Get()) != frame.producer.list ||
+        uintptr_t(frame.consumerIdentity.Get()) != frame.consumer.list) return false;
+    const size_t count = frame.unusedProducer ? 1 : 2;
+    auto& guards = ReplayGuards();
+    std::lock_guard lock(guards.mutex);
+    if (!guards.policy.Remember(std::span(recordings.data(), count))) return false;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto index = guards.policy.Find(recordings[i].list);
+        if (!guards.identities[index])
+            guards.identities[index] = i == 0 ? frame.producerIdentity : frame.consumerIdentity;
+    }
+    guards.pending.store(true, std::memory_order_release);
+    return true;
+}
+
+bool AllowsRetiredSubmission(UINT count, ID3D12CommandList* const* lists)
+{
+    auto& guards = ReplayGuards();
+    if (!count || !guards.pending.load(std::memory_order_acquire)) return true;
+    if (!lists || count > ResetPolicy::Policy::MaxExecuteLists) return false;
+    std::array<ResetPolicy::Recording, ResetPolicy::Policy::MaxExecuteLists> recordings {};
+    std::array<ComPtr<IUnknown>, ResetPolicy::Policy::MaxExecuteLists> identities;
+    for (UINT i = 0; i < count; ++i)
+    {
+        if (!lists[i] || FAILED(lists[i]->QueryInterface(IID_PPV_ARGS(&identities[i])))) return false;
+        recordings[i].list = uintptr_t(identities[i].Get());
+    }
+    {
+        auto& data = Data(); std::lock_guard lock(data.mutex);
+        for (UINT i = 0; i < count; ++i)
+        {
+            const auto found = data.lists.find(identities[i].Get());
+            if (captureTrackingValid.load() && found != data.lists.end() && found->second.known)
+                recordings[i].generation = found->second.generation;
+        }
+    }
+    // Release retired COM identities outside the registry lock.
+    std::array<ComPtr<IUnknown>, ResetPolicy::Policy::MaxExecuteLists> released;
+    std::lock_guard lock(guards.mutex);
+    if (!guards.policy.Allows(std::span(recordings.data(), count))) return false;
+    for (UINT i = 0; i < count; ++i)
+    {
+        const auto index = guards.policy.Find(recordings[i].list);
+        if (guards.policy.Retire(recordings[i])) released[i] = std::move(guards.identities[index]);
+    }
+    guards.pending.store(!guards.policy.Empty(), std::memory_order_release);
+    return true;
+}
+
+bool TransferCompletedTemporalWatch(TemporalWindow& window, const std::shared_ptr<PrivateResetPacket>& frame)
+{
+    if (!window.continuous || !window.stopped) return false;
+    std::lock_guard frameLock(frame->mutex);
+    std::lock_guard windowLock(window.mutex);
+    auto& slot = window.frames[frame->temporalKey.index % window.frames.size()];
+    if (!window.restartRequested || slot != frame || slot.use_count() != 2 || !window.policy ||
+        window.returnEvidencePending || !frame->retired || (!frame->returned && !frame->unusedProducer) ||
+        !window.policy->CanTransferReplayGuard(frame->temporalKey, frame->producer, frame->consumer, frame->unusedProducer))
+        return false;
+    // Publish while the old window still vetoes replay. A submission which was
+    // waiting for this window lock must check the retired guards AFTER admission.
+    if (!PublishReplayGuards(*frame)) return false; // Capacity/identity failure retains the original watch.
+    if (!window.policy->TransferReplayGuard(frame->temporalKey, frame->producer, frame->consumer,
+                                           frame->unusedProducer, true)) PrivateResetFatal();
+    std::erase(window.liveFrames, frame.get());
+    ++window.drainedFrames;
+    slot.reset(); // Maintenance snapshot destroys outside all policy/registry locks.
+    return true;
+}
+
+void LogStoppedTemporalFrames(TemporalWindow& window, const std::vector<std::shared_ptr<PrivateResetPacket>>& frames)
+{
+    {
+        std::lock_guard lock(window.mutex);
+        if (!window.continuous || !window.stopped || window.drainDiagnosticLogged) return;
+        window.drainDiagnosticLogged = true;
+    }
+    for (const auto& frame : frames)
+    {
+        if (!frame) continue;
+        std::lock_guard frameLock(frame->mutex);
+        ResetPolicy::Recording producer = frame->producer, consumer = frame->consumer;
+        producer.generation = consumer.generation = 0;
+        {
+            auto& data = Data(); std::lock_guard lock(data.mutex);
+            for (auto* recording : { &producer, &consumer })
+            {
+                const auto found = data.lists.find(reinterpret_cast<IUnknown*>(recording->list));
+                if (captureTrackingValid.load() && found != data.lists.end() && found->second.known)
+                    recording->generation = found->second.generation;
+            }
+        }
+        std::lock_guard lock(window.mutex);
+        const auto& slot = window.frames[frame->temporalKey.index % window.frames.size()];
+        if (slot != frame || !window.policy) continue;
+        LOG_INFO("[FSRRR continuous] drain frame={} retired={} returned={} unused={} CPU_owners={} pending={} "
+                 "failed={} producer_returned={} consumer_embedded={} producer={:#x}:{}->{} consumer={:#x}:{}->{} "
+                 "producer_ticket={} final_ticket={}",
+                 frame->temporalKey.frame, frame->retired, frame->returned, frame->unusedProducer, slot.use_count(),
+                 window.returnEvidencePending, window.policy->FrameFailed(frame->temporalKey),
+                 window.policy->ProducerReturned(frame->temporalKey), window.policy->ConsumerEmbedded(frame->temporalKey),
+                 producer.list, frame->producer.generation, producer.generation,
+                 consumer.list, frame->consumer.generation, consumer.generation,
+                 bool(frame->producerTicket), bool(frame->finalTicket));
+    }
+}
+
 void MaintainTemporalWindow(TemporalWindow& window)
 {
     // No waits and no provider/native calls under the controller lock. Bounded
@@ -6053,7 +6182,14 @@ void MaintainTemporalWindow(TemporalWindow& window)
     }
     // A newer native Reset is NOT a GPU fence. Both are required here,
     // independently, before removing a submission watch or reusing a CPU slot.
-    for (const auto& frame : frames) RetireVisualWatch(window, *frame);
+    for (const auto& frame : frames)
+    {
+        if (!frame) continue;
+        RetireVisualWatch(window, *frame);
+        if (TransferCompletedTemporalWatch(window, frame))
+            LOG_INFO("[FSRRR continuous] drained completed scene frame {} into lightweight replay guards", frame->temporalKey.frame);
+    }
+    LogStoppedTemporalFrames(window, frames);
     for (size_t pass = 0; pass < 2; ++pass)
     {
         size_t slot = window.freeTargets.size();
@@ -6461,9 +6597,16 @@ uint64_t AdmitPrivateResetSubmission(ID3D12CommandQueue* queue, UINT count,
 {
     if (auto window = temporalWindow.load(std::memory_order_acquire))
     {
-        try { return AdmitTemporalSubmission(*window, queue, count, lists); }
+        try {
+            const auto token = AdmitTemporalSubmission(*window, queue, count, lists);
+            if (!AllowsRetiredSubmission(count, lists)) PrivateResetFatal();
+            return token;
+        }
         catch (...) { PrivateResetFatal(); }
     }
+    // Old scene guards also remain effective between roots and after disabling RR.
+    try { if (!AllowsRetiredSubmission(count, lists)) PrivateResetFatal(); }
+    catch (...) { PrivateResetFatal(); }
     auto* packet = privateResetPacket.load(std::memory_order_acquire);
     if (!packet) return 0;
     try

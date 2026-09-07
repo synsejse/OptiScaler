@@ -320,6 +320,31 @@ class Window
     }
     size_t SubmissionWatches() const noexcept { return _watches.size(); }
 
+    bool CanTransferReplayGuard(FrameKey key, Recording producer, Recording consumer, bool unused) const noexcept
+    {
+        const auto* frame = FindConst(key);
+        if (!Continuous() || !_stopped || !frame || frame->policy->Failed() ||
+            !frame->policy->ProducerReturned() || !producer.Valid() || producer != frame->producer ||
+            consumer != frame->consumer) return false;
+        if (unused ? (frame->policy->ConsumerEmbedded() || consumer.list) :
+                     (key.index >= _committed || !frame->policy->ConsumerReturned() || !consumer.Valid())) return false;
+        for (const auto& call : _calls)
+            if (call.receipt.Valid())
+                for (uint32_t i = 0; i < call.count; ++i)
+                    if (call.entries[i].index == key.index) return false;
+        return std::find(_watches.begin(), _watches.end(), key.index) != _watches.end();
+    }
+    // Host publishes process-wide replay guards FIRST, with the exact owned
+    // native list identities. Also requires final fences and CPU quiescence.
+    // This transfers the old-generation veto; it does not waive native Reset.
+    bool TransferReplayGuard(FrameKey key, Recording producer, Recording consumer, bool unused,
+                             bool guardsPublished) noexcept
+    {
+        if (!guardsPublished || !CanTransferReplayGuard(key, producer, consumer, unused)) return false;
+        std::erase(_watches, key.index); Clear(key.index);
+        return true;
+    }
+
     // Admission/preparation can fail before any private command was recorded.
     // This is not cancellation of submitted work: host must independently prove
     // no producer/guide/copy/consumer recording, ticket, or CPU callback exists.

@@ -70,7 +70,7 @@ class ContinuousLifetime(unittest.TestCase):
         compiler = os.environ.get('CXX') or shutil.which('c++')
         if not compiler:
             self.skipTest('Set CXX for compiled host reclamation checks')
-        functions = section('void RetireVisualWatch(', 'void MaintainTemporalWindow(')
+        functions = section('void RetireVisualWatch(', 'constexpr size_t MaxRetiredReplayGuards')
         functions += section('bool CanRestartTemporalWindow(', 'void NotifyFeatureReleased(')
         fixture = r'''
 #include "FSRDCyberpunkTemporalWindowPolicy.h"
