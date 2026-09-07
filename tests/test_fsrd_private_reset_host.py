@@ -150,7 +150,11 @@ struct ID3D12CommandQueue:IUnknown{IUnknown* device=nullptr;bool deviceFail=fals
 // separately compiled against real Window policy in test_fsrd_temporal_host.
 struct TemporalWindow{};std::atomic<TemporalWindow*> temporalWindow{nullptr};
 constexpr uint64_t TemporalToken=1ull<<63;
-uint64_t AdmitTemporalSubmission(TemporalWindow&,ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){assert(false);return 0;}
+bool replayAllowed=true;
+bool AllowsRetiredSubmission(UINT,ID3D12CommandList* const*){return replayAllowed;}
+// Simulate a guard being published while this call waits for old-root admission.
+uint64_t AdmitTemporalSubmission(TemporalWindow&,ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){
+ replayAllowed=false;return TemporalToken|123;}
 void ReturnedTemporalSubmission(TemporalWindow&,uint64_t){assert(false);}
 namespace ResetPolicy=FSRD::CyberpunkPrivateResetPolicy;
 struct PrivateResetPacket{std::mutex mutex;ResetPolicy::Policy policy;ComPtr<IUnknown> queueIdentity;
@@ -174,6 +178,8 @@ int main(int argc,char** argv){
  ResetPolicy::ProducerSeal seal{p,p,1,2,3,4,true,true,true,true,true,true,true,true};
  assert(policy.SealProducer(seal));assert(policy.EmbedConsumer(c,1,true));assert(policy.SealConsumer(c,2,true,true));
  const std::string mode=argc>1?argv[1]:"separate";ID3D12CommandList* both[]{&producer,&consumer};
+ if(mode=="retired-gap"){privateResetPacket.store(nullptr);replayAllowed=false;AdmitPrivateResetSubmission(&queue,2,both);assert(false);}
+ if(mode=="retired-transfer"){TemporalWindow old;temporalWindow.store(&old);AdmitPrivateResetSubmission(&queue,2,both);assert(false);}
  if(mode=="bad-order"){ID3D12CommandList* reverse[]{&consumer,&producer};AdmitPrivateResetSubmission(&queue,2,reverse);assert(false);}
  if(mode=="missing-producer"){ID3D12CommandList* one[]{&consumer};AdmitPrivateResetSubmission(&queue,1,one);assert(false);}
  if(mode=="unknown-reset"){captureTrackingValid=false;AdmitPrivateResetSubmission(&queue,2,both);assert(false);}
@@ -206,7 +212,7 @@ int main(int argc,char** argv){
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for mode in ('separate', 'batch', 'bad-order', 'missing-producer', 'unknown-reset',
-                             'wrong-queue', 'lost-list', 'bad-return', 'in-flight'):
+                             'wrong-queue', 'lost-list', 'bad-return', 'in-flight', 'retired-gap', 'retired-transfer'):
                     result = subprocess.run([str(temp / 'test'), mode], text=True, capture_output=True)
                     expected = 0 if mode in ('separate', 'batch') else 79
                     self.assertEqual(result.returncode, expected, mode + result.stdout + result.stderr)
