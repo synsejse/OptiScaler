@@ -1095,7 +1095,9 @@ PrivateResetPacket* SelectTemporalFrame(TemporalWindow& window, const Json& meta
         window.warmupSkippedThrough = std::max(window.warmupSkippedThrough, source.current.frame);
         return nullptr;
     }
-    if (source.current.view != window.lastFog->view || source.current.object != window.lastFog->object)
+    // A frame payload is not a persistent view identifier. Exact object/camera
+    // equality across this frame's roles remains enforced by ClaimPrivateReset.
+    if (source.current.view != window.lastFog->view)
     {
         window.stopped = true;
         if (window.policy) window.policy->Stop();
@@ -5267,14 +5269,22 @@ PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT cou
     {
         std::lock_guard lock(window->mutex);
         if (window->policy && window->policy->Complete()) return nullptr;
-        if (window->lastFog && (window->lastFog->view != raw.current.view || window->lastFog->object != raw.current.object ||
-            window->lastFog->frame == UINT32_MAX || raw.current.frame != window->lastFog->frame + 1))
+        if (window->lastFog && !raw.current.FollowsInView(*window->lastFog))
             throw std::runtime_error(std::format(
                 "temporal selected Fog source cadence or view changed: frame {}->{} view {:#x}->{:#x} "
                 "object {:#x}->{:#x} list {:#x} generation {} committed {}",
                 window->lastFog->frame, raw.current.frame, window->lastFog->view, raw.current.view,
                 window->lastFog->object, raw.current.object, recording.list, recording.generation,
                 window->policy ? window->policy->CommittedFrames() : 0));
+        if (window->lastFog && window->lastFog->object != raw.current.object)
+        {
+            static std::atomic<uint32_t> payloadChangeLogs { 0 };
+            if (payloadChangeLogs.fetch_add(1) < 4)
+                LOG_INFO("[FSRRR temporal] consecutive frame payload changed: frame {}->{} view {:#x} "
+                         "object {:#x}->{:#x}; same-frame input matching remains required",
+                         window->lastFog->frame, raw.current.frame, raw.current.view,
+                         window->lastFog->object, raw.current.object);
+        }
         previousTime = window->lastFogTimestamp;
         ready = window->warmupReturned && window->lastFog.has_value();
     }

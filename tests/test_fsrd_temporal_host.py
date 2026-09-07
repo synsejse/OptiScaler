@@ -57,7 +57,10 @@ class TemporalHost(unittest.TestCase):
         self.assertIn('state->second.generation', observe)
         self.assertIn('nativeList != uintptr_t(list)', observe)
         self.assertIn('topology != 4', observe)
-        self.assertIn('raw.current.frame != window->lastFog->frame + 1', observe)
+        self.assertIn('!raw.current.FollowsInView(*window->lastFog)', observe)
+        self.assertNotIn('source.current.object != window.lastFog->object', select)
+        claim = section('void ClaimPrivateReset(', 'void StopTemporalWindow(')
+        self.assertIn('!packet.source->SameFrame(source)', claim)
         self.assertIn('frame {}->{} view {:#x}->{:#x}', observe)
         self.assertIn('object {:#x}->{:#x} list {:#x} generation {} committed {}', observe)
         self.assertIn('const double delta = timestamp - previousTime', observe)
@@ -278,7 +281,8 @@ int main(int argc,char**argv){
         compiler = os.environ.get('CXX') or shutil.which('c++')
         if not compiler:
             self.skipTest('Set CXX for compiled frame selector checks')
-        implementation = section('PrivateResetPacket* SelectTemporalFrame(', 'void FailPacket(')
+        implementation = section('void ClaimPrivateReset(', 'void StopTemporalWindow(')
+        implementation += section('PrivateResetPacket* SelectTemporalFrame(', 'void FailPacket(')
         mocks = r'''
 #include "FSRDCyberpunkTemporalWindowPolicy.h"
 #include <json.hpp>
@@ -298,19 +302,23 @@ template<class T>struct ComPtr{T* p=nullptr;ComPtr()=default;ComPtr(T* v):p(v){}
 namespace WindowPolicy=FSRD::CyberpunkTemporalWindowPolicy;
 namespace ResetPolicy=FSRD::CyberpunkPrivateResetPolicy;
 namespace ResetSource{
- struct RawSource{uint32_t width=1280,height=720,frame=101;uintptr_t view=1000,object=2000;};
+ struct RawSource{uint32_t width=1280,height=720,frame=101;uintptr_t view=1000,object=2000;
+ bool SameFrame(const RawSource& b)const{return width==b.width&&height==b.height&&frame==b.frame&&view==b.view&&object==b.object;}};
  struct RawTemporalSource{RawSource current;bool nativeResetRequested=false;};
  RawTemporalSource ParseRawTemporal(const Json& j){RawTemporalSource value;
  value.current.frame=j.at("frame").get<uint32_t>();value.current.view=j.value("view",uintptr_t(1000));
  value.current.object=j.value("object",uintptr_t(2000));value.current.width=j.value("width",1280u);
  value.nativeResetRequested=j.value("reset",false);return value;}
+ RawSource Parse(const Json& j,float){return ParseRawTemporal(j).current;}
 }
 struct TemporalWindow;
 struct Targets{std::shared_ptr<int> guides,rays,charge;};
 struct PrivateResetPacket{explicit PrivateResetPacket(uintptr_t){}
+ std::mutex mutex;float delta=1;std::optional<ResetSource::RawSource> source;
  ComPtr<ID3D12Device> device;ComPtr<IUnknown> deviceIdentity;UINT width=0,height=0;
  uint64_t provider=0;int settings=0;TemporalWindow* temporal=nullptr;WindowPolicy::FrameKey temporalKey{};
- struct{TemporalWindow* window=nullptr;WindowPolicy::FrameKey key{};}policy;
+ struct{TemporalWindow* window=nullptr;WindowPolicy::FrameKey key{};bool failed=false;
+ bool Failed()const{return failed;}void Fail(){failed=true;}}policy;
  std::shared_ptr<int> guides,rays,charge;};
 struct TemporalWindow{
  std::mutex mutex;ComPtr<ID3D12Device> device;ComPtr<IUnknown> deviceIdentity,queueIdentity;
@@ -336,15 +344,28 @@ int main(){
  window.lastFog->frame=100;for(auto& free:window.freeTargets)free=Targets{std::make_shared<int>(1),std::make_shared<int>(2),std::make_shared<int>(3)};};
  for(unsigned bad=0;bad<6;++bad){TemporalWindow window;setup(window);Json j={{"frame",101}};
   switch(bad){case 0:window.warmupReturned=false;break;case 1:window.queueIdentity={};break;
-   case 2:j["view"]=999;break;case 3:j["object"]=888;break;case 4:j["width"]=2560;break;case 5:j["frame"]=103;break;}
+   case 2:j["view"]=999;break;case 3:j["frame"]=100;break;case 4:j["width"]=2560;break;case 5:j["frame"]=103;break;}
   assert(!SelectTemporalFrame(window,j,&device,WindowPolicy::Role::Ray));assert(!window.frames[0]);
+ }
+ // Actual host input-claim function still refuses a different object within
+ // this frame, even though inter-frame allocation changes are now accepted.
+ for(unsigned bad=0;bad<3;++bad){TemporalWindow window;setup(window);Json j={{"frame",101},{"object",888}};
+  auto* packet=SelectTemporalFrame(window,j,&device,WindowPolicy::Role::Ray);assert(packet);
+  bool firstRole=false,secondRole=false;ClaimPrivateReset(*packet,j,&device,firstRole);
+  if(bad==1)j["object"]=999;if(bad==2)j["frame"]=102;
+  bool refused=false;try{ClaimPrivateReset(*packet,j,&device,secondRole);}catch(const std::exception&){refused=true;}
+  assert(refused==(bad!=0));assert(packet->policy.Failed()==(bad!=0));assert(secondRole==(bad==0));
  }
  for(unsigned failFinal=0;failFinal<3;++failFinal){
   FSRDFogLayerCapture::guideRequests=FSRDFogLayerCapture::fogRequests=FSRDFogLayerCapture::cancels=0;
   FSRDFogLayerCapture::guides=true;FSRDFogLayerCapture::fog=true;
   TemporalWindow window;setup(window);
   for(unsigned i=0;i<32;++i){
-   Json j={{"frame",101+i}};if(i==31){FSRDFogLayerCapture::guides=failFinal!=1;FSRDFogLayerCapture::fog=failFinal!=2;}
+   // Fresh native payload address on EVERY frame, same address for all roles
+   // within that frame. Reproduces the real allocation transition without
+   // treating allocator reuse as a persistent camera/history identity.
+   const uintptr_t payload=0x5b4c98920ull+i*0x1000ull;
+   Json j={{"frame",101+i},{"object",payload}};if(i==31){FSRDFogLayerCapture::guides=failFinal!=1;FSRDFogLayerCapture::fog=failFinal!=2;}
    // Fog may be first on CPU. It takes fixed outputs, never current/last mutable resources.
    auto* fog=SelectTemporalFrame(window,j,&device,WindowPolicy::Role::Fog);
    if(i==31&&failFinal){assert(!fog&&window.stopped&&!window.frames[i]);break;}
@@ -353,6 +374,9 @@ int main(){
    auto* ray=SelectTemporalFrame(window,j,&device,WindowPolicy::Role::Ray);
    auto* guides=SelectTemporalFrame(window,j,&device,WindowPolicy::Role::Guides);
    assert(fog==ray&&fog==guides);
+   bool fogRole=false,rayRole=false,guideRole=false;
+   ClaimPrivateReset(*fog,j,&device,fogRole);ClaimPrivateReset(*ray,j,&device,rayRole);
+   ClaimPrivateReset(*guides,j,&device,guideRole);assert(!fog->policy.Failed());
    ResetPolicy::Recording p{0x1100+i*0x100,1},c{0x1200+i*0x100,2};
    auto key=fog->temporalKey;
    assert(window.policy->DeclareProducer(key,p));
@@ -360,7 +384,7 @@ int main(){
    assert(window.policy->EmbedConsumer(key,c,1,true));assert(window.policy->SealConsumer(key,c,2,true,true));
    std::array<ResetPolicy::Recording,2> both{p,c};auto submit=window.policy->BeforeExecute({uintptr_t(&queue),uintptr_t(&device),true},both);
    assert(submit.allowed);assert(window.policy->AfterExecute(submit.receipt).consumer==key);assert(window.policy->CommitConsumer(key));
-   window.lastFog->frame=101+i;
+   window.lastFog->frame=101+i;window.lastFog->object=payload;
    if(i<31)assert(FSRDFogLayerCapture::guideRequests==0&&FSRDFogLayerCapture::fogRequests==0);
    // Emulate fresh allocation by maintenance, not reuse of claimed Targets.
    for(auto& free:window.freeTargets)if(!free)free=Targets{std::make_shared<int>(1),std::make_shared<int>(2),std::make_shared<int>(3)};

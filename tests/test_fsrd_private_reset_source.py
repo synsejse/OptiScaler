@@ -141,6 +141,21 @@ int main(){
  auto different=a;different.width++;assert(!a.SameFrame(different));
  different=a;different.height++;assert(!a.SameFrame(different));
 
+ // Native run75189->75190: same view, consecutive ID, newly allocated payload.
+ // It is valid inter-frame cadence, NEVER the same frame's input association.
+ auto prior=a;prior.frame=75189;prior.view=0x590a2b0e0ull;prior.object=0x5b4c98920ull;
+ auto next=prior;next.frame=75190;next.object=0x5b0526d90ull;
+ assert(next.FollowsInView(prior));assert(!next.SameFrame(prior));
+ auto wrongSameFrame=prior;wrongSameFrame.object=next.object;
+ assert(!wrongSameFrame.SameFrame(prior));assert(!wrongSameFrame.FollowsInView(prior));
+ for(unsigned bad=0;bad<8;++bad){auto invalid=next;auto before=prior;
+  switch(bad){case 0:invalid.frame=prior.frame;break;case 1:invalid.frame=prior.frame-1;break;
+   case 2:++invalid.frame;break;case 3:++invalid.view;break;case 4:++invalid.width;break;
+   case 5:++invalid.height;break;case 6:before.frame=UINT32_MAX;invalid.frame=0;break;
+   case 7:before.view=invalid.view=0;break;}
+  assert(!invalid.FollowsInView(before));
+ }
+
  for(const Json& invalid:{Json(-1),Json(0),Json(4096.0),Json(4096.5),Json(true),Json("4096"),Json()}){
   b=good;b["view"]=invalid;reject(b);
   b=good;b["camera_provenance"]["frame_id_virtual_route"]["object_address"]=invalid;reject(b);

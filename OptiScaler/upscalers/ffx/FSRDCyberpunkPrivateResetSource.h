@@ -59,6 +59,14 @@ struct RawSource
     Json camera; // Includes all repeated authored source evidence, not just dispatch fields.
     CyberpunkResetCamera::Snapshot rawSnapshot {}; // Actual current source words, not reconstructed history.
     std::array<float, 2> motionScale {};
+    // Frame payloads are allocated separately by the native renderer. Their
+    // addresses identify inputs WITHIN a frame, not history across frames.
+    // This is only a CPU cadence check; it establishes no native origin epoch.
+    bool FollowsInView(const RawSource& prior) const
+    {
+        return view && width && height && view == prior.view && width == prior.width && height == prior.height &&
+            prior.frame != UINT32_MAX && frame == prior.frame + 1;
+    }
     bool SameFrame(const RawSource& other) const
     {
         return view == other.view && object == other.object && frame == other.frame &&
