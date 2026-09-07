@@ -14,7 +14,14 @@
 #include <map>
 #include <stdexcept>
 #include <vector>
+#include <optional>
+#include <cstring>
+#include <climits>
+#include <bcrypt.h>
 #include "replay_options.h"
+#include "native_reset_options.h"
+#include <FSRDInputConv_Shader.h>
+#include <FSRDOutputComp_Shader.h>
 
 using Microsoft::WRL::ComPtr;
 using json = nlohmann::json;
@@ -102,10 +109,11 @@ struct Readback
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
     UINT64 bytes = 0;
 };
-static Readback copyReadback(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* source)
+static Readback copyReadback(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+                            D3D12_RESOURCE_STATES before = D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
 {
     Readback result;
-    barrier(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    barrier(list, source, before, D3D12_RESOURCE_STATE_COPY_SOURCE);
     const auto desc = source->GetDesc();
     device->GetCopyableFootprints(&desc, 0, 1, 0, &result.footprint, nullptr, nullptr, &result.bytes);
     result.buffer = buffer(device, result.bytes, D3D12_HEAP_TYPE_READBACK);
@@ -118,7 +126,8 @@ static Readback copyReadback(ID3D12Device* device, ID3D12GraphicsCommandList* li
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     return result;
 }
-static void writeReadback(const Readback& readback, const fs::path& path, uint32_t width, uint32_t height)
+static void writeReadback(const Readback& readback, const fs::path& path, uint32_t width, uint32_t height,
+                          uint32_t pixelBytes = 8)
 {
     void* mapped = nullptr;
     D3D12_RANGE range { 0, size_t(readback.bytes) };
@@ -126,7 +135,7 @@ static void writeReadback(const Readback& readback, const fs::path& path, uint32
     std::ofstream result(path, std::ios::binary);
     for (uint32_t y = 0; y < height; ++y)
         result.write(static_cast<char*>(mapped) + readback.footprint.Offset +
-                         size_t(y) * readback.footprint.Footprint.RowPitch, size_t(width) * 8);
+                         size_t(y) * readback.footprint.Footprint.RowPitch, size_t(width) * pixelBytes);
     D3D12_RANGE noWrite { 0, 0 };
     readback.buffer->Unmap(0, &noWrite);
     result.close();
@@ -134,8 +143,167 @@ static void writeReadback(const Readback& readback, const fs::path& path, uint32
         throw std::runtime_error("Cannot write replay texture: " + path.string());
 }
 
+static std::string sha256(const void* data, size_t size)
+{
+    if (size > ULONG_MAX) throw std::runtime_error("Hash input exceeds bounded diagnostic size");
+    std::array<unsigned char, 32> digest {};
+    if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+                   const_cast<PUCHAR>(static_cast<const unsigned char*>(data)), ULONG(size),
+                   digest.data(), ULONG(digest.size())) < 0)
+        throw std::runtime_error("SHA256 failed");
+    constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    for (auto byte : digest) { result += hex[byte >> 4]; result += hex[byte & 15]; }
+    return result;
+}
+
+// Standalone lifetime: every object below remains owned until the SAME command
+// list's existing completion fence succeeds. No game hooks/contexts or global
+// FSRDSubmission registry are involved. Shader bytes are produced from the exact
+// production HLSL/flags in build.cmd; there is no CPU conversion approximation.
+struct NativeConversion
+{
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Resource> constants;
+    std::map<std::string, ComPtr<ID3D12Resource>> outputs;
+};
+static const std::array<std::pair<const char*, DXGI_FORMAT>, 8> conversionOutputs {{
+    { "converted_radiance", DXGI_FORMAT_R16G16B16A16_FLOAT },
+    { "converted_fused_albedo", DXGI_FORMAT_R10G10B10A2_UNORM },
+    { "converted_motion", DXGI_FORMAT_R16G16B16A16_FLOAT },
+    { "converted_normals", DXGI_FORMAT_R10G10B10A2_UNORM },
+    { "converted_specular_albedo", DXGI_FORMAT_R10G10B10A2_UNORM },
+    { "converted_diffuse_albedo", DXGI_FORMAT_R10G10B10A2_UNORM },
+    { "converted_depth", DXGI_FORMAT_R32_FLOAT },
+    { "preserved_lighting", DXGI_FORMAT_R16G16B16A16_FLOAT }
+}};
+static NativeConversion convertNative(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+    const std::map<std::string, ComPtr<ID3D12Resource>>& inputs, const Replay::NativeReset& raw)
+{
+    constexpr auto readState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    NativeConversion result;
+    check(device->CreateRootSignature(0, FSRDInputConv_cso, sizeof(FSRDInputConv_cso),
+                                      IID_PPV_ARGS(&result.root)), "Create converter root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso {};
+    pso.pRootSignature = result.root.Get();
+    pso.CS = { FSRDInputConv_cso, sizeof(FSRDInputConv_cso) };
+    check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&result.pipeline)), "Create converter pipeline");
+    D3D12_DESCRIPTOR_HEAP_DESC heap {};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors = 16;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&result.heap)), "Create converter descriptors");
+    result.constants = buffer(device, 256, D3D12_HEAP_TYPE_UPLOAD);
+    void* mapped = nullptr;
+    D3D12_RANGE noRead {};
+    check(result.constants->Map(0, &noRead, &mapped), "Map converter constants");
+    memset(mapped, 0, 256);
+    static_assert(sizeof(raw.constants) == 240);
+    memcpy(mapped, raw.constants.data(), sizeof(raw.constants));
+    result.constants->Unmap(0, nullptr);
+    const auto increment = device->GetDescriptorHandleIncrementSize(heap.Type);
+    auto cpu = result.heap->GetCPUDescriptorHandleForHeapStart();
+    // Exact t0..t7 production bindings, including an explicit inactive null t4.
+    constexpr const char* names[] = { "raw_color", "raw_depth", "raw_motion", "raw_normals",
+                                      nullptr, "raw_hit", "raw_diffuse_albedo", "raw_specular_albedo" };
+    for (const auto* name : names)
+    {
+        auto* source = name ? inputs.at(name).Get() : nullptr;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+        srv.Format = source ? source->GetDesc().Format : DXGI_FORMAT_R32_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(source, &srv, cpu);
+        cpu.ptr += increment;
+    }
+    const auto w = uint32_t(raw.camera.renderSize[0]), h = uint32_t(raw.camera.renderSize[1]);
+    for (const auto& [name, format] : conversionOutputs)
+    {
+        auto& output = result.outputs[name];
+        output = texture(device, w, h, format, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+        uav.Format = format; uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, cpu);
+        cpu.ptr += increment;
+    }
+    ID3D12DescriptorHeap* heaps[] = { result.heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(result.root.Get());
+    list->SetPipelineState(result.pipeline.Get());
+    list->SetComputeRootConstantBufferView(0, result.constants->GetGPUVirtualAddress());
+    auto gpu = result.heap->GetGPUDescriptorHandleForHeapStart();
+    list->SetComputeRootDescriptorTable(1, gpu);
+    gpu.ptr += UINT64(increment) * 8;
+    list->SetComputeRootDescriptorTable(2, gpu);
+    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    for (const auto& [name, output] : result.outputs)
+        barrier(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, readState);
+    return result;
+}
+
+static NativeConversion composeNative(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+    ID3D12Resource* radiance, const NativeConversion& converted, const Replay::NativeReset& raw)
+{
+    NativeConversion result;
+    check(device->CreateRootSignature(0, FSRDOutputComp_cso, sizeof(FSRDOutputComp_cso),
+                                      IID_PPV_ARGS(&result.root)), "Create compositor root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso {};
+    pso.pRootSignature = result.root.Get();
+    pso.CS = { FSRDOutputComp_cso, sizeof(FSRDOutputComp_cso) };
+    check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&result.pipeline)), "Create compositor pipeline");
+    D3D12_DESCRIPTOR_HEAP_DESC heap {};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors = 4; heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&result.heap)), "Create compositor descriptors");
+    // Actual CB_Comp layout: DstTexSize, Flags=0, Padding=0, SrcTexSize.
+    std::array<uint32_t, 8> words {};
+    for (size_t i = 0; i < 4; ++i) words[i] = std::bit_cast<uint32_t>(raw.camera.renderSize[i]);
+    words[6] = words[0]; words[7] = words[1];
+    result.constants = buffer(device, 256, D3D12_HEAP_TYPE_UPLOAD);
+    void* mapped = nullptr; D3D12_RANGE noRead {};
+    check(result.constants->Map(0, &noRead, &mapped), "Map compositor constants");
+    memset(mapped, 0, 256); memcpy(mapped, words.data(), sizeof(words));
+    result.constants->Unmap(0, nullptr);
+    const auto increment = device->GetDescriptorHandleIncrementSize(heap.Type);
+    auto cpu = result.heap->GetCPUDescriptorHandleForHeapStart();
+    ID3D12Resource* sources[] = { radiance, converted.outputs.at("converted_fused_albedo").Get(),
+                                  converted.outputs.at("preserved_lighting").Get() };
+    for (auto* source : sources)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+        srv.Format = source->GetDesc().Format; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(source, &srv, cpu); cpu.ptr += increment;
+    }
+    const auto w = uint32_t(raw.camera.renderSize[0]), h = uint32_t(raw.camera.renderSize[1]);
+    auto& output = result.outputs["composed"];
+    output = texture(device, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+    uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, cpu);
+    ID3D12DescriptorHeap* heaps[] = { result.heap.Get() };
+    list->SetDescriptorHeaps(1, heaps); list->SetComputeRootSignature(result.root.Get());
+    list->SetPipelineState(result.pipeline.Get());
+    list->SetComputeRootConstantBufferView(0, result.constants->GetGPUVirtualAddress());
+    auto gpu = result.heap->GetGPUDescriptorHandleForHeapStart();
+    list->SetComputeRootDescriptorTable(1, gpu); gpu.ptr += UINT64(increment) * 3;
+    list->SetComputeRootDescriptorTable(2, gpu);
+    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    return result; // Composition output stays UAV, exactly the readback precondition.
+}
+
 static int run(int argc, wchar_t** argv)
 {
+    if (argc == 3 && std::wstring(argv[1]) == L"--validate-native-reset")
+    {
+        const auto raw = Replay::parseNativeReset(json::parse(std::ifstream(fs::path(argv[2]))));
+        std::cout << json({ { "dispatch", Replay::nativeDispatch(raw) },
+                            { "conversion_constants_words", raw.constants } }).dump() << '\n';
+        return 0; // CPU only; no provider, device, queue or output directory.
+    }
     if (argc != 4)
         throw std::runtime_error("Usage: fsrrr-replay.exe job.json absolute-provider.dll NEW-output-directory");
     fs::path jobPath = fs::absolute(argv[1]);
@@ -144,6 +312,16 @@ static int run(int argc, wchar_t** argv)
     json job = json::parse(std::ifstream(jobPath));
     if (job.at("schema") != 1 || fs::exists(outputPath))
         throw std::runtime_error("Unknown schema or output directory already exists");
+    std::optional<Replay::NativeReset> native;
+    if (Replay::nativeMode(job))
+    {
+        native = Replay::parseNativeReset(job);
+        job["dispatch"] = Replay::nativeDispatch(*native);
+        job["conversion_constants_words"] = native->constants;
+        job["conversion_shader_sha256"] = sha256(FSRDInputConv_cso, sizeof(FSRDInputConv_cso));
+        job["dispatch_source"] = "actual_ResetCamera_builder_from_current_CPU_sources; independent_RESET";
+        job["composition_shader_sha256"] = sha256(FSRDOutputComp_cso, sizeof(FSRDOutputComp_cso));
+    }
     const auto& d = job.at("dispatch");
     uint32_t w = d.at("render_size").at(0), h = d.at("render_size").at(1);
     if (!w || !h || w > 8192 || h > 8192 || !(d.at("flags").get<uint32_t>() & FFX_DENOISER_DISPATCH_RESET))
@@ -155,11 +333,19 @@ static int run(int argc, wchar_t** argv)
     // Validate paths and file sizes before loading a provider or creating GPU resources.
     std::map<std::string, std::vector<char>> bytes;
     std::map<std::string, std::pair<uint32_t, uint32_t>> resourceSizes;
-    const std::map<std::string, uint32_t> expected {
+    const std::map<std::string, uint32_t> convertedFormats {
         { "converted_radiance", 10 }, { "converted_motion", 10 }, { "converted_depth", 41 },
         { "converted_normals", 24 }, { "converted_diffuse_albedo", 24 },
         { "converted_specular_albedo", 24 }, { "converted_fused_albedo", 24 }
     };
+    const std::map<std::string, uint32_t> rawFormats {
+        { "raw_color", 10 }, { "raw_depth", 41 }, { "raw_motion", 10 }, { "raw_normals", 10 },
+        { "raw_hit", 41 }, { "raw_diffuse_albedo", 28 }, { "raw_specular_albedo", 28 }
+    };
+    const auto& expected = native ? rawFormats : convertedFormats;
+    if (native && (uint64_t(w) * h * 40 > 256ull * 1024 * 1024 ||
+                   uint64_t(w) * h * 68 > 256ull * 1024 * 1024))
+        throw std::runtime_error("Raw RESET exceeds bounded input or converted/output texel allocation");
     for (const auto& entry : job.at("textures"))
     {
         const auto name = entry.at("name").get<std::string>();
@@ -172,6 +358,8 @@ static int run(int argc, wchar_t** argv)
         uint32_t resourceW = sizeJson.at(0), resourceH = sizeJson.at(1);
         if (resourceW < w || resourceH < h || resourceW > 8192 || resourceH > 8192)
             throw std::runtime_error("Invalid texture allocation dimensions");
+        if (native && (resourceW != w || resourceH != h))
+            throw std::runtime_error("Raw RESET requires exact active-size native snapshots, no uncaptured padding");
         resourceSizes[name] = { resourceW, resourceH };
         size_t size = size_t(w) * h * (fmt == 10 ? 8 : 4);
         const auto path = jobPath.parent_path() / filename;
@@ -182,6 +370,8 @@ static int run(int argc, wchar_t** argv)
         std::ifstream input(path, std::ios::binary);
         if (!input.read(data.data(), static_cast<std::streamsize>(size)))
             throw std::runtime_error("Cannot read texture: " + name);
+        if (native && entry.at("sha256") != sha256(data.data(), data.size()))
+            throw std::runtime_error("Native input hash mismatch: " + name);
     }
     if (bytes.size() != expected.size())
         throw std::runtime_error("Missing required texture");
@@ -246,6 +436,8 @@ static int run(int argc, wchar_t** argv)
     versions.versionIds = &id;
     versions.versionNames = &versionName;
     checkFfx(ffxQuery(nullptr, &versions.header), "Query version");
+    if (native && native->providerId != id)
+        throw std::runtime_error("Explicit native RESET provider ID differs from enumerated provider");
     job["provider_version"] = versionName ? versionName : "unknown";
     job["provider_id"] = id;
     std::cout << "Provider: " << job["provider_version"] << std::endl;
@@ -327,10 +519,22 @@ static int run(int argc, wchar_t** argv)
         barrier(list.Get(), tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, readState);
         uploads.push_back(upload);
     }
+    // Keep raw resources separately as well as descriptors until the own-list
+    // completion fence. Replacing the provider-input map must not retire sources.
+    std::map<std::string, ComPtr<ID3D12Resource>> rawInputs;
+    std::optional<NativeConversion> conversion;
+    if (native)
+    {
+        rawInputs = inputs;
+        conversion = convertNative(device.Get(), list.Get(), rawInputs, *native);
+        inputs = conversion->outputs;
+    }
     const auto outputSize = job.value("output_size", json::array({ w, h }));
     uint32_t outputW = outputSize.at(0), outputH = outputSize.at(1);
     if (outputW < w || outputH < h || outputW > 8192 || outputH > 8192)
         throw std::runtime_error("Invalid output allocation dimensions");
+    if (native && (outputW != w || outputH != h))
+        throw std::runtime_error("Native RESET diagnostic output must match the active rectangle");
     auto output = texture(device.Get(), outputW, outputH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto resource = [&](const char* name) { return ffxApiGetResourceDX12(inputs.at(name).Get(), FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ); };
     ffxDispatchDescDenoiserInput1Signal signal {};
@@ -399,10 +603,25 @@ static int run(int argc, wchar_t** argv)
     dispatch.frameIndex = d.at("frame_index");
     dispatch.flags = d.at("flags");
     checkFfx(ffxDispatch(&context, &dispatch.header), "Dispatch denoiser");
-    const auto readback = copyReadback(device.Get(), list.Get(), output.Get());
+    std::optional<NativeConversion> identityComposition, denoisedComposition;
+    std::optional<Readback> identityReadback, composedReadback;
+    if (conversion)
+    {
+        barrier(list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, readState);
+        identityComposition = composeNative(device.Get(), list.Get(), inputs.at("converted_radiance").Get(), *conversion, *native);
+        denoisedComposition = composeNative(device.Get(), list.Get(), output.Get(), *conversion, *native);
+        identityReadback = copyReadback(device.Get(), list.Get(), identityComposition->outputs.at("composed").Get());
+        composedReadback = copyReadback(device.Get(), list.Get(), denoisedComposition->outputs.at("composed").Get());
+    }
+    const auto readback = copyReadback(device.Get(), list.Get(), output.Get(),
+                                      conversion ? readState : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Readback debugReadback;
     if (options.debug)
         debugReadback = copyReadback(device.Get(), list.Get(), debugOutput.Get());
+    std::map<std::string, Readback> convertedReadbacks;
+    if (conversion)
+        for (const auto& [name, source] : conversion->outputs)
+            convertedReadbacks[name] = copyReadback(device.Get(), list.Get(), source.Get(), readState);
     check(list->Close(), "Close command list");
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create fence");
@@ -422,6 +641,26 @@ static int run(int argc, wchar_t** argv)
     CloseHandle(event);
     fs::create_directories(outputPath);
     writeReadback(readback, outputPath / "denoised.rgba16f", w, h);
+    if (conversion)
+    {
+        writeReadback(*identityReadback, outputPath / "identity_composed.rgba16f", w, h);
+        writeReadback(*composedReadback, outputPath / "denoised_composed.rgba16f", w, h);
+        job["composition_outputs"] = {
+            { "identity", "identity_composed.rgba16f" }, { "denoised", "denoised_composed.rgba16f" },
+            { "format", 10 }, { "size", { w, h } }, { "flags", 0 },
+            { "meaning", "same production GPU compositor; identity replaces only the denoised signal, output alpha=1; no Fog composition" }
+        };
+        job["converted_outputs"] = json::array();
+        for (const auto& [name, format] : conversionOutputs)
+        {
+            const auto filename = std::string(name) + ".bin";
+            const auto pixelBytes = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+            writeReadback(convertedReadbacks.at(name), outputPath / filename, w, h, pixelBytes);
+            job["converted_outputs"].push_back({ { "name", name }, { "file", filename },
+                { "format", uint32_t(format) }, { "size", { w, h } }, { "bytes", uint64_t(w) * h * pixelBytes },
+                { "value_transform", "exact production GPU converter; native UAV bytes, no CPU repacking" } });
+        }
+    }
     if (options.debug)
     {
         writeReadback(debugReadback, outputPath / "debug.rgba16f", options.debugWidth, options.debugHeight);

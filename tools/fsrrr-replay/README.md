@@ -99,3 +99,30 @@ python -m unittest discover -s tools/fsrrr-replay -p 'test_*.py'
 ```
 
 Pinned [AMD diagnostic API and sample](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/v2.2.0/Kits/FidelityFX/docs/techniques/denoising.md#debug-view).
+
+## Native-input RESET diagnostic
+
+The optional schema-1 `input_mode: "cyberpunk_native_reset_v1"` accepts seven
+native snapshots: composed color, hardware depth, motion, world-normal/roughness,
+hit distance, diffuse albedo and specular albedo. It runs the **same production
+GPU input-conversion and output-composition shaders**, not a CPU approximation.
+It requires exact current camera words, explicit motion scales, provider ID,
+all six settings, and an explicitly labeled frame-duration experiment control.
+It refuses a supplied converted dispatch or uncaptured allocation padding.
+
+Raw input SHA256 values are checked before GPU work. The result includes the
+eight native converter outputs, `identity_composed.rgba16f` and
+`denoised_composed.rgba16f`, plus the effective dispatch and shader hashes.
+Identity replaces only the denoised signal; both controls use the production
+compositor. No fog equation is applied and no game resources are accessed.
+All resources remain owned until the standalone command-list fence completes.
+
+This mode does not establish frame pairing by itself. Preparation must compare
+independently completed captures' explicit frame-source object/value, view and
+camera data; file names, directory order and pointer survival are not evidence.
+One fresh RESET result does not validate temporal quality. The raw camera/options
+contract can also be checked without loading the provider or creating a device:
+
+```text
+fsrrr-replay.exe --validate-native-reset job.json
+```

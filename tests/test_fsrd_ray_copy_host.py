@@ -107,7 +107,9 @@ class RayCopyHost(unittest.TestCase):
 #include <vector>
 #include <json.hpp>
 #include "FSRDCyberpunkRayAccess.h"
+#ifndef __fastcall
 #define __fastcall
+#endif
 using Json=nlohmann::json;
 constexpr uintptr_t Image=0x140000000,Context=0x2000;
 thread_local bool inMetadata=false;
