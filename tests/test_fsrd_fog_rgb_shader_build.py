@@ -77,6 +77,7 @@ class FogRgbShaderBuild(unittest.TestCase):
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 using BYTE=unsigned char;using UINT=unsigned;using HRESULT=int;using BOOL=int;
 #define FAILED(x) ((x)<0)
 #define IID_PPV_ARGS(x) (x)
@@ -87,8 +88,12 @@ enum {D3D11_SHVER_PIXEL_SHADER=0,D3D11_SHVER_VERTEX_SHADER=1,D3D_NAME_UNDEFINED=
  D3D_NAME_VERTEX_ID=6,D3D_NAME_TARGET=64,D3D_REGISTER_COMPONENT_FLOAT32=3,
  D3D_REGISTER_COMPONENT_UINT32=1,D3D_SIT_TEXTURE=2,D3D_SRV_DIMENSION_TEXTURE2D=4,
  D3D_RETURN_TYPE_FLOAT=5};
+// MinGW's CRT already declares _stricmp with C linkage. Only non-Windows
+// hosts need this portable stand-in; never redeclare the Windows CRT symbol.
+#ifndef _WIN32
 inline int _stricmp(const char* a,const char* b){while(*a&&*b){int x=std::tolower((unsigned char)*a++);
  int y=std::tolower((unsigned char)*b++);if(x!=y)return x-y;}return *a-*b;}
+#endif
 struct D3D11_SHADER_DESC{UINT Version=0,InputParameters=1,OutputParameters=1,BoundResources=1;};
 struct D3D11_SIGNATURE_PARAMETER_DESC{const char* SemanticName=nullptr;UINT SemanticIndex=0;
  UINT SystemValueType=0,ComponentType=3;BYTE Mask=3;UINT Stream=0;};
