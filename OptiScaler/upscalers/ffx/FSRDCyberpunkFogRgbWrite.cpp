@@ -1,8 +1,8 @@
 #include "pch.h"
 #include "FSRDCyberpunkFogRgbWrite.h"
 #include "resource_tracking/FSRDSubmission.h"
-#include <d3dcompiler.h>
-#include <d3d11shader.h>
+#include <fsrd_generated/FSRDFogRgbWrite_VS.h>
+#include <fsrd_generated/FSRDFogRgbWrite_PS.h>
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -16,32 +16,12 @@ namespace
 using Microsoft::WRL::ComPtr;
 constexpr UINT MaxDimension = 8192;
 constexpr UINT64 MaxRetainedBytes = 256ull * 1024 * 1024;
-constexpr char Shader[] = R"(
-Texture2D<float4> Input : register(t0);
-struct VertexOutput
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-VertexOutput VSMain(uint vertex : SV_VertexID)
-{
-    float2 p = float2((vertex << 1) & 2, vertex & 2);
-    VertexOutput output;
-    output.position = float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
-    output.uv = p;
-    return output;
-}
-float4 PSMain(sample float2 uv : TEXCOORD0) : SV_Target0
-{
-    // SV_Position may describe a coarse VRS region even for sample-frequency
-    // execution. Use the actual sample-interpolated coordinate instead. With
-    // W=1 at every vertex and an exact full viewport, this maps each fine
-    // sample to its own texel; the admitted source/target extents are equal.
-    uint width, height;
-    Input.GetDimensions(width, height);
-    return float4(Input.Load(int3(uint2(uv * float2(width, height)), 0)).rgb, 0);
-}
-)";
+// The mandatory native Windows build validator reflects THESE generated DXBC
+// arrays and requires VS/PS 5.0 plus positive sample-frequency PS execution.
+// Wine's compiler/reflection implementations are not a runtime fallback: some
+// versions reject sample interpolation or stub IsSampleFrequencyShader false.
+static_assert(sizeof(FSRDFogRgbWrite_VS_cso) > 32);
+static_assert(sizeof(FSRDFogRgbWrite_PS_cso) > 32);
 
 struct Refused { const char* reason; };
 void Require(bool value, const char* reason) { if (!value) throw Refused { reason }; }
@@ -79,29 +59,6 @@ void ValidateTexture(ID3D12Device* device, ID3D12Resource* resource, UINT width,
             allocation.SizeInBytes <= MaxRetainedBytes - retained, "RGB-write retained texture budget exceeded");
     retained += allocation.SizeInBytes;
 }
-ComPtr<ID3DBlob> Compile(const char* entry, const char* profile)
-{
-    ComPtr<ID3DBlob> shader, errors;
-    const auto result = D3DCompile(Shader, sizeof(Shader) - 1, "FSRDCyberpunkFogRgbWrite", nullptr, nullptr,
-                                   entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-                                   0, &shader, &errors);
-    if (!SUCCEEDED(result) || !shader || !shader->GetBufferPointer() || !shader->GetBufferSize())
-    {
-        try
-        {
-            constexpr size_t MaxDiagnosticBytes = 2048;
-            const auto size = errors ? errors->GetBufferSize() : 0;
-            const auto* data = errors ? static_cast<const char*>(errors->GetBufferPointer()) : nullptr;
-            const std::string_view diagnostic = data ? std::string_view(data, size < MaxDiagnosticBytes ? size : MaxDiagnosticBytes)
-                                                     : std::string_view {};
-            LOG_WARN("[FSRRR RGB identity] {} {} compilation HRESULT={:08x}: {}", entry, profile, uint32_t(result), diagnostic);
-        }
-        catch (...) {} // Logging must not replace the static bounded error result.
-        throw Refused { "RGB-write shader compilation failed" };
-    }
-    return shader;
-}
-
 // Submission retains only this leaf owner. It owns neither Work nor a ticket,
 // parent capture plan or callback; partial command recording cannot create a cycle.
 struct Lease
@@ -155,12 +112,6 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
         auto& lease = *data->lease;
         lease.device = device; lease.source = source; lease.target = target;
 
-        const auto vs = Compile("VSMain", "vs_5_0");
-        const auto ps = Compile("PSMain", "ps_5_0");
-        ComPtr<ID3D11ShaderReflection> reflection;
-        Require(SUCCEEDED(D3DReflect(ps->GetBufferPointer(), ps->GetBufferSize(), IID_PPV_ARGS(&reflection))) &&
-                reflection && reflection->IsSampleFrequencyShader(), "RGB-write sample-frequency proof unavailable");
-
         D3D12_DESCRIPTOR_RANGE range {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 1;
         D3D12_ROOT_PARAMETER parameter {};
@@ -176,8 +127,8 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
                                                      IID_PPV_ARGS(&lease.root))) && lease.root, "RGB-write root creation failed");
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pso {};
         pso.pRootSignature = lease.root.Get();
-        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        pso.VS = { FSRDFogRgbWrite_VS_cso, sizeof(FSRDFogRgbWrite_VS_cso) };
+        pso.PS = { FSRDFogRgbWrite_PS_cso, sizeof(FSRDFogRgbWrite_PS_cso) };
         for (auto& b : pso.BlendState.RenderTarget)
         {
             b.SrcBlend = D3D12_BLEND_ONE; b.DestBlend = D3D12_BLEND_ZERO; b.BlendOp = D3D12_BLEND_OP_ADD;

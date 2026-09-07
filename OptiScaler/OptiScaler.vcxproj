@@ -898,6 +898,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\magnifier\precompile\Magnifier_Shader_Vk.spv" />
+    <None Include="shaders\fsrd_preprocess\precompile\FSRDFogRgbWrite.hlsl" />
     <None Include="Source.def" />
   </ItemGroup>
   <ItemDefinitionGroup>
@@ -915,6 +916,16 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
           Outputs="$(IntDir)fsrd_generated\%(FSRDShader.Filename)_Shader.h">
     <MakeDir Directories="$(IntDir)fsrd_generated" />
     <Exec Command="&quot;$(ProjectDir)shaders\shader_tools\dxc.exe&quot; -T cs_6_0 -E CSMain -O3 -Qstrip_debug -Qstrip_reflect -Fo &quot;$(IntDir)fsrd_generated\%(FSRDShader.Filename).cso&quot; -Fh &quot;$(IntDir)fsrd_generated\%(FSRDShader.Filename)_Shader.h&quot; -Vn %(FSRDShader.Filename)_cso &quot;%(FSRDShader.FullPath)&quot;" />
+  </Target>
+  <Target Name="CompileFSRDFogRgbShaders" BeforeTargets="ClCompile"
+          Inputs="$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDFogRgbWrite.hlsl;$(ProjectDir)shaders\shader_tools\fxc.exe;$(ProjectDir)..\tools\fsrrr-rgb-shaders\validate.cmd;$(ProjectDir)..\tools\fsrrr-rgb-shaders\validate.cpp;$(MSBuildProjectFullPath)"
+          Outputs="$(IntDir)fsrd_generated\FSRDFogRgbWrite_VS.h;$(IntDir)fsrd_generated\FSRDFogRgbWrite_PS.h;$(IntDir)fsrd_generated\FSRDFogRgbWrite.validated">
+    <MakeDir Directories="$(IntDir)fsrd_generated" />
+    <Delete Files="$(IntDir)fsrd_generated\FSRDFogRgbWrite.validated" />
+    <Exec Command="&quot;$(ProjectDir)shaders\shader_tools\fxc.exe&quot; /nologo /Ges /O3 /WX /T vs_5_0 /E VSMain /Fh &quot;$(IntDir)fsrd_generated\FSRDFogRgbWrite_VS.h&quot; /Vn FSRDFogRgbWrite_VS_cso &quot;$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDFogRgbWrite.hlsl&quot;" />
+    <Exec Command="&quot;$(ProjectDir)shaders\shader_tools\fxc.exe&quot; /nologo /Ges /O3 /WX /T ps_5_0 /E PSMain /Fh &quot;$(IntDir)fsrd_generated\FSRDFogRgbWrite_PS.h&quot; /Vn FSRDFogRgbWrite_PS_cso &quot;$(ProjectDir)shaders\fsrd_preprocess\precompile\FSRDFogRgbWrite.hlsl&quot;" />
+    <Exec Command="&quot;$(ProjectDir)..\tools\fsrrr-rgb-shaders\validate.cmd&quot; &quot;$(IntDir)fsrd_generated&quot; &quot;$(IntDir)fsrd_rgb_validator&quot;" />
+    <Touch Files="$(IntDir)fsrd_generated\FSRDFogRgbWrite.validated" AlwaysCreate="true" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="TestFSRDContracts" AfterTargets="Build"

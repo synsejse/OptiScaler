@@ -49,7 +49,9 @@ class Work
 //
 // This helper changes graphics root, descriptor heaps/tables, PSO and OM, then
 // draws three vertices. It never changes IA, RS, VRS or resource states. Shader
-// reflection must prove sample-frequency execution. Sample-interpolated UVs
+// reflection on the native build host must prove sample-frequency execution
+// for the exact embedded DXBC (no runtime Wine compiler/reflection fallback).
+// Sample-interpolated UVs
 // from the owned W=1 fullscreen triangle address the source, not SV_Position
 // (which may name a coarse VRS region). A real identity roundtrip with the
 // actual inherited rasterization/VRS state is still required before use.
