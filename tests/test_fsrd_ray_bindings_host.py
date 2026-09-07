@@ -102,7 +102,9 @@ class RayBindingsHost(unittest.TestCase):
 #include <vector>
 #include <json.hpp>
 #include "FSRDCyberpunkRayBindings.h"
+#ifndef __fastcall
 #define __fastcall
+#endif
 #define WINAPI
 using Json=nlohmann::json;
 thread_local bool inMetadata=false;
