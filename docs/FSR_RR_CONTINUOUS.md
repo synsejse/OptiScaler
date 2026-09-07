@@ -1,7 +1,7 @@
 # Cyberpunk pre-Fog ray regeneration
 
-Implementation status: continuous-mode CPU regression tests pass; native
-validation is still in progress.
+Implementation status: continuous-mode CPU regression tests and native loading
+recovery pass; sustained continuous memory/quality-transition validation remains.
 The predecessor `b1fcdb09` completed 18,000 consecutive native denoised frames
 with movement and a positive user visual check. This does not yet validate the
 new continuous ownership/restart implementation in the game.
@@ -60,7 +60,7 @@ off for other installations; an unsupported executable is not patched.
   only a newer observed Reset retires a guard. Publication precedes removing the
   old watch, and submission rechecks guards after window admission, closing the
   transfer race. Capacity/identity failures retain the old window, never evict
-  an unproven guard. This restart path is undergoing native validation.
+  an unproven guard. Native loading recovery is confirmed in `fd1b9202`.
 - A wholly unrecorded frame may be discarded after a preparation refusal only
   with no declared producer, embedded consumer, private-command evidence,
   retained submission ticket, pending return, or live CPU callback. This is
@@ -74,6 +74,16 @@ off for other installations; an unsupported executable is not patched.
   `CyberpunkPreFog=false` and the existing experiment flags, after a restart.
 
 ## Scope and remaining validation
+
+`fd1b9202` passed 348 local tests, 22 targeted sanitizer checks, and the Windows
+workflow (338 tests, 18 skips). In the September 7 22:08 UTC native launch, the
+loading jump from frame 3536 to 6563 left exactly three completed old frames,
+3534–3536. The new path migrated their replay guards and began history 3 at
+frame 6566. Further gaps 6991→8557 and 9747→11487 likewise drained three frames
+and resumed histories 4 and 5. The user confirmed it works and supplied an
+ACTIVE screenshot at 519 denoised frames in history 4; subsequent logs reached
+1,200 committed frames in history 5. This directly verifies the reported stuck
+restart, not an indefinite runtime/memory guarantee. No image arithmetic changed.
 
 The native EXE/shader/resource contracts are deliberately narrow. Frame duration
 still comes from CPU intervals between selected native fog draws; independent
