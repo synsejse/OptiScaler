@@ -580,3 +580,53 @@ The control used AutoSave18 in a separate run; stochastic state, bias-mask
 coverage and camera/jitter differ from baseline. It is not an exact cross-run
 pixel subtraction or proof that every particle effect is handled correctly.
 The temporary engine override was removed after capture.
+
+### Positive pre-fog denoising control, with submission evidence
+
+Build `28860425` captured fog `fog-20260907-012146-595Z-324` and two immediate,
+nonqueued RR candidates. Independent queue-call intervals show separate,
+nonoverlapping submissions on the same queue, fog first. Candidate frame 10122
+is pixel-bit-identical to native post-fog RGB over 97.0419% of the image. Frame
+10123 matches only 6.0930%; this next-frame control has broad stochastic changes.
+The first candidate's remaining 2.9581% contains localized later color changes.
+These results support a controlled isolated-boundary experiment, not an assertion
+that no later writers exist or that arbitrary future frames can be paired this way.
+
+Three actual AMD fresh-context replays used the first candidate's identical
+guides, native ray-length alpha and settings:
+
+1. Captured current radiance, with its original numerical residual.
+2. CPU-rebuilt current radiance/residual, as an arithmetic control.
+3. CPU-converted native pre-fog radiance, with its own numerical residual; only
+   after denoising/remodulation is the captured authored fog operator applied.
+
+The third arm removes the unwanted revealed-material outlines in the fixed far
+and right-building regions. Both current-color controls reproduce the defect.
+The pre-fog surface-only view retains genuinely denoised detail; the same authored
+fog, not a fitted or increased haze layer, is restored. The corresponding
+identity round trip agrees with native post-fog within three FP16 steps.
+
+Each arm was repeated in another fresh context. The provider is not bit-
+deterministic in this test. On 473,835 unchanged-source pixels after excluding
+32 pixels around any observed later-color change, current-arm repeat MAEs are
+approximately 0.00027–0.00028, comparable to the 0.00028–0.00030 difference
+between the two arithmetic controls. Thus that difference cannot be attributed
+solely to CPU arithmetic. The current-to-pre-fog change is approximately
+0.00951 in both runs, about 34 times the repeat variation. On the fixed right
+region, pre-fog-plus-fog luminance remains close to the raw source while the
+current path increases contrast and material-correlated structure.
+
+This is strong positive evidence for separating atmospheric composition from
+surface denoising. It is **not a production fix**: late-color differences and
+the denoiser's unknown spatial reach remain confounds, and two reset-frame runs
+are not temporal validation. A general live correction should denoise before
+the game's own fog and subsequent effects, rather than replacing their final
+result using a guessed residual. Current NGX guides are generated later, so
+previous-frame parameter pointers are not a safe shortcut.
+
+The next opt-in observation reads only bounded current-context graph metadata
+at the authenticated, explicitly requested fog draw. It reports available guide
+handles and authored settings; it neither calls engine getters nor accesses GPU
+contents. A handle's presence does not establish initialized pixels, resource
+state, or permission to dispatch early. Shared-view constants, motion/depth and
+ray-distance availability still require corresponding producer/consumer checks.

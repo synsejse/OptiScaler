@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "FSRDCyberpunkFogProbe.h"
 #include "FSRDFogLayerCapture.h"
+#include "FSRDCyberpunkEarlyGuides.h"
 
 #include <Util.h>
 #include <resource_tracking/FSRDSubmission.h>
@@ -1162,6 +1163,10 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         { "rr_frame_association", "not_established" }
     };
     plan->provenance["endpoint_origin"] = plan->endpoint->fog;
+    // One accepted, authenticated capture only. CPU table availability does not
+    // establish initialized GPU contents or authorize an early denoiser dispatch.
+    plan->provenance["early_guide_availability"] = Json::parse(
+        FSRDCyberpunkEarlyGuides::Describe(s.context, uintptr_t(GetModuleHandleW(nullptr))));
     const CD3DX12_HEAP_PROPERTIES properties(D3D12_HEAP_TYPE_DEFAULT);
     auto allocate = [&](const D3D12_RESOURCE_DESC& textureDesc, D3D12_RESOURCE_STATES initial,
                          FSRDFogLayerCapture::Texture& output) {
