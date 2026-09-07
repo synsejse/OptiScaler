@@ -84,6 +84,9 @@ namespace ResetPolicy=FSRD::CyberpunkPrivateResetPolicy;
 struct IUnknown{};
 struct PrivateResetPacket{
  std::mutex mutex;bool retired=false,returned=true,unusedProducer=false;
+ bool sceneRecorded=false,consumerSealed=false;
+ uint64_t rayTerminal=0,guideBegin=0;
+ std::shared_ptr<int> rayCopy,finalTicket,denoise;
  ResetPolicy::Recording producer{},consumer{};WindowPolicy::FrameKey temporalKey{};
 };
 struct TemporalWindow{
@@ -158,6 +161,28 @@ int main(){
  Data().lists[reinterpret_cast<IUnknown*>(p.list)]={true,11};
  RetireVisualWatch(unused,*frame);assert(unused.liveFrames.empty());
  assert(unused.policy->CommittedFrames()==0&&CanRestartTemporalWindow(unused));
+ // A preparation failure with NO private recording cannot strand the session.
+ // Exercise the real cleanup with every independent host proof withheld.
+ TemporalWindow empty;empty.policy=std::make_unique<WindowPolicy::Window>(11,queue,1000,0);
+ auto abandoned=std::make_shared<PrivateResetPacket>();abandoned->returned=false;
+ auto emptyKey=empty.policy->ClaimRole(1000,WindowPolicy::Role::Ray);
+ abandoned->temporalKey=emptyKey;empty.frames[0]=abandoned;empty.liveFrames.push_back(abandoned.get());
+ empty.stopped=true;empty.policy->FailFrame(emptyKey);
+ {auto reader=abandoned;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));}
+ for(auto* flag:{&abandoned->sceneRecorded,&abandoned->consumerSealed,&abandoned->returned,&abandoned->retired}){
+  *flag=true;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));*flag=false;}
+ for(auto* value:{&abandoned->rayTerminal,&abandoned->guideBegin}){
+  *value=1;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));*value=0;}
+ for(auto* recording:{&abandoned->producer,&abandoned->consumer}){
+  *recording={100,1};assert(!RetireUnrecordedTemporalFrame(empty,abandoned));*recording={};}
+ for(auto* owner:{&abandoned->rayCopy,&abandoned->finalTicket,&abandoned->denoise}){
+  *owner=std::make_shared<int>(0);assert(!RetireUnrecordedTemporalFrame(empty,abandoned));owner->reset();}
+ empty.returnEvidencePending=1;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));empty.returnEvidencePending=0;
+ empty.continuous=false;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));empty.continuous=true;
+ empty.stopped=false;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));empty.stopped=true;
+ assert(RetireUnrecordedTemporalFrame(empty,abandoned));
+ assert(empty.liveFrames.empty()&&!empty.frames[0]&&empty.policy->CommittedFrames()==0);
+ assert(CanRestartTemporalWindow(empty));
 }
 '''
         with tempfile.TemporaryDirectory(prefix='fsrd-continuous-lifetime-') as folder:

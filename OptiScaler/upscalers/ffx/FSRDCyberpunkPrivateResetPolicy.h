@@ -164,6 +164,7 @@ class Policy
     bool ConsumerAdmitted() const noexcept { return _consumerSubmitted; }
     bool ConsumerReturned() const noexcept { return _consumerReturned; }
     bool ProducerReturned() const noexcept { return _producerReturned; }
+    bool ProducerDeclared() const noexcept { return _producerDeclared; }
     bool Failed() const noexcept { return _failed; }
     Failure LastFailure() const noexcept { return _failure; }
 

@@ -272,6 +272,17 @@ int main(){
   for(unsigned i=0;i<64;++i){auto key=producers(w,i);fog(w,i);
    auto s=submit(w,{producer(i),consumer(i)});commit(w,key,s.receipt);}
   assert(!w.ClaimRole(first+64,Role::Ray).Valid()&&w.Stopped());}
+ // A wholly unrecorded, failed allocation is disposable. Declared producer,
+ // embedded consumer, missing host proof and legacy mode stay retained.
+ {Window w(epoch,queue,first,0);auto key=w.ClaimRole(first,Role::Ray);w.FailFrame(key);
+  assert(!w.RetireUnrecordedFrame(key,false));assert(w.RetireUnrecordedFrame(key,true));
+  assert(!w.SubmissionWatches()&&w.CommittedFrames()==0&&w.FrameFailed(key));}
+ {Window w(epoch,queue,first,0);auto key=w.ClaimRole(first,Role::Ray);
+  assert(w.DeclareProducer(key,producer(0)));w.FailFrame(key);assert(!w.RetireUnrecordedFrame(key,true));}
+ {Window w(epoch,queue,first,0);auto key=w.ClaimRole(first,Role::Fog);
+  assert(w.EmbedConsumer(key,consumer(0),5,true));w.FailFrame(key);assert(!w.RetireUnrecordedFrame(key,true));}
+ {Window w(epoch,queue,first,32);auto key=w.ClaimRole(first,Role::Ray);w.FailFrame(key);
+  assert(!w.RetireUnrecordedFrame(key,true));}
  for(auto count:{31u,33u,17999u,18001u,UINT32_MAX}){
   Window w(epoch,queue,first,count);assert(w.Stopped()&&!w.ClaimRole(first,Role::Ray).Valid());}
  {Window w(epoch,queue,UINT32_MAX-17998,18000);assert(w.Stopped());}

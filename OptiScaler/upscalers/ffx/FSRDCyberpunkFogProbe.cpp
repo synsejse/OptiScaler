@@ -2292,7 +2292,11 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
         plan->provenance["ray_owner"] = plan->rayOwner;
         return plan;
     }
-    catch (const std::exception& error) { plan->provenance["reason"] = error.what(); }
+    catch (const std::exception& error) {
+        plan->provenance["reason"] = error.what();
+        if (plan->packet && plan->packet->temporal)
+            LOG_WARN("[FSRRR continuous] ray preparation refused before state requests: {}", error.what());
+    }
     catch (...) { plan->provenance["reason"] = "ray-copy preparation threw"; }
     if (plan->packet) FailPacket(plan->packet);
     else if (auto window = temporalWindow.load(std::memory_order_acquire))
@@ -5953,6 +5957,26 @@ void RetireVisualWatch(TemporalWindow& window, PrivateResetPacket& frame)
     }
 }
 
+bool RetireUnrecordedTemporalFrame(TemporalWindow& window, const std::shared_ptr<PrivateResetPacket>& frame)
+{
+    if (!window.continuous || !window.stopped) return false;
+    // Same frame -> controller lock order as ClaimPrivateReset/PacketPolicy.
+    // A zero-recording proof and CPU quiescence must hold together, not in
+    // separate snapshots between which a recording callback could run.
+    std::lock_guard frameLock(frame->mutex);
+    std::lock_guard windowLock(window.mutex);
+    auto& slot = window.frames[frame->temporalKey.index % window.frames.size()];
+    if (slot.get() != frame.get() || slot.use_count() != 2 || !window.policy ||
+        window.returnEvidencePending || frame->producer.list || frame->consumer.list ||
+        frame->rayTerminal || frame->guideBegin || frame->rayCopy || frame->finalTicket || frame->denoise ||
+        frame->sceneRecorded || frame->consumerSealed || frame->returned || frame->retired ||
+        !window.policy->RetireUnrecordedFrame(frame->temporalKey, true)) return false;
+    std::erase(window.liveFrames, frame.get());
+    slot.reset(); // Snapshot keeps all COM-backed allocation destruction outside the locks.
+    window.restartRequested = true;
+    return true;
+}
+
 void MaintainTemporalWindow(TemporalWindow& window)
 {
     // No waits and no provider/native calls under the controller lock. Bounded
@@ -5969,6 +5993,12 @@ void MaintainTemporalWindow(TemporalWindow& window)
     for (const auto& frame : frames)
     {
         if (!frame) continue;
+        if (RetireUnrecordedTemporalFrame(window, frame))
+        {
+            LOG_INFO("[FSRRR continuous] released wholly unrecorded frame {}; fresh history requested",
+                     frame->temporalKey.frame);
+            continue;
+        }
         std::shared_ptr<FSRDSubmission::Ticket> ticket;
         std::shared_ptr<FSRDSubmission::Ticket> producerTicket;
         bool unusedProducer = false;

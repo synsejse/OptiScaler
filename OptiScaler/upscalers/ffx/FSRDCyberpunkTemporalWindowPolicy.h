@@ -320,6 +320,25 @@ class Window
     }
     size_t SubmissionWatches() const noexcept { return _watches.size(); }
 
+    // Admission/preparation can fail before any private command was recorded.
+    // This is not cancellation of submitted work: host must independently prove
+    // no producer/guide/copy/consumer recording, ticket, or CPU callback exists.
+    bool RetireUnrecordedFrame(FrameKey key, bool noGpuRecording) noexcept
+    {
+        const auto* frame = FindConst(key);
+        if (!Continuous() || !_stopped || !noGpuRecording || !frame ||
+            frame->policy->ProducerDeclared() || frame->policy->ConsumerEmbedded() ||
+            frame->producer.list || frame->consumer.list) return false;
+        for (const auto& call : _calls)
+            if (call.receipt.Valid())
+                for (uint32_t i = 0; i < call.count; ++i)
+                    if (call.entries[i].index == key.index) return false;
+        const auto found = std::find(_watches.begin(), _watches.end(), key.index);
+        if (found == _watches.end()) return false;
+        _watches.erase(found); Clear(key.index);
+        return true;
+    }
+
   private:
     static constexpr uint8_t RoleBit(Role role) noexcept
     { return role == Role::Ray ? 1 : role == Role::Guides ? 2 : role == Role::Fog ? 4 : 0; }
