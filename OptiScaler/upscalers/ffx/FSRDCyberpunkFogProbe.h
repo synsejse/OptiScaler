@@ -34,6 +34,12 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept;
 // actual identity is tested from the snapshots, NOT assumed. No guide/RESET packet,
 // denoised scene substitution, or change to the ordinary late RR/SR route.
 void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept;
+// Explicit disabled-by-default FSRRR-prefog-temporal.request experiment: one
+// persistent Session, at most 32 consecutive native source frames, first RESET
+// then owned previous camera. Requires restart-fixed late SR. Timing is the
+// selected original Fog draw CPU interval, not an authenticated engine delta.
+// Poll also retires fence-complete owners; it never waits or enables a fallback.
+void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height) noexcept;
 // Mandatory dependency veto BEFORE both native Execute branches and their
 // FSRDSubmission::Preparing calls. A refusal terminates this authenticated game
 // diagnostic, never drops a native list or pretends that submission succeeded.

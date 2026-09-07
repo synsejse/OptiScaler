@@ -633,6 +633,8 @@ void FSRDFeatureDx12::PollPreFogExperiments()
             FSRDCyberpunkFogProbe::ArmPrivateReset(Device, RenderWidth(), RenderHeight());
         if (_denoiser.IsCreated())
             FSRDCyberpunkFogProbe::ArmRgbIdentity(Device, RenderWidth(), RenderHeight());
+        if (_denoiser.IsCreated())
+            FSRDCyberpunkFogProbe::PollTemporalWindow(Device, RenderWidth(), RenderHeight());
     }
 }
 

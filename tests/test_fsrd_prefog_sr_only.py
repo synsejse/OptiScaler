@@ -139,7 +139,9 @@ struct Config{
  static Config* Instance(){static Config c;return &c;}
 };
 namespace Util{inline double now=100;double MillisecondsNow(){return now;}}
-namespace FSRDCyberpunkFogProbe{inline int resets=0,identities=0;void ArmPrivateReset(void*,unsigned,unsigned){++resets;}void ArmRgbIdentity(void*,unsigned,unsigned){++identities;}}
+namespace FSRDCyberpunkFogProbe{inline int resets=0,identities=0,temporal=0;
+void ArmPrivateReset(void*,unsigned,unsigned){++resets;}void ArmRgbIdentity(void*,unsigned,unsigned){++identities;}
+void PollTemporalWindow(void*,unsigned,unsigned){++temporal;}}
 struct NVSDK_NGX_Parameter{
  std::array<float,16> projection{1.3f,0,0,0,0,2.2f,0,0,0,0,1.000001f,1,0,0,-.02f,0};
  bool hasProjection=true,hasDelta=true,hasExplicit=false,failBefore=false,failAfter=false,throws=false;
@@ -194,7 +196,7 @@ int main(){
  assert(std::abs(f.dispatched.cameraFovAngleVertical-float(2*std::atan(1.0/2.2)))<1e-6f);
  assert(!f._preFogSrScalarOverride&&!f._upscaleColorOverride&&!f._frameShowNativeDebug);
  assert(f._hasCameraHistory); // RR camera state was not committed/consumed by late SR.
- assert(FSRDCyberpunkFogProbe::resets==1&&FSRDCyberpunkFogProbe::identities==1);
+ assert(FSRDCyberpunkFogProbe::resets==1&&FSRDCyberpunkFogProbe::identities==1&&FSRDCyberpunkFogProbe::temporal==1);
  assert(f.EvaluateInternal(&list,&p)&&!f.dispatched.reset&&f._frameCount==2);
  p.reset=7;assert(f.EvaluateInternal(&list,&p)&&f.dispatched.reset);p.reset=0;
  p.width=1000;assert(f.EvaluateInternal(&list,&p)&&f.dispatched.reset);
@@ -225,7 +227,9 @@ int main(){
  assert(f.EvaluateInternal(&list,&p)&&f.dispatched.frameTimeDelta==13&&f.dispatched.reset);
  // Missing early provider/disabled controls affect polling only, never select late RR.
  f._denoiser.created=false;auto polls=FSRDCyberpunkFogProbe::resets;Util::now+=16;
+ const auto temporalPolls=FSRDCyberpunkFogProbe::temporal;
  assert(f.EvaluateInternal(&list,&p)&&FSRDCyberpunkFogProbe::resets==polls&&!f.ordinaryRrCalls);
+ assert(FSRDCyberpunkFogProbe::temporal==temporalPolls);
  FSRD::PreFogSession::Freeze(false);FSRDFeatureDx12 recreated;p.hasDelta=true;
  assert(recreated.EvaluateInternal(&list,&p)&&recreated.dispatched.reset&&!recreated.ordinaryRrCalls);
  f.inited=false;const auto previous=f.baseCalls;assert(!f.EvaluateInternal(&list,&p)&&f.baseCalls==previous);

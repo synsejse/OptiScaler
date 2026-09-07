@@ -67,13 +67,16 @@ class PrivateResetHost(unittest.TestCase):
         self.assertLess(record.index('packet->denoise = work'), record.index('policy.EmbedConsumer('))
         self.assertLess(record.index('policy.EmbedConsumer('), record.index('Transition(list, plan.layers.before'))
         self.assertLess(record.index('plan.layers.before.state = readable'), record.index('work->Record(list)'))
-        self.assertIn('if (!complete) FailPrivateReset()', record)
+        self.assertIn('if (!complete) FailPacket(packet)', record)
+        self.assertIn('auto* packet = plan.packet ? plan.packet : privateResetPacket.load', record)
         self.assertIn('ScopeLostAfterMutation)', record)
         self.assertIn('PrivateResetFatal();', record)
         self.assertNotIn('originalDraw(', record)
         capture_plan = body(HOST, 'struct CapturePlan\n', '\n};')
         self.assertNotIn('PrivateDenoise::Work', capture_plan)
-        self.assertNotIn('PrivateResetPacket', capture_plan)
+        self.assertIn('PrivateResetPacket* packet', capture_plan)
+        self.assertNotIn('shared_ptr<PrivateResetPacket>', capture_plan)
+        self.assertNotIn('unique_ptr<PrivateResetPacket>', capture_plan)
         feature = (BASE / 'FSRDFeature_Dx12.cpp').read_text()
         poll = body(feature, 'void FSRDFeatureDx12::PollPreFogExperiments()',
                     'bool FSRDFeatureDx12::EvaluatePreFogSrOnly(')
@@ -103,8 +106,10 @@ class PrivateResetHost(unittest.TestCase):
         self.assertIn('seal.guidesRestored = result.bindingsRestored', lighting)
         self.assertIn('seal.rayTerminal = packet->rayTerminal', lighting)
         fog = body(HOST, 'void FinishCapture(', 'bool MatchesFinalLightingDraw(')
-        self.assertLess(fog.index('FSRDFogLayerCapture::Record('), fog.index('policy.SealConsumer('))
-        self.assertIn('(packet->sceneResetOnce && !plan->sceneResetWritten)', fog)
+        disk = fog[fog.index('    CopyMain(list, *plan, plan->layers.after.resource.Get());'):]
+        self.assertLess(disk.index('FSRDFogLayerCapture::Record('), disk.index('policy.SealConsumer('))
+        self.assertIn('((packet->sceneResetOnce || packet->temporal) && !plan->sceneResetWritten)', disk)
+        self.assertIn('if (plan->temporal && !plan->captureFinal)', fog[:fog.index('    CopyMain(')])
         draw = body(HOST, 'void WINAPI HookDraw(', 'void WINAPI HookDrawIndexed(')
         self.assertEqual(draw.count('originalDraw(list, count, instances, start, firstInstance);'), 1)
         self.assertLess(draw.index('PrepareCapture('), draw.index('originalDraw('))
@@ -141,6 +146,12 @@ struct ID3D12CommandList:IUnknown{};
 struct ID3D12CommandQueue:IUnknown{IUnknown* device=nullptr;bool deviceFail=false;int type=0;
  HRESULT GetDevice(IUnknown** out){if(deviceFail)return -1;*out=device;device->AddRef();return 0;}
  struct Desc{int Type;};Desc GetDesc(){return{type};}};
+// This fixture preserves the ordinary one-shot path. Temporal routing is
+// separately compiled against real Window policy in test_fsrd_temporal_host.
+struct TemporalWindow{};std::atomic<TemporalWindow*> temporalWindow{nullptr};
+constexpr uint64_t TemporalToken=1ull<<63;
+uint64_t AdmitTemporalSubmission(TemporalWindow&,ID3D12CommandQueue*,UINT,ID3D12CommandList* const*){assert(false);return 0;}
+void ReturnedTemporalSubmission(TemporalWindow&,uint64_t){assert(false);}
 namespace ResetPolicy=FSRD::CyberpunkPrivateResetPolicy;
 struct PrivateResetPacket{std::mutex mutex;ResetPolicy::Policy policy;ComPtr<IUnknown> queueIdentity;
  explicit PrivateResetPacket(uintptr_t device):policy(device){}};

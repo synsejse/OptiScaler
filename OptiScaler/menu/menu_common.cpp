@@ -2827,8 +2827,8 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         {
             if (FSRD::PreFogSession::LateSrOnly())
             {
-                ImGui::TextWrapped("Pre-Fog experiment: late SR only. Early denoising is one-shot, not continuous.");
-                ShowHelpMarker("Frames without the explicit early scene test remain noisy.\n"
+                ImGui::TextWrapped("Pre-Fog experiment: late SR only. Early denoising runs only during explicit bounded tests.");
+                ShowHelpMarker("Outside the one-frame or 32-frame early test, frames remain noisy.\n"
                                "No late denoiser fallback; RR debug controls are inactive. Restart to change this route.");
             }
             if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())

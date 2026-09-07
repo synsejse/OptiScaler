@@ -231,6 +231,10 @@ class Window
     { const auto* frame = FindConst(key); return frame && frame->policy->ConsumerEmbedded(); }
     bool ConsumerReturned(FrameKey key) const noexcept
     { const auto* frame = FindConst(key); return frame && frame->policy->ConsumerReturned(); }
+    // A soft window stop must not poison a previously embedded valid frame.
+    // Invalid keys fail closed without changing any existing frame obligation.
+    bool FrameFailed(FrameKey key) const noexcept
+    { const auto* frame = FindConst(key); return !frame || frame->policy->Failed(); }
 
   private:
     static constexpr uint8_t RoleBit(Role role) noexcept

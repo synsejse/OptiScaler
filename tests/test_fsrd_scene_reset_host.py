@@ -31,7 +31,7 @@ class SceneResetHost(unittest.TestCase):
         self.assertLess(arm.index('DeleteFileW(path.c_str())'), arm.index('privateResetPacket.store('))
         capture = section('std::shared_ptr<CapturePlan> PrepareCapture(', 'void PublishFogEndpoint(')
         self.assertIn('plan->sceneResetOnce = resetPacket && resetPacket->sceneResetOnce', capture)
-        self.assertIn('(plan->sceneResetOnce && (rgbPacket || !FSRD::PreFogSession::LateSrOnly()))', capture)
+        self.assertIn('((plan->sceneResetOnce || plan->temporal) && (rgbPacket || !FSRD::PreFogSession::LateSrOnly()))', capture)
         self.assertLess(capture.index('IsFullRgbViewport(state,'), capture.index('captureStarted.exchange(true)'))
         self.assertIn('if (plan->rgbIdentity)\n    {\n        allocate(beforeDesc,', capture)
         scene = section('void RecordSceneReset(', 'void RecordPrivateReset(')
@@ -42,8 +42,10 @@ class SceneResetHost(unittest.TestCase):
         self.assertIn('"native_target_alpha_unwritten"', scene)
         self.assertIn('"independent_one_shot_RESET_only"', scene)
         plan = section('struct CapturePlan\n', 'bool SameEarlyReservation(')
-        for forbidden in ('PrivateDenoise::Work', 'FogRgbWrite::Work', 'PrivateResetPacket'):
+        for forbidden in ('PrivateDenoise::Work', 'FogRgbWrite::Work', 'shared_ptr<PrivateResetPacket>',
+                          'unique_ptr<PrivateResetPacket>'):
             self.assertNotIn(forbidden, plan)
+        self.assertIn('PrivateResetPacket* packet', plan)
 
     def test_actual_private_then_scene_order_and_complete_consumer_guard(self):
         record = section('void RecordPrivateReset(', 'std::shared_ptr<CapturePlan> PrepareCapture(')
@@ -52,11 +54,12 @@ class SceneResetHost(unittest.TestCase):
                   '["scene_modified"] = plan.sceneResetWritten', 'attempted.complete = true')
         indices = [record.index(point) for point in points]
         self.assertEqual(indices, sorted(indices))
-        self.assertIn('~RefuseIncomplete() { if (!complete) FailPrivateReset(); }', record)
+        self.assertIn('~RefuseIncomplete() { if (!complete) FailPacket(packet); }', record)
         self.assertNotIn('catch (', record)  # No partial-write fallback can complete the obligation.
         finish = section('void FinishCapture(', 'bool MatchesFinalLightingDraw(')
-        self.assertLess(finish.index('FSRDFogLayerCapture::Record('), finish.index('policy.SealConsumer('))
-        self.assertIn('!recorded || (packet->sceneResetOnce && !plan->sceneResetWritten) ||', finish)
+        disk = finish[finish.index('    CopyMain(list, *plan, plan->layers.after.resource.Get());'):]
+        self.assertLess(disk.index('FSRDFogLayerCapture::Record('), disk.index('policy.SealConsumer('))
+        self.assertIn('!recorded || ((packet->sceneResetOnce || packet->temporal) && !plan->sceneResetWritten) ||', disk)
         draw = section('void WINAPI HookDraw(', 'void WINAPI HookDrawIndexed(')
         self.assertEqual(draw.count('originalDraw(list, count, instances, start, firstInstance);'), 1)
         self.assertLess(draw.index('PrepareCapture('), draw.index('originalDraw('))
@@ -75,10 +78,11 @@ class SceneResetHost(unittest.TestCase):
         seal_start = finish.index('    if (plan->layers.privateReset[0].resource)')
         seal_end = finish.index('    {\n        const auto status', seal_start)
         functions += '\nvoid Seal(const std::shared_ptr<CapturePlan>& plan, bool recorded) {\n'
+        functions += 'auto* selected = plan->packet ? plan->packet : privateResetPacket.load();\n'
         functions += finish[seal_start:seal_end] + '\n}\n'
         guard = section('    struct RefuseIncomplete\n', '    if (!plan.depthPrepared')
-        functions += '\nvoid ControlledScene(ID3D12GraphicsCommandList* list, CapturePlan& plan, PrivateResetPacket& packet) {\n'
-        functions += guard + '\nRecordSceneReset(list, plan, packet);\nattempted.complete = true;\n}\n'
+        functions += '\nvoid ControlledScene(ID3D12GraphicsCommandList* list, CapturePlan& plan, PrivateResetPacket& value) {\nauto* packet = &value;\n'
+        functions += guard + '\nRecordSceneReset(list, plan, *packet);\nattempted.complete = true;\n}\n'
         mocks = r'''
 #include <json.hpp>
 #include <array>
@@ -102,14 +106,18 @@ template<class T>struct ComPtr{T* p=nullptr;T* Get()const{return p;}T* operator-
 struct Handle{uintptr_t ptr=100;};struct View{};struct Viewport{};struct Rect{};
 struct Texture{ComPtr<Resource> resource;D3D12_RESOURCE_STATES state=0xc0;};
 struct Endpoint{ComPtr<IUnknown> list;};
+struct PrivateResetPacket;
+namespace FSRDFogLayerCapture{struct Layers{enum class PrivateOutputMode{IndependentReset,TemporalWindowFinalSceneControl32};};}
 struct CapturePlan{
  bool rgbIdentity=false,sceneResetOnce=true,sceneResetWritten=false;
+ bool temporal=false,captureFinal=false;PrivateResetPacket* packet=nullptr; // Legacy fixture keeps temporal disabled.
  ComPtr<Device> device;ComPtr<Resource> main;ComPtr<Pso> originalPso;Handle frozenOriginalRtv;View originalView;
  struct{std::array<Viewport,1> viewports;std::array<Rect,1> scissors;uint64_t generation=12;}drawState;
  struct{uint32_t handle=7;uintptr_t native=0x1000;
   struct{uint64_t serial=2,recordingGeneration=12;uintptr_t list=0,view=0x3000;}scope;}depthSnapshot;
  uintptr_t depthFrameObject=0x4000;uint32_t depthFrame=99;
- struct{std::array<Texture,3> privateReset;bool privateResetSceneWrite=false;}layers;
+ struct{std::array<Texture,3> privateReset;bool privateResetSceneWrite=false;
+  FSRDFogLayerCapture::Layers::PrivateOutputMode privateOutputMode=FSRDFogLayerCapture::Layers::PrivateOutputMode::IndependentReset;}layers;
  std::shared_ptr<Endpoint> endpoint=std::make_shared<Endpoint>();Json provenance;
 };
 struct Recording{uintptr_t list;uint64_t generation;};
@@ -121,6 +129,7 @@ struct DenoiseWork{bool recorded=true;struct Data{ComPtr<Resource> composed;}dat
  bool Recorded()const{return recorded;}const Data& Outputs()const{return data;}};
 struct PrivateResetPacket{
  std::mutex mutex;bool sceneResetOnce=true,fogClaimed=true;UINT width=4,height=4;
+ void* temporal=nullptr;bool sceneRecorded=false,consumerSealed=false;
  std::shared_ptr<DenoiseWork> denoise=std::make_shared<DenoiseWork>();ComPtr<IUnknown> consumerIdentity,deviceIdentity;Policy policy;
 };
 std::atomic<PrivateResetPacket*> privateResetPacket{nullptr};std::atomic<void*> rgbIdentityPacket{nullptr};
@@ -162,6 +171,7 @@ std::shared_ptr<Work> Prepare(Device* device,UINT width,UINT height,const ComPtr
 }
 uint64_t PrivateResetPoint(IUnknown* list,uint64_t generation){assert(list&&generation==12);return 18;}
 void FailPrivateReset(){++failedPackets;if(auto* packet=privateResetPacket.load())packet->policy.failed=true;}
+void FailPacket(PrivateResetPacket* packet){++failedPackets;assert(packet);packet->policy.failed=true;}
 [[noreturn]]void PrivateResetFatal()noexcept{std::_Exit(79);}
 '''
         harness = r'''
@@ -170,6 +180,7 @@ Pso pso;ID3D12GraphicsCommandList list;PrivateResetPacket packet;
 void Setup(CapturePlan& plan){
  plan=CapturePlan{};events.clear();route=targetValid=codeValid=true;prepareFailure=recordFailure=recordThrow=false;sceneMode=failedPackets=0;
  privateResetPacket=&packet;rgbIdentityPacket=nullptr;packet.sceneResetOnce=packet.fogClaimed=true;packet.policy=Policy{};
+ packet.temporal=nullptr;packet.sceneRecorded=packet.consumerSealed=false;
  packet.denoise=std::make_shared<DenoiseWork>();packet.denoise->data.composed={&composedResource};
  packet.consumerIdentity={&listIdentity};packet.deviceIdentity={&deviceIdentity};
  plan.device={&device};plan.main={&mainResource};plan.originalPso={&pso};plan.endpoint->list={&listIdentity};

@@ -34,7 +34,7 @@ inline bool LateSrOnly() noexcept { return processRoute.LateSrOnly(); }
 inline std::string_view StatusText() noexcept
 {
     return LateSrOnly()
-        ? "Pre-Fog experiment: late SR only; early scene denoising is one-shot and NOT guaranteed for this frame. Missing early work remains noisy; no late RR fallback."
+        ? "Pre-Fog experiment: late SR only; early scene denoising uses explicit bounded tests and is NOT guaranteed for this frame. Missing early work remains noisy; no late RR fallback."
         : "Ordinary late ray regeneration; pre-Fog scene experiment disabled.";
 }
 

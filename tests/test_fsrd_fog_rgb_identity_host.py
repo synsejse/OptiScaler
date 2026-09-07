@@ -53,13 +53,21 @@ class FogRgbIdentityHost(unittest.TestCase):
         self.assertLess(capture.index('IsFullRgbViewport(state,'), capture.index('captureStarted.exchange(true)'))
         self.assertIn('desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.MipLevels != 1', capture)
         self.assertIn('nativeCaller != authenticatedImage.load() + FSRD::CyberpunkFogDepth::DrawReturnRva', capture)
-        self.assertIn('copyCount = plan->rgbIdentity ? 3 : 2', capture)
+        self.assertIn('const bool diskCapture = !temporal || plan->captureFinal;', capture)
+        self.assertIn('copyCount = plan->rgbIdentity ? 3 : (diskCapture ? 2 : 1)', capture)
+        # Identity still owns all three native snapshots. Only intermediate
+        # temporal frames omit the after/authored disk-only textures.
+        self.assertRegex(capture, r'if \(diskCapture\)\s*\{\s*allocate\(beforeDesc,[^\n]+plan->layers.after\);\s*'
+                                  r'allocate\(authoredDesc,[^\n]+plan->layers.authored\);')
         self.assertIn('mainBytes + copyCount * copyBytes + authoredBytes', capture)
         self.assertLess(capture.index('FSRDSubmission::Retain('), capture.index('CopyMain(list,'))
         self.assertLess(capture.index('CopyMain(list,'), capture.index('RecordRgbIdentity(list,'))
         self.assertRegex(capture, r'if \(plan->rgbIdentity\)\s*RecordRgbIdentity\([^\n]+\n\s*else\s*\{\s*RecordPrivateReset')
         plan = section('struct CapturePlan\n', 'bool SameEarlyReservation(')
         self.assertNotIn('FogRgbWrite::Work', plan)
+        self.assertIn('PrivateResetPacket* packet = nullptr;', plan)
+        self.assertNotRegex(plan, r'(?:shared_ptr|unique_ptr)<PrivateResetPacket>')
+        self.assertNotIn('PrivateDenoise::Work', plan)
         record = section('void RecordRgbIdentity(', 'void PrepareFogDepth(')
         self.assertIn('RecordSceneRgb(host, input, [&] { return work->Record(list); })', record)
         self.assertNotIn('RecordPrivateCompute(', record)

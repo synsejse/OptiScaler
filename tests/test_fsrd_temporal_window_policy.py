@@ -134,6 +134,7 @@ int main(){
   changed.generation=0;assert(!submit(w,{changed}).allowed&&w.ConsumerEmbedded(key));}
  // Explicit stop still permits existing producer closures and valid recorded consumers to drain.
  {Window w(epoch,queue,first);auto key=fog(w,0);w.Stop();assert(w.Stopped()&&w.ConsumerEmbedded(key));
+  assert(!w.FrameFailed(key)&&w.FrameFailed({})&&w.FrameFailed({epoch+1,0,first}));
   assert(!w.ClaimRole(first+1,Role::Ray).Valid());assert(!w.ClaimRole(first,Role::Fog).Valid());
   assert(producers(w,0)==key);auto s=submit(w,{producer(0),consumer(0)});assert(s.allowed);
   auto r=w.AfterExecute(s.receipt);assert(r.allowed&&r.consumer==key&&!w.CommitConsumer(key));}
@@ -143,7 +144,7 @@ int main(){
   assert(!w.ClaimRole(first,Role::Fog).Valid());}
  // Failure after recording does not clear an obligation or authorize its native submission.
  {Window w(epoch,queue,first);auto key=producers(w,0);fog(w,0);w.FailFrame(key);
-  assert(w.Stopped()&&w.ConsumerEmbedded(key)&&!submit(w,{producer(0),consumer(0)}).allowed);}
+  assert(w.Stopped()&&w.FrameFailed(key)&&w.ConsumerEmbedded(key)&&!submit(w,{producer(0),consumer(0)}).allowed);}
  {Window w(epoch,queue,first);auto key=producers(w,0);assert(w.ClaimRole(first,Role::Fog)==key);
   assert(w.EmbedConsumer(key,consumer(0),50,true));assert(!w.SealConsumer(key,consumer(0),60,false,true));
   assert(w.ConsumerEmbedded(key)&&!submit(w,{producer(0),consumer(0)}).allowed);}
