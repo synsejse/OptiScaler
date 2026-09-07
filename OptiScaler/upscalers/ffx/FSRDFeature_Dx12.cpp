@@ -10,6 +10,7 @@
 #include "FSRDInputMath.h"
 #include "FSRDInputValidation.h"
 #include "FSRDResearchCapture.h"
+#include "FSRDCyberpunkFogProbe.h"
 #include <json.hpp>
 
 using namespace DirectX;
@@ -716,6 +717,17 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     ffxDispatchDescDenoiserInput1Signal fusedSignal = {};
     ffxDispatchDescDenoiser denoiserDesc = {};
     bool isDenoiserReady = false;
+
+    if (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
+        cfg.FfxDenoiserCyberpunkFogCapture.value_or_default())
+    {
+        ID3D12Resource* color = nullptr;
+        ID3D12Resource* beforeParticles = nullptr;
+        TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Color, color);
+        TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles, beforeParticles);
+        FSRDCyberpunkFogProbe::ObserveNgxInput(InCommandList, color, beforeParticles,
+                                             Handle()->Id, _frameCount, RenderWidth(), RenderHeight());
+    }
 
     // Pull configuration and input buffers for DLSS-RR from the param table, convert and
     // repack input buffers into intermediate FSR-RR input buffers, and configure descriptors.

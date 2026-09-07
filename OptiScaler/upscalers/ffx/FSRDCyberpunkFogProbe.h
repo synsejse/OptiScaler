@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d12.h>
+#include <cstdint>
 
 // Research-only probe for one authenticated Cyberpunk executable. Metadata-only
 // unless the separate CyberpunkFogCapture INI opt-in AND an explicit one-shot
@@ -16,4 +17,11 @@ namespace FSRDCyberpunkFogProbe
 void Initialize(bool enabled);
 void HookDevice(ID3D12Device* device);
 void HookCommandList(ID3D12GraphicsCommandList* commandList);
+// Call before RR input conversion with the actual NGX resource pointers. No-op
+// except for eight endpoint observations after an explicitly requested fog capture.
+// Reports resource identity and local recording order, NOT GPU/frame association
+// or unchanged contents. It records no GPU commands and changes no NGX inputs.
+void ObserveNgxInput(ID3D12GraphicsCommandList* commandList, ID3D12Resource* color,
+                     ID3D12Resource* colorBeforeParticles, uint64_t featureId, uint64_t frameIndex,
+                     UINT renderWidth, UINT renderHeight) noexcept;
 } // namespace FSRDCyberpunkFogProbe

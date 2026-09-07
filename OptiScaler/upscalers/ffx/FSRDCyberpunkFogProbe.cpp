@@ -52,6 +52,8 @@ constexpr SIZE_T FogVertexBytes = 2361;
 constexpr std::string_view FogVertexSha256 = "174ce05e0a97ce65f80358b2a01bbadea4c314fb386cfac6064940a870f91a5a";
 constexpr size_t MaxRtvHeaps = 64, MaxRtvSlots = 65536, MaxCommandLists = 128;
 constexpr UINT64 MaxCaptureTextureBytes = 256ull * 1024 * 1024;
+constexpr unsigned MaxNgxEndpoints = 8;
+constexpr UINT64 MaxEndpointResourceBytes = 256ull * 1024 * 1024;
 
 // Runtime loading avoids adding another DLL import to ordinary, probe-off builds.
 struct CryptoApi
@@ -150,11 +152,24 @@ struct Query
 struct ListState
 {
     uint64_t generation = 0;
+    // Ordinal of observed endpoints only, not of every command or GPU event.
+    uint64_t endpointOrdinal = 0;
     bool known = false, predicated = false, renderPass = false;
     std::array<Query, 64> queries {};
     UINT queryCount = 0, viewportCount = 0, scissorCount = 0;
     std::array<D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports {};
     std::array<D3D12_RECT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors {};
+};
+struct EndpointTrace
+{
+    ComPtr<IUnknown> list;
+    // The first owned identity is the captured fog target. Keeping identities
+    // alive through this short window prevents address recycling between logs.
+    std::vector<ComPtr<IUnknown>> resources;
+    Json fog;
+    uint64_t generation = 0, ordinal = 0;
+    UINT64 resourceBytes = 0;
+    unsigned count = 0;
 };
 struct Registry
 {
@@ -163,6 +178,7 @@ struct Registry
     std::vector<TaggedPso> tagged;
     std::vector<RtvHeap> heaps;
     std::unordered_map<IUnknown*, ListState> lists;
+    std::shared_ptr<EndpointTrace> endpoint;
     size_t slots = 0;
     uint64_t nextHeap = 0, nextSlot = 0, nextRecording = 0;
 };
@@ -178,6 +194,7 @@ std::atomic<bool> active { false };
 std::atomic<bool> captureEnabled { false }, captureTrackingValid { true };
 std::atomic<unsigned> captureRefusalLogs { 0 };
 std::atomic<bool> captureStarted { false };
+std::atomic<bool> endpointActive { false };
 std::atomic<unsigned> drawLogs { 0 }, emptyLogs { 0 };
 std::atomic<unsigned> arm { 0 };
 std::atomic<uint64_t> scopes { 0 };
@@ -403,6 +420,55 @@ ComPtr<IUnknown> ListIdentity(ID3D12GraphicsCommandList* list)
     if (!list || FAILED(list->QueryInterface(IID_PPV_ARGS(&identity))))
         throw std::runtime_error("command-list COM identity unavailable");
     return identity;
+}
+
+ComPtr<IUnknown> EndpointListIdentity(ID3D12GraphicsCommandList* list)
+{
+    if (!list)
+        throw std::runtime_error("NGX command list unavailable");
+    // Same authenticated wrapper interface used by ResTrack::PrepareSubmission,
+    // without installing queue hooks or emitting a submission/fence operation.
+    static constexpr IID nativeListIid = {
+        0xadec44e2, 0x61f0, 0x45c3, { 0xad, 0x9f, 0x1b, 0x37, 0x37, 0x92, 0x84, 0xff }
+    };
+    ComPtr<IUnknown> native, identity;
+    IUnknown* object = list;
+    if (SUCCEEDED(list->QueryInterface(nativeListIid, reinterpret_cast<void**>(native.GetAddressOf()))) && native)
+        object = native.Get();
+    if (FAILED(object->QueryInterface(IID_PPV_ARGS(&identity))))
+        throw std::runtime_error("NGX command-list COM identity unavailable");
+    return identity;
+}
+
+Json OwnEndpointResource(EndpointTrace& trace, ID3D12Resource* resource)
+{
+    if (!resource)
+        return nullptr;
+    ComPtr<IUnknown> identity;
+    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&identity))))
+        throw std::runtime_error("NGX resource COM identity unavailable");
+    const auto desc = resource->GetDesc();
+    if (std::none_of(trace.resources.begin(), trace.resources.end(),
+                     [&](const auto& owned) { return owned.Get() == identity.Get(); }))
+    {
+        ComPtr<ID3D12Device> device;
+        if (FAILED(resource->GetDevice(IID_PPV_ARGS(&device))))
+            throw std::runtime_error("NGX resource device unavailable");
+        const auto bytes = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        if (trace.resources.size() >= 1 + 2 * MaxNgxEndpoints || bytes > MaxEndpointResourceBytes ||
+            trace.resourceBytes > MaxEndpointResourceBytes - bytes)
+            throw std::runtime_error("endpoint resource ownership budget exhausted");
+        trace.resources.push_back(identity);
+        trace.resourceBytes += bytes;
+    }
+    return { { "address", std::format("{:x}", uintptr_t(resource)) },
+        { "canonical_identity", std::format("{:x}", uintptr_t(identity.Get())) },
+        { "matches_fog_resource", !trace.resources.empty() && identity.Get() == trace.resources.front().Get() },
+        { "description", { { "dimension", UINT(desc.Dimension) }, { "alignment", desc.Alignment },
+            { "width", desc.Width }, { "height", desc.Height }, { "depth_or_array_size", desc.DepthOrArraySize },
+            { "mip_levels", desc.MipLevels }, { "format", UINT(desc.Format) },
+            { "sample_count", desc.SampleDesc.Count }, { "sample_quality", desc.SampleDesc.Quality },
+            { "layout", UINT(desc.Layout) }, { "flags", UINT(desc.Flags) } } } };
 }
 
 HRESULT WINAPI HookCreateList(ID3D12Device* device, UINT nodeMask, D3D12_COMMAND_LIST_TYPE type,
@@ -700,6 +766,7 @@ struct CapturePlan
     BOOL contiguous = FALSE;
     FSRDFogLayerCapture::Layers layers;
     Json provenance;
+    std::shared_ptr<EndpointTrace> endpoint;
 };
 
 void RefuseCapture(const char* reason)
@@ -749,6 +816,7 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         return {};
     }
     auto plan = std::make_shared<CapturePlan>();
+    plan->endpoint = std::make_shared<EndpointTrace>();
     ListState state;
     {
         const auto identity = ListIdentity(list);
@@ -786,6 +854,9 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         plan->originalPso = foundPso->pso;
         plan->authoredPso = foundPso->authored;
         plan->root = foundPso->root;
+        plan->endpoint->list = identity;
+        plan->endpoint->generation = state.generation;
+        plan->endpoint->ordinal = ++foundState->second.endpointOrdinal;
         const auto& b = foundPso->blend;
         plan->provenance = {
             { "schema", "optiscaler.fsr_rr.fog_draw.v1" }, { "scope_serial", s.serial }, { "scope_arm", arm.load() },
@@ -845,6 +916,16 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     if (mainBytes > MaxCaptureTextureBytes || copyBytes > MaxCaptureTextureBytes || authoredBytes > MaxCaptureTextureBytes ||
         mainBytes + 2 * copyBytes + authoredBytes > MaxCaptureTextureBytes)
         throw std::runtime_error("fog capture retained texture allocation exceeds 256 MiB");
+    plan->endpoint->fog = {
+        { "scope_serial", plan->provenance["scope_serial"] },
+        { "command_list_identity", std::format("{:x}", uintptr_t(plan->endpoint->list.Get())) },
+        { "command_list_generation", plan->endpoint->generation }, { "endpoint_ordinal", plan->endpoint->ordinal },
+        { "ordinal_scope", "observed endpoints within this Reset recording only" },
+        { "resource", OwnEndpointResource(*plan->endpoint, plan->main.Get()) },
+        { "subresource", 0 }, { "view_format", UINT(plan->originalView.Format) },
+        { "rr_frame_association", "not_established" }
+    };
+    plan->provenance["endpoint_origin"] = plan->endpoint->fog;
     const CD3DX12_HEAP_PROPERTIES properties(D3D12_HEAP_TYPE_DEFAULT);
     auto allocate = [&](const D3D12_RESOURCE_DESC& textureDesc, D3D12_RESOURCE_STATES initial,
                          FSRDFogLayerCapture::Texture& output) {
@@ -878,6 +959,20 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     FSRDSubmission::Retain(plan->device.Get(), list, plan);
     CopyMain(list, *plan, plan->layers.before.resource.Get());
     return plan;
+}
+
+void PublishFogEndpoint(const std::shared_ptr<CapturePlan>& plan) noexcept
+{
+    Metadata([&] {
+        auto& data = Data();
+        {
+            std::lock_guard lock(data.mutex);
+            data.endpoint = plan->endpoint;
+            endpointActive.store(true, std::memory_order_release);
+        }
+        LOG_INFO("[FSRRR fog endpoint] original fog draw recorded; origin={}; next {} CPU-observed RR endpoints only; no GPU/frame/content association",
+                 plan->endpoint->fog.dump(), MaxNgxEndpoints);
+    });
 }
 
 void FinishCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<CapturePlan>& plan)
@@ -925,6 +1020,8 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
         });
     originalDraw(list, count, instances, start, firstInstance);
     if (plan)
+    {
+        PublishFogEndpoint(plan); // Publish only AFTER the original target draw was recorded once.
         Metadata([&] {
             try { FinishCapture(list, plan); }
             catch (const std::exception& error)
@@ -933,6 +1030,7 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
                 LOG_WARN("[FSRRR fog capture] post-draw capture stopped; earlier GPU storage retained: {}", error.what());
             }
         });
+    }
 }
 void WINAPI HookDrawIndexed(ID3D12GraphicsCommandList* list, UINT count, UINT instances, UINT start,
                             INT baseVertex, UINT firstInstance)
@@ -1134,6 +1232,74 @@ bool Authenticate(uintptr_t& entry)
     return true;
 }
 } // namespace
+
+void ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+                     ID3D12Resource* colorBeforeParticles, uint64_t featureId, uint64_t frameIndex,
+                     UINT renderWidth, UINT renderHeight) noexcept
+{
+    if (!endpointActive.load(std::memory_order_acquire))
+        return; // No COM calls, allocation, file polling or locks on the inactive path.
+    Metadata([&] {
+        std::shared_ptr<EndpointTrace> trace;
+        try
+        {
+            const auto identity = EndpointListIdentity(list);
+            Json record;
+            auto& data = Data();
+            {
+                std::lock_guard lock(data.mutex);
+                trace = data.endpoint;
+                if (!trace || trace->count >= MaxNgxEndpoints)
+                    return;
+                const unsigned index = ++trace->count;
+                const auto found = data.lists.find(identity.Get());
+                const bool recordingKnown = captureTrackingValid.load() && found != data.lists.end();
+                const uint64_t generation = recordingKnown ? found->second.generation : 0;
+                const uint64_t ordinal = recordingKnown ? ++found->second.endpointOrdinal : 0;
+                const bool sameList = identity.Get() == trace->list.Get();
+                const bool sameRecording = recordingKnown && sameList && generation == trace->generation;
+                const char* relation = !recordingKnown ? "unknown_recording" : !sameList ? "different_command_list" :
+                    !sameRecording ? "different_Reset_recording" : ordinal > trace->ordinal ?
+                    "same_recording_later_endpoint" : "same_recording_order_unestablished";
+                record = {
+                    { "schema", "optiscaler.fsr_rr.fog_ngx_endpoint.v1" },
+                    { "endpoint_index", index }, { "fog_origin", trace->fog },
+                    { "feature_id", featureId }, { "rr_frame_index", frameIndex },
+                    { "render_extent", { renderWidth, renderHeight } },
+                    { "command_list_address", std::format("{:x}", uintptr_t(list)) },
+                    { "command_list_identity", std::format("{:x}", uintptr_t(identity.Get())) },
+                    { "recording_known", recordingKnown },
+                    { "command_list_generation", recordingKnown ? Json(generation) : Json(nullptr) },
+                    { "endpoint_ordinal", recordingKnown ? Json(ordinal) : Json(nullptr) },
+                    { "local_recording_relation", relation },
+                    { "color", OwnEndpointResource(*trace, color) },
+                    { "color_before_particles", OwnEndpointResource(*trace, colorBeforeParticles) },
+                    { "ngx_view", "resource pointers only; mip/array/plane/subrect base not observed" },
+                    { "rr_frame_association", "not_established" },
+                    { "gpu_execution_order", "not_observed" }, { "intervening_writes", "not_tracked" },
+                    { "unchanged_contents", "not_verified" },
+                    { "observation_order", "CPU endpoint callbacks only; not submission or presentation order" }
+                };
+                if (trace->count == MaxNgxEndpoints)
+                {
+                    endpointActive.store(false, std::memory_order_release);
+                    data.endpoint.reset(); // Local shared owners outlive the lock and final log.
+                }
+            }
+            LOG_INFO("[FSRRR fog endpoint] NGX {}", record.dump());
+        }
+        catch (const std::exception& error)
+        {
+            endpointActive.store(false, std::memory_order_release);
+            {
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                trace = std::move(data.endpoint);
+            }
+            LOG_WARN("[FSRRR fog endpoint] observation window stopped; association incomplete: {}", error.what());
+        }
+    });
+}
 
 void Initialize(bool enabled)
 {

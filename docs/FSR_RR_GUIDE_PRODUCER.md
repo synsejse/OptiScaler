@@ -483,3 +483,42 @@ are hash-preserved. Results and progress images are in ignored
 - `per-case-brightened-raw-composed-pairs.png`
 - `far-building-per-case-brightened.png`
 - `right-building-per-case-brightened.png`
+
+### Authenticated live fog draw and RR routing
+
+The opt-in provenance build `2d0acd9b` authenticated all four exact installed
+fog pixel shaders and their common vertex shader. In the saved test scene the
+active pass uses High fog, an RGBA16F target, one non-indexed fullscreen triangle,
+no depth/stencil target, and ONE/INV_SRC_ALPHA/ADD blending for RGB and alpha.
+This confirms the traced premultiplied operator at the live draw boundary.
+
+The one-shot capture build `46f3a225` records native RGBA16F pre/post snapshots
+and the unchanged shader's authored output into private RGBA32F storage with
+blending disabled. The original draw runs once against the original target.
+Its resource/view is retained at the original RTV binding, and restoration uses
+an immutable private descriptor: a CPU RTV handle may be recycled after binding.
+Capturing requires both explicit INI opt-ins and a separate request marker;
+unsupported identity, shader, format or command-list state refuses capture.
+This is diagnostic instrumentation, not a fog correction.
+
+Executable tracing also resolves fog and ApplyDLSS through the same
+view-namespaced `color` key, `0x3d7e6258`. Fog constructs it at
+`0x14061face`; ApplyDLSS resolves it at `0x14037e25f` and passes it through
+`0x14037e2b5` to the internal tag that maps to Streamline
+`kBufferTypeScalingInputColor`. There is no explicit pre-fog replacement there.
+That is engine-key identity, not proof of identical live resources or pixels.
+
+Importantly, graph construction appends FogOverlay at `0x141d45814` and
+ApplyDLSS at `0x141d465b9`, with potentially active planar reflections,
+holograms, distortion/heat haze, clouds, transparency, screen effects and
+underwater work between them. Node class getters and engine stage strings
+authenticate these identities; construction order alone does not prove live
+execution or GPU ordering. In particular, recomposing only `F + T*denoised(pre)`
+at RR could omit legitimate later content.
+
+The next association check must link the owned fog target and exact recording
+generation to the RR input and compare native values at that boundary. Raw
+pointer equality across independent dumps, feature-local frame counters, and
+CPU timestamps are insufficient: textures persist across frames and worker
+threads can record GPU-later command lists first. Endpoint identity/order is
+reported separately from any claim that no intermediate writer changed color.

@@ -218,6 +218,72 @@ class FogProbe(unittest.TestCase):
                                ("HookEndRenderPass", "originalEndRenderPass")):
             self.assertEqual(function(hook).count(original + "("), 1)
 
+    def test_endpoint_observer_inactive_path_has_no_com_or_gpu_work(self):
+        observe = function("ObserveNgxInput")
+        self.assertLess(observe.index("if (!endpointActive.load"), observe.index("Metadata("))
+        self.assertLess(observe.index("return;"), observe.index("EndpointListIdentity("))
+        for mutation in ("->Draw", "->Dispatch", "->Copy", "->ResourceBarrier", "->SetPipelineState",
+                         "->OMSetRenderTargets", "FSRDResearch::Request", "FSRDSubmission::Retain"):
+            self.assertNotIn(mutation, observe)
+        self.assertIn("noexcept", SOURCE[SOURCE.index("void ObserveNgxInput"):].split("{", 1)[0])
+
+    def test_endpoint_origin_is_published_only_after_original_capture_draw(self):
+        draw = function("HookDraw")
+        self.assertLess(draw.index("originalDraw("), draw.index("PublishFogEndpoint(plan)"))
+        self.assertLess(draw.index("if (plan)"), draw.index("PublishFogEndpoint(plan)"))
+        publish = function("PublishFogEndpoint")
+        self.assertIn("data.endpoint = plan->endpoint", publish)
+        self.assertIn("endpointActive.store(true", publish)
+        self.assertEqual(SOURCE.count("endpointActive.store(true"), 1)
+        prepare = function("PrepareCapture")
+        self.assertLess(prepare.index("!FSRDFogLayerCapture::WantsCapture()"), prepare.index("plan->endpoint ="))
+        self.assertLess(prepare.index("OwnEndpointResource("), prepare.index("CopyMain("))
+        self.assertIn('plan->provenance["endpoint_origin"]', prepare)
+
+    def test_endpoint_recording_identity_handles_wrapper_without_submission_hooks(self):
+        identity = function("EndpointListIdentity")
+        self.assertIn("0xadec44e2, 0x61f0, 0x45c3", identity)
+        self.assertIn("0xad, 0x9f, 0x1b, 0x37, 0x37, 0x92, 0x84, 0xff", identity)
+        self.assertIn("object->QueryInterface(IID_PPV_ARGS(&identity))", identity)
+        self.assertNotIn("HookToQueue(", identity)
+        self.assertNotIn("PrepareSubmission(", identity)
+        observe = function("ObserveNgxInput")
+        self.assertIn("generation == trace->generation", observe)
+        self.assertIn("identity.Get() == trace->list.Get()", observe)
+        self.assertIn("++found->second.endpointOrdinal", observe)
+        self.assertIn("captureTrackingValid.load() && found != data.lists.end()", observe)
+        self.assertIn('"different_command_list"', observe)
+        self.assertIn('"different_Reset_recording"', observe)
+
+    def test_endpoint_identity_owners_and_logs_are_bounded(self):
+        self.assertIn("MaxNgxEndpoints = 8", SOURCE)
+        self.assertIn("MaxEndpointResourceBytes = 256ull * 1024 * 1024", SOURCE)
+        own = function("OwnEndpointResource")
+        self.assertIn("resource->QueryInterface(IID_PPV_ARGS(&identity))", own)
+        self.assertIn("trace.resources.size() >= 1 + 2 * MaxNgxEndpoints", own)
+        self.assertIn("trace.resourceBytes > MaxEndpointResourceBytes - bytes", own)
+        self.assertIn("trace.resources.push_back(identity)", own)
+        self.assertIn("identity.Get() == trace.resources.front().Get()", own)
+        for field in ("dimension", "flags", "format", "width", "height", "mip_levels",
+                      "depth_or_array_size", "sample_count", "sample_quality"):
+            self.assertIn('"' + field + '"', own)
+        observe = function("ObserveNgxInput")
+        self.assertIn("trace->count >= MaxNgxEndpoints", observe)
+        self.assertIn("trace->count == MaxNgxEndpoints", observe)
+        self.assertIn("endpointActive.store(false", observe)
+        self.assertIn("data.endpoint.reset()", observe)
+
+    def test_endpoint_trace_does_not_claim_contents_or_gpu_frame_order(self):
+        observe = function("ObserveNgxInput")
+        for statement in ('{ "rr_frame_association", "not_established" }',
+                          '{ "gpu_execution_order", "not_observed" }',
+                          '{ "intervening_writes", "not_tracked" }',
+                          '{ "unchanged_contents", "not_verified" }',
+                          '"resource pointers only; mip/array/plane/subrect base not observed"'):
+            self.assertIn(statement, observe)
+        self.assertIn("CPU endpoint callbacks only; not submission or presentation order", observe)
+        self.assertIn("Ordinal of observed endpoints only", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()
