@@ -68,7 +68,7 @@ class FogRgbIdentityHost(unittest.TestCase):
         self.assertIn('PrivateResetPacket* packet = nullptr;', plan)
         self.assertNotRegex(plan, r'(?:shared_ptr|unique_ptr)<PrivateResetPacket>')
         self.assertNotIn('PrivateDenoise::Work', plan)
-        record = section('void RecordRgbIdentity(', 'void PrepareFogDepth(')
+        record = section('void RecordRgbIdentity(', 'bool SameFogDepthSelection(')
         self.assertIn('RecordSceneRgb(host, input, [&] { return work->Record(list); })', record)
         self.assertNotIn('RecordPrivateCompute(', record)
         self.assertNotIn('originalDraw(', record)
@@ -106,7 +106,7 @@ class FogRgbIdentityHost(unittest.TestCase):
         compiler = os.environ.get('CXX') or shutil.which('c++')
         if not compiler:
             self.skipTest('Set CXX for actual host adapter compilation')
-        functions = section('bool IsFullRgbViewport(', 'void PrepareFogDepth(')
+        functions = section('bool IsFullRgbViewport(', 'bool SameFogDepthSelection(')
         mocks = r'''
 #include <json.hpp>
 #include <array>
