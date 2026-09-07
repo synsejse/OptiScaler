@@ -27,6 +27,54 @@ struct Textures
     Microsoft::WRL::ComPtr<ID3D12Resource> composed;
 };
 
+class Work;
+class Session;
+
+struct SessionDesc
+{
+    FfxApiDimensions2D maxRenderSize {};
+    uint64_t providerId = 0;
+    DenoiserSettings settings {};
+    uint64_t epoch = 0; // Caller-owned, nonzero software-session epoch, not a native view identity.
+    uint32_t frameLimit = 32; // One through 32 successful acknowledgements; never wraps/restarts.
+};
+
+struct FrameAdmission
+{
+    uint64_t epoch = 0;
+    uintptr_t canonicalDirectQueue = 0; // Exact same-device DIRECT queue, authenticated by caller.
+    bool sameViewAndCoordinateOrigin = false; // Caller attestation, never inferred from matrices.
+};
+
+class Session
+{
+  public:
+    ~Session();
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
+
+    // HOST ATTESTATION, not independent GPU/submission proof or GPU completion:
+    // this exact Work recorded successfully, its intended consumer/scene succeeded,
+    // and that consumer's actual original Execute call RETURNED on this exact queue.
+    // Caller must make this truthful before a subsequent frame can be prepared.
+    // Same Execute-array order alone is NOT this acknowledgement. No lock is held
+    // across Execute, and no engine/queue calls or waits occur in this method.
+    bool AcknowledgeExecuted(const Work& frame, uintptr_t canonicalDirectQueue) noexcept;
+    void Stop() noexcept; // Irreversible; does not release in-flight leases or pretend to undo history.
+    bool Stopped() const noexcept;
+    bool Complete() const noexcept; // Frame limit acknowledged, NOT GPU completion.
+    uint32_t AcknowledgedFrames() const noexcept;
+
+  private:
+    struct Impl;
+    explicit Session(std::unique_ptr<Impl> implementation);
+    friend class Work;
+    friend std::shared_ptr<Session> CreateSession(ID3D12Device*, const SessionDesc&, const char**) noexcept;
+    friend std::shared_ptr<Work> PrepareFrame(const std::shared_ptr<Session>&, const Parameters&,
+                                               const FrameAdmission&, const char**) noexcept;
+    std::unique_ptr<Impl> _impl;
+};
+
 class Work
 {
   public:
@@ -48,7 +96,12 @@ class Work
   private:
     struct Impl;
     explicit Work(std::unique_ptr<Impl> implementation);
+    friend class Session;
     friend std::shared_ptr<Work> Prepare(ID3D12Device*, const Parameters&, const char**) noexcept;
+    friend std::shared_ptr<Work> PrepareFrame(const std::shared_ptr<Session>&, const Parameters&,
+                                               const FrameAdmission&, const char**) noexcept;
+    static std::unique_ptr<Impl> PrepareResources(ID3D12Device*, const Parameters&);
+    static void PrepareConverter(Impl&, const char*);
     std::unique_ptr<Impl> _impl;
 };
 
@@ -86,4 +139,30 @@ class Work
 // error, if supplied, receives a static message (valid after this call and no allocation).
 std::shared_ptr<Work> Prepare(ID3D12Device* device, const Parameters& parameters,
                               const char** error = nullptr) noexcept;
+
+// Additive temporal experiment primitive; Prepare above remains independent RESET.
+// Exactly ONE context/provider/default-query/configuration belongs to this session.
+// Each Work has fresh converter textures and descriptor storage; there is no scratch
+// reuse while prior GPU work is outstanding. Acyclic frame leases retain the shared
+// context through existing final-consumer submission fences even if Session/Work dies.
+// Inputs plus nominal private textures are capped at 512 MiB across retained session
+// leases; provider-internal allocations and separately owned producer targets are not
+// claimed to be included. Abandoned/failed-signal submissions remain charged/retained.
+// Provider module management remains the caller's responsibility, as for Prepare.
+std::shared_ptr<Session> CreateSession(ID3D12Device* device, const SessionDesc& description,
+                                       const char** error = nullptr) noexcept;
+
+// CPU preparation only, one pending frame slot, no hidden reset/fallback. Caller must
+// supply true temporal parameters from its OWN previous accepted frame and the same
+// view/origin. First frame explicitly has BOTH RESET flags; later frames have NEITHER
+// and frameIndex is strictly previous+1 without wrap. Provider/settings/max extent and
+// canonical queue are immutable. This is not a camera validator or a native view key.
+// An accepted reservation that fails preparation/Record or whose Work is abandoned
+// before acknowledgement permanently stops the session. A missing acknowledgement,
+// busy slot, invalid admission or changed parameters refuses without reserving work.
+// AcknowledgeExecuted supplies only ordering; ordinary submission fences still govern
+// retirement. The host must veto failed consumers and all dependent work, restore
+// engine state, and serialize other provider/module management as for Prepare.
+std::shared_ptr<Work> PrepareFrame(const std::shared_ptr<Session>& session, const Parameters& parameters,
+                                   const FrameAdmission& admission, const char** error = nullptr) noexcept;
 } // namespace FSRD::PrivateDenoise

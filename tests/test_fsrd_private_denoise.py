@@ -38,8 +38,12 @@ class PrivateDenoise(unittest.TestCase):
         self.assertNotIn('Converter', lease)
         self.assertNotIn('Ticket', lease)
         self.assertNotIn('Work', lease)
-        for required in ('ComPtr<ID3D12Device> device', 'ComPtr<ID3D12Resource>', 'Textures textures', 'denoiser'):
+        for required in ('ComPtr<ID3D12Device> device', 'ComPtr<ID3D12Resource>', 'Textures textures', 'ContextLease'):
             self.assertIn(required, lease)
+        context = SOURCE.split('struct ContextLease\n', 1)[1].split('\n};', 1)[0]
+        self.assertIn('DenoiserCore<FfxApiProxy> denoiser', context)
+        for forbidden in ('Converter', 'Ticket', 'Work', 'Session'):
+            self.assertNotIn(forbidden, context)
         record = SOURCE.split('bool Work::Record', 1)[1]
         self.assertLess(record.index('FSRDSubmission::Retain'), record.index('DispatchConversion'))
         self.assertLess(record.index('Require(bool(retained)'), record.index('DispatchConversion'))
@@ -52,6 +56,27 @@ class PrivateDenoise(unittest.TestCase):
         self.assertNotIn('std::isfinite', SOURCE)
 
     def test_compiled_actual_work_lifecycle_and_failures(self):
+        self._compile_work()
+
+    def test_session_contract_is_explicit_and_separate_from_one_shot(self):
+        prepare = SOURCE.split('std::shared_ptr<Work> Prepare(', 1)[1].split('Session::Session(', 1)[0]
+        frame = SOURCE.split('std::shared_ptr<Work> PrepareFrame(', 1)[1].split('bool Work::Record(', 1)[0]
+        self.assertIn('dispatch.flags |= FFX_DENOISER_DISPATCH_RESET', prepare)
+        self.assertNotIn('|= FFX_DENOISER_DISPATCH_RESET', frame)
+        self.assertNotIn('CreateContext(', frame)
+        self.assertNotIn('.Configure(', frame)
+        self.assertIn('Work::PrepareConverter(*data, "FSRD Private Temporal Frame")', frame)
+        self.assertLess(frame.index('budget.Acquire'), frame.index('Work::PrepareConverter'))
+        for required in ('HOST ATTESTATION', 'Same Execute-array order alone is NOT',
+                         'previous frame not acknowledged', 'frameIndex != UINT32_MAX',
+                         'sessionOrdinal > session.acknowledged', 'if (reserved) session->Stop()',
+                         'if (data.session) data.session->Stop()'):
+            self.assertIn(required, SOURCE + HEADER)
+
+    def test_compiled_persistent_session_order_lifetime_and_refusals(self):
+        self._compile_work(temporal=True)
+
+    def _compile_work(self, temporal=False):
         compiler = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++')
         if not compiler:
             self.skipTest('Set CXX for actual private Work mock compilation')
@@ -137,6 +162,11 @@ inline std::vector<std::string> events;
 inline bool retainFail=false,convertFail=false,composeFail=false,dispatchThrow=false;
 inline bool createFail=false,defaultFail=false,configureFail=false,changedCount=false;
 inline unsigned contexts=0,destroys=0,dispatches=0;
+inline unsigned creates=0,defaultQueries=0,configurationCalls=0,lastConversionFlags=0;
+inline bool temporal=false,allocationFail=false;
+inline void (*duringDispatch)()=nullptr;
+inline void (*duringAllocation)()=nullptr;
+inline std::vector<void*> dispatchedContexts;
 inline uint64_t provider=42,queriedProvider=0; inline float settings[6]{1,1,65504,50,0,.01f};
 inline int dispatchResult=0;
 }
@@ -171,7 +201,8 @@ class FSRDPreprocessor_Dx12 {public:
  std::shared_ptr<FSRDSubmission::Ticket> converterSlotTicket; // Real converter owns tickets.
  FSRDPreprocessor_Dx12(std::string_view,ID3D12Device* d):device(d){}
  bool IsInit(){return true;}
- bool SetMaxRenderSize(UINT,UINT){for(auto& t:textures)t=new ID3D12Resource(device.Get());return true;}
+ bool SetMaxRenderSize(UINT,UINT){if(Fake::duringAllocation)Fake::duringAllocation();
+  if(Fake::allocationFail)return false;for(auto& t:textures)t=new ID3D12Resource(device.Get());return true;}
  void GetSignal(ffxDispatchDescDenoiserInput1Signal& s,ffxDispatchDescDenoiser& d)const{
   s={};s.header.type=FFX_API_DISPATCH_DESC_INPUT_1_SIGNAL_TYPE_DENOISER;
   s.radiance.input.resource=textures[0].Get();s.radiance.output.resource=textures[1].Get();
@@ -181,7 +212,7 @@ class FSRDPreprocessor_Dx12 {public:
  ID3D12Resource* GetPreservedLighting()const{return textures[3].Get();}
  ID3D12Resource* GetCompositionOutput()const{return textures[9].Get();}
  bool DispatchConversion(ID3D12GraphicsCommandList* l,const ConversionDesc& c){
-  assert(FSRDSubmission::pending && (c.Flags&64));
+  assert(FSRDSubmission::pending && (Fake::temporal || (c.Flags&64)));Fake::lastConversionFlags=c.Flags;
   // A Storage owner, not this converter, is retained by the real converter.
   auto storage=std::make_shared<std::array<Ptr,10>>(textures);
   converterSlotTicket=FSRDSubmission::Retain(device.Get(),l,storage);
@@ -199,7 +230,8 @@ struct FfxApiProxy {
  static inline ffxDispatchDescDenoiser lastDispatch{};
  static ffxReturnCode_t D3D12_CreateContext(ffxContext* c,ffxHeader* h,const ffxAllocationCallbacks*){
   auto* d=reinterpret_cast<ffxCreateContextDescDenoiser*>(h);
-  assert(d->mode==FFX_DENOISER_MODE_1_SIGNAL && d->flags==0 && d->maxRenderSize.width==2560);
+  assert(d->mode==FFX_DENOISER_MODE_1_SIGNAL && d->flags==0 && d->maxRenderSize.width==(Fake::temporal?1280u:2560u));
+  ++Fake::creates;
   auto* b=reinterpret_cast<ffxCreateBackendDX12Desc*>(h->pNext);
   auto* v=reinterpret_cast<ffxOverrideVersion*>(b->header.pNext);Fake::queriedProvider=v->versionId;
   if(Fake::createFail)return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
@@ -211,19 +243,22 @@ struct FfxApiProxy {
    if(!d->versionIds){*d->outputCount=1;}else{d->versionIds[0]=Fake::provider;d->versionNames[0]="test RR 1.1";
     if(Fake::changedCount)*d->outputCount=0;}return FFX_API_RETURN_OK;}
   auto* d=reinterpret_cast<ffxQueryDescDenoiserGetDefaultKeyValue*>(h);
+  ++Fake::defaultQueries;
   if(Fake::defaultFail)return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
   *static_cast<float*>(d->data)=Fake::settings[d->key-1];return FFX_API_RETURN_OK;}
  static ffxReturnCode_t D3D12_Configure(ffxContext*,const ffxHeader* h){
+  ++Fake::configurationCalls;
   if(Fake::configureFail)return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
   auto* d=reinterpret_cast<const ffxConfigureDescDenoiserKeyValue*>(h);
   Fake::settings[d->key-1]=*static_cast<const float*>(d->data);return FFX_API_RETURN_OK;}
- static ffxReturnCode_t D3D12_Dispatch(ffxContext*,const ffxHeader* h){
+ static ffxReturnCode_t D3D12_Dispatch(ffxContext* context,const ffxHeader* h){
   auto* d=reinterpret_cast<const ffxDispatchDescDenoiser*>(h);lastDispatch=*d;
   assert(d->header.pNext && d->header.pNext->type==FFX_API_DISPATCH_DESC_INPUT_1_SIGNAL_TYPE_DENOISER);
-  assert(d->flags==3 && d->frameIndex==731 && d->deltaTime==17.25f && d->jitterOffsets.x==.001f);
+  if(!Fake::temporal)assert(d->flags==3 && d->frameIndex==731 && d->deltaTime==17.25f && d->jitterOffsets.x==.001f);
   auto* s=reinterpret_cast<const ffxDispatchDescDenoiserInput1Signal*>(h->pNext);
   assert(s->radiance.input.resource && s->radiance.output.resource && s->radiance.input.resource!=s->radiance.output.resource);
   Fake::events.push_back("denoise");++Fake::dispatches;
+  Fake::dispatchedContexts.push_back(*context);if(Fake::duringDispatch)Fake::duringDispatch();
   if(Fake::dispatchThrow)throw 3;return static_cast<ffxReturnCode_t>(Fake::dispatchResult);}
 };
 '''
@@ -306,6 +341,135 @@ int main(){
  assert(!Fake::contexts);
 }
 '''
+        if temporal:
+            # Reuse the exact old device/input/parameter fixture, not the old test body.
+            harness = harness.split(' auto rejected=', 1)[0] + r'''
+ Fake::temporal=true;p.maxRenderSize={1280,720};p.settings.stabilityBias=1.5f;
+ SessionDesc desc{p.maxRenderSize,p.providerId,p.settings,77,32};
+ const FrameAdmission admission{77,0x12340,true};
+ auto parameters=[&](unsigned ordinal){auto q=p;q.dispatch.frameIndex=1000+ordinal;
+  q.dispatch.flags=ordinal?2:3;q.conversion.Flags=ordinal?37:69;
+  q.dispatch.deltaTime=17.25f+float(ordinal)*.01f;
+  q.dispatch.cameraPositionDelta={float(ordinal),0,0};
+  q.conversion.PrevViewMatrix.m[0][0]=float(ordinal+1);return q;};
+ auto create=[&]{const char* error=nullptr;auto s=CreateSession(device.Get(),desc,&error);
+  assert(s && error && !*error && !s->Stopped() && !s->Complete());return s;};
+ for(unsigned kind=0;kind<6;++kind){auto d=desc;
+  if(kind==0)d.epoch=0;if(kind==1)d.frameLimit=0;if(kind==2)d.frameLimit=33;
+  if(kind==3)d.maxRenderSize={};if(kind==4)d.settings.maxRadiance=0;if(kind==5)d.providerId=43;
+  const char* error=nullptr;assert(!CreateSession(device.Get(),d,&error)&&error&&*error&&!Fake::contexts);
+ }
+ {
+  const auto creations=Fake::creates,queries=Fake::defaultQueries,configs=Fake::configurationCalls;
+  const auto dispatches=Fake::dispatches,destroys=Fake::destroys;auto s=create();
+  assert(Fake::creates==creations+1&&Fake::defaultQueries==queries+6&&Fake::configurationCalls==configs+1);
+  std::shared_ptr<Work> previous;
+  for(unsigned i=0;i<32;++i){const auto q=parameters(i);const char* error=nullptr;
+   auto w=PrepareFrame(s,q,admission,&error);assert(w&&error&&!*error);
+   assert(w->EffectiveParameters().dispatch.flags==q.dispatch.flags&&w->EffectiveParameters().conversion.Flags==q.conversion.Flags);
+   assert(w->EffectiveParameters().dispatch.frameIndex==q.dispatch.frameIndex);
+   assert(!s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));
+   assert(!PrepareFrame(s,q,admission)&&!s->Stopped()); // No second pending reservation.
+   if(previous){assert(previous->Outputs().radiance.Get()!=w->Outputs().radiance.Get());
+    assert(previous->Outputs().depth.Get()!=w->Outputs().depth.Get());}
+   assert(w->Record(list.Get())&&w->Recorded()&&Fake::lastConversionFlags==q.conversion.Flags);
+   assert(FfxApiProxy::lastDispatch.frameIndex==q.dispatch.frameIndex&&FfxApiProxy::lastDispatch.flags==q.dispatch.flags);
+   assert(FfxApiProxy::lastDispatch.cameraPositionDelta.x==float(i));
+   assert(FfxApiProxy::lastDispatch.linearDepth.resource==w->Outputs().depth.Get());
+   assert(!w->Record(list.Get()));assert(!PrepareFrame(s,parameters(i+1),admission));
+   assert(!s->AcknowledgeExecuted(*w,0)&&!s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue+1));
+   assert(s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));
+   assert(!s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));
+   assert(s->AcknowledgedFrames()==i+1&&!s->Stopped());
+   previous.reset();previous=w;FSRDSubmission::pending.reset();
+  }
+  assert(s->Complete()&&!PrepareFrame(s,parameters(32),admission)&&!s->Stopped());
+  assert(Fake::creates==creations+1&&Fake::defaultQueries==queries+6&&Fake::configurationCalls==configs+1);
+  assert(Fake::dispatches==dispatches+32);
+  for(auto* identity:Fake::dispatchedContexts)assert(identity==Fake::dispatchedContexts.front());
+  previous.reset();assert(Fake::contexts==1);s.reset();assert(!Fake::contexts&&Fake::destroys==destroys+1);
+ }
+ // Admission refusals do not reserve/poison; accepted resource failures do.
+ for(unsigned kind=0;kind<12;++kind){auto s=create();auto q=parameters(0);auto a=admission;
+  if(kind==0)a.epoch=78;if(kind==1)a.canonicalDirectQueue=0;if(kind==2)a.sameViewAndCoordinateOrigin=false;
+  if(kind==3)q.providerId=43;if(kind==4)q.maxRenderSize.width=1281;if(kind==5)q.settings.stabilityBias=1.6f;
+  if(kind==6)q.dispatch.flags=2;if(kind==7)q.conversion.Flags=37;
+  if(kind==8)q.dispatch.deltaTime=0;if(kind==9)q.settings.gaussianKernelRelaxation=-0.f;
+  if(kind==10)q.dispatch.header.pNext=reinterpret_cast<ffxHeader*>(uintptr_t(1));
+  if(kind==11)q.dispatch.deltaTime=std::bit_cast<float>(0x7fc12345u);
+  const char* error=nullptr;assert(!PrepareFrame(s,q,a,&error)&&error&&*error&&!s->Stopped());
+  auto w=PrepareFrame(s,parameters(0),admission);assert(w);w.reset();assert(s->Stopped());
+  assert(!PrepareFrame(s,parameters(0),admission));s.reset();assert(!Fake::contexts);
+ }
+ for(unsigned kind=0;kind<7;++kind){auto s=create();auto w=PrepareFrame(s,parameters(0),admission);assert(w);
+  assert(w->Record(list.Get())&&s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));
+  auto q=parameters(1);auto a=admission;
+  if(kind==0)q.dispatch.frameIndex=1000;if(kind==1)q.dispatch.frameIndex=1002;
+  if(kind==2)q.dispatch.flags=3;if(kind==3)q.conversion.Flags=101;
+  if(kind==4)a.canonicalDirectQueue++;if(kind==5)q.dispatch.renderSize.width=1279;
+  if(kind==6)q.settings.maxRadiance=65000;
+  assert(!PrepareFrame(s,q,a)&&!s->Stopped());w.reset();FSRDSubmission::pending.reset();s.reset();assert(!Fake::contexts);
+ }
+ // Counter wrap is never a temporal join. Explicit Stop cannot be cleared.
+ {auto s=create();auto q=parameters(0);q.dispatch.frameIndex=UINT32_MAX;
+  auto w=PrepareFrame(s,q,admission);assert(w&&w->Record(list.Get()));
+  assert(s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));q=parameters(1);q.dispatch.frameIndex=0;
+  assert(!PrepareFrame(s,q,admission));s->Stop();assert(s->Stopped());
+  w.reset();FSRDSubmission::pending.reset();s.reset();assert(!Fake::contexts);}
+ // Exact session/Work identity is required, not just matching numeric frames.
+ {auto a=create(),b=create();auto wa=PrepareFrame(a,parameters(0),admission),wb=PrepareFrame(b,parameters(0),admission);
+  assert(wa&&wb&&wa->Record(list.Get())&&wb->Record(list.Get()));
+  assert(!a->AcknowledgeExecuted(*wb,admission.canonicalDirectQueue));
+  assert(a->AcknowledgeExecuted(*wa,admission.canonicalDirectQueue));
+  assert(b->AcknowledgeExecuted(*wb,admission.canonicalDirectQueue));
+  wa.reset();wb.reset();a.reset();b.reset();assert(Fake::contexts==2);FSRDSubmission::pending.reset();assert(!Fake::contexts);}
+ // A successful Work abandoned before the host's actual consumer acknowledgement poisons.
+ {auto s=create();auto w=PrepareFrame(s,parameters(0),admission);assert(w&&w->Record(list.Get()));
+  w.reset();assert(s->Stopped()&&!PrepareFrame(s,parameters(1),admission));
+  s.reset();assert(Fake::contexts==1);FSRDSubmission::pending.reset();assert(!Fake::contexts);}
+ // Retain-failure, conversion/provider/composition failures, and throws stop history permanently.
+ for(unsigned kind=0;kind<7;++kind){auto s=create();auto w=PrepareFrame(s,parameters(0),admission);assert(w);
+  Fake::retainFail=kind==0;Fake::convertFail=kind==1;Fake::dispatchResult=kind==2?FFX_API_RETURN_ERROR_RUNTIME_ERROR:0;
+  Fake::dispatchThrow=kind==3;Fake::composeFail=kind==4;if(kind==5)list->type=2;if(kind==6)s->Stop();
+  assert(!w->Record(list.Get())&&!w->Recorded()&&s->Stopped());
+  assert(!s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue)&&!PrepareFrame(s,parameters(1),admission));
+  list->type=0;Fake::retainFail=Fake::convertFail=Fake::dispatchThrow=Fake::composeFail=false;Fake::dispatchResult=0;
+  w.reset();s.reset();FSRDSubmission::pending.reset();assert(!Fake::contexts);}
+ {auto s=create();auto q=parameters(0);q.conversion.Resources.InColor=nullptr;
+  assert(!PrepareFrame(s,q,admission)&&s->Stopped());s.reset();assert(!Fake::contexts);}
+ {auto s=create();Fake::allocationFail=true;assert(!PrepareFrame(s,parameters(0),admission)&&s->Stopped());
+  Fake::allocationFail=false;s.reset();assert(!Fake::contexts);}
+ // Concurrent preparation has one winner; concurrently retrying one Record cannot enter provider twice.
+ {auto s=create();std::array<std::shared_ptr<Work>,2> contenders;std::array<std::thread,2> threads;
+  for(unsigned i=0;i<2;++i)threads[i]=std::thread([&,i]{contenders[i]=PrepareFrame(s,parameters(0),admission);});
+  for(auto& thread:threads)thread.join();assert(bool(contenders[0])!=bool(contenders[1]));
+  auto w=contenders[0]?contenders[0]:contenders[1];const auto dispatches=Fake::dispatches;
+  bool results[2]{};for(unsigned i=0;i<2;++i)threads[i]=std::thread([&,i]{results[i]=w->Record(list.Get());});
+  for(auto& thread:threads)thread.join();assert(results[0]!=results[1]&&Fake::dispatches==dispatches+1);
+  assert(s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));
+  w.reset();contenders={};s.reset();FSRDSubmission::pending.reset();assert(!Fake::contexts);}
+ // Reentrant Stop does not deadlock provider recording or preparation, and no success is published.
+ {auto s=create();static Session* stopping;stopping=s.get();
+  Fake::duringAllocation=[](){stopping->Stop();};assert(!PrepareFrame(s,parameters(0),admission)&&s->Stopped());
+  Fake::duringAllocation=nullptr;s.reset();assert(!Fake::contexts);}
+ {auto s=create();auto w=PrepareFrame(s,parameters(0),admission);static Session* stopping;stopping=s.get();
+  Fake::duringDispatch=[](){stopping->Stop();};assert(!w->Record(list.Get())&&s->Stopped()&&!w->Recorded());
+  Fake::duringDispatch=nullptr;w.reset();s.reset();assert(Fake::contexts==1);
+  FSRDSubmission::pending.reset();assert(!Fake::contexts);}
+ // Five retained frame leases fit this fixture; the sixth exceeds fixed aggregate budget.
+ // A returned Execute acknowledgement is deliberately NOT a resource-retirement event.
+ {auto s=create();std::vector<std::shared_ptr<Work>> retained;
+  for(unsigned i=0;i<5;++i){auto w=PrepareFrame(s,parameters(i),admission);assert(w&&w->Record(list.Get()));
+   assert(s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));retained.push_back(w);}
+  const char* error=nullptr;assert(!PrepareFrame(s,parameters(5),admission,&error)&&s->Stopped());
+  assert(std::string(error)=="session retained resource budget exceeded");
+  retained.clear();std::weak_ptr<Session> weak=s;s.reset();assert(weak.expired()&&Fake::contexts==1);
+  // The ticket may represent unsubmitted/failed-signal work. No lifetime shortcut exists.
+  assert(Fake::contexts==1);FSRDSubmission::pending.reset();assert(!Fake::contexts);}
+ assert(!Fake::contexts&&!FSRDSubmission::pending);
+}
+'''
+            harness = '#include <thread>\n' + harness
         with tempfile.TemporaryDirectory(prefix='fsrd-private-denoise-') as directory:
             tmp = Path(directory)
             files = {'pch.h': '#pragma once\n#include "d3d12.h"\n', 'd3d12.h': windows,
@@ -320,7 +484,7 @@ int main(){
                 path.write_text(text)
             for number, optimization in enumerate((['-O0'], ['-O3', '-ffast-math', '-ffp-contract=fast'])):
                 binary = tmp / f'test-{number}'
-                result = subprocess.run([compiler, '-std=c++20', *optimization, '-I', str(tmp), '-I', str(BASE),
+                result = subprocess.run([compiler, '-std=c++20', '-pthread', *optimization, '-I', str(tmp), '-I', str(BASE),
                     '-I', str(ROOT / 'OptiScaler/include'), str(tmp / 'main.cpp'), '-o', str(binary)],
                     capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
