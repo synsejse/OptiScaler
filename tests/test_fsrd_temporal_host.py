@@ -58,6 +58,8 @@ class TemporalHost(unittest.TestCase):
         self.assertIn('nativeList != uintptr_t(list)', observe)
         self.assertIn('topology != 4', observe)
         self.assertIn('raw.current.frame != window->lastFog->frame + 1', observe)
+        self.assertIn('frame {}->{} view {:#x}->{:#x}', observe)
+        self.assertIn('object {:#x}->{:#x} list {:#x} generation {} committed {}', observe)
         self.assertIn('const double delta = timestamp - previousTime', observe)
         self.assertIn('ParseTemporal(metadata, measured)', observe)
         self.assertLess(observe.index('SelectTemporalFrame('), observe.index('window->lastFog = raw.current'))

@@ -5269,7 +5269,12 @@ PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT cou
         if (window->policy && window->policy->Complete()) return nullptr;
         if (window->lastFog && (window->lastFog->view != raw.current.view || window->lastFog->object != raw.current.object ||
             window->lastFog->frame == UINT32_MAX || raw.current.frame != window->lastFog->frame + 1))
-            throw std::runtime_error("temporal selected Fog source cadence or view changed");
+            throw std::runtime_error(std::format(
+                "temporal selected Fog source cadence or view changed: frame {}->{} view {:#x}->{:#x} "
+                "object {:#x}->{:#x} list {:#x} generation {} committed {}",
+                window->lastFog->frame, raw.current.frame, window->lastFog->view, raw.current.view,
+                window->lastFog->object, raw.current.object, recording.list, recording.generation,
+                window->policy ? window->policy->CommittedFrames() : 0));
         previousTime = window->lastFogTimestamp;
         ready = window->warmupReturned && window->lastFog.has_value();
     }
