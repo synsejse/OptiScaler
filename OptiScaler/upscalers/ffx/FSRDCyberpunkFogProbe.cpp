@@ -2099,12 +2099,7 @@ bool SameRayCopyScope(const RayCopyBundle& plan) noexcept
             if (!FSRD::CyberpunkRayBindings::Detail::ReadCurrent(reader, plan.input.image,
                     expected.list4, expected.scope, receipt, handles, current, reason)) return false;
             current.callerRva = expected.callerRva;
-            // ReadCurrent requires positive refs. Ignore ONLY their numeric
-            // changes before comparing snapshots: kind3 may legitimately retain.
-            // The metadata-only Observe intentionally compares them more strictly.
-            for (size_t i = 0; i < current.textures.size(); ++i)
-                current.textures[i].refs = expected.textures[i].refs;
-            if (current != expected) return false;
+            if (!FSRD::CyberpunkRayBindings::SameBindingIdentity(current, expected)) return false;
         }
         return true;
     }
@@ -2493,13 +2488,18 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
                 FSRD::CyberpunkRayBindings::ChangedSnapshots changed;
                 const FSRD::CyberpunkRayBindings::TextureHandles handles {
                     current->bindings[0].handle, current->bindings[1].handle, current->bindings[2].handle };
-                if (!FSRD::CyberpunkRayBindings::Observe(reader, authenticatedImage.load(), caller, uintptr_t(list),
-                        observed, current->receipt, handles, snapshot, &reason, &changed))
-                {
-                    if (changed.available)
-                        observation["changed_snapshots"] = DescribeChangedRaySnapshots(changed);
+                const bool bindingObserved = FSRD::CyberpunkRayBindings::Observe(reader, authenticatedImage.load(), caller,
+                    uintptr_t(list), observed, current->receipt, handles, snapshot, &reason, &changed);
+                if (changed.available)
+                    observation["changed_snapshots"] = DescribeChangedRaySnapshots(changed);
+                if (!bindingObserved)
                     throw std::runtime_error(std::string(FSRD::CyberpunkRayBindings::FailureName(reason)));
-                }
+                observation["refcount_policy"] = "both_positive; numeric_count_is_not_binding_identity_or_ownership";
+                if (changed.available)
+                    LOG_INFO("[FSRRR ray binding] same binding identities frame={}; positive refs changed t4={}->{} u0={}->{} u8={}->{}; not ownership proof",
+                             observed.frameSource, changed.first.textures[0].refs, changed.second.textures[0].refs,
+                             changed.first.textures[1].refs, changed.second.textures[1].refs,
+                             changed.first.textures[2].refs, changed.second.textures[2].refs);
                 if (rayScope != current || CurrentRayConstantScope() != observed)
                     throw std::runtime_error("native ray scope changed after descriptor observation");
                 observation["native_caller_rva"] = snapshot.callerRva;

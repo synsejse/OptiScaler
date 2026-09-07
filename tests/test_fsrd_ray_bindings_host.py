@@ -116,6 +116,7 @@ class RayBindingsHost(unittest.TestCase):
 #define __fastcall
 #endif
 #define WINAPI
+#define LOG_INFO(...) ((void)0)
 using Json=nlohmann::json;
 thread_local bool inMetadata=false;
 std::atomic<bool> rayBindingsAuthenticated{true},captureTrackingValid{true},lightingRequested{true},lightingAttempted{false};

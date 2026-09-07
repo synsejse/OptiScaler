@@ -50,7 +50,7 @@ class RayCopyHost(unittest.TestCase):
                          'found->second.predicated', 'found->second.renderPass', 'found->second.queryCount',
                          'rayScope->bindings[i].valid', 'receipt.phase !=',
                          'CyberpunkRayBindings::Detail::ReadCurrent(',
-                         'current.textures[i].refs = expected.textures[i].refs', 'current != expected'):
+                         'CyberpunkRayBindings::SameBindingIdentity(current, expected)'):
             self.assertIn(required, same)
         endpoint = same.split('if (plan.cleanupEntered)\n', 1)[1].split('const FSRD::CyberpunkRayBindings::TextureHandles', 1)[0]
         for required in ('rayScope->pendingCopy.get() != &plan', '!plan.originalReturned',

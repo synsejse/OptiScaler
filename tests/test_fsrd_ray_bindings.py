@@ -66,6 +66,12 @@ struct Host
             if(selected==4)Put<uint64_t>(Cache+0x70,1ull<<63);
             if(selected==5)Put<uintptr_t>(Engine+0x90,B6+1);
             if(selected==6)Put<uintptr_t>(Slot(2)+0x40,Extra(2)+1);
+            if(selected==7)Put<uint8_t>(Slot(1)+0x4e,1);
+            if(selected==8)Put<int32_t>(Slot(1)-8,1);
+            if(selected==9)Put<int32_t>(Slot(1)-8,0);
+            if(selected==10)Put<int32_t>(Slot(1)-8,-1);
+            if(selected==11)Put<uint32_t>(Slot(1)+0x48,0x40);
+            if(selected==12)Put<uintptr_t>(Slot(1),0x1234567);
         }
         return true;
     }
@@ -181,26 +187,77 @@ int main()
     reject([](Host& t){t.Put<uintptr_t>(Cache+0x28,UINTPTR_MAX-4);},R::Failure::BindingRange);
     reject([](Host& t){t.throwing=Array;},R::Failure::ReadException);
     reject([](Host& t){t.memory.erase(UavArray(3));},R::Failure::TextureSource);
-    for(unsigned mutation:{1u,2u,3u,5u,6u})
+    for(unsigned mutation:{2u,3u,5u,6u})
         reject([&](Host& t){t.mutationTrigger=Array+24;t.mutation=mutation;},
-            mutation==1?R::Failure::Changed:mutation==2||mutation==5?R::Failure::CurrentScope:
+            mutation==2||mutation==5?R::Failure::CurrentScope:
             mutation==3?R::Failure::BindingRange:R::Failure::TextureSource);
     h=Setup();h.mutationTrigger=Array+24;h.mutation=4;
     assert(Observe(h,repeated)&&repeated==out); // Unrelated dirty range is not a global race guard.
-    // Refusal diagnostics preserve both complete snapshots without admitting
-    // the changed input. No partial/stale evidence survives the next call.
+    // A positive retain changes bookkeeping, not the binding. Keep both actual
+    // samples in diagnostics and accept the newest unmodified source counts.
     R::ChangedSnapshots changed;
     h=Setup();h.mutationTrigger=Array+24;h.mutation=1;
-    assert(!R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
-    assert(reason==R::Failure::Changed&&repeated==empty&&changed.available);
+    assert(R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
+    assert(reason==R::Failure::None&&repeated==changed.second&&changed.available);
     assert(changed.first==out&&changed.first.textures[0].refs==1&&changed.second.textures[0].refs==2);
     changed.second.textures[0].refs=1;assert(changed.first==changed.second);
+    h=Setup();h.Put<int32_t>(Slot(1)-8,2);h.mutationTrigger=Array+24;h.mutation=8;
+    assert(R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
+    assert(reason==R::Failure::None&&changed.available&&changed.first.textures[0].refs==2&&
+           changed.second.textures[0].refs==1&&repeated==changed.second);
+    for(unsigned mutation:{7u,9u,10u,11u,12u})
+    {
+        h=Setup();h.mutationTrigger=Array+24;h.mutation=mutation;
+        assert(!R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
+        assert(repeated==empty);
+        if(mutation==9||mutation==10)
+            assert(reason==R::Failure::TextureSource&&!changed.available&&changed.first==empty&&changed.second==empty);
+        else
+            assert(reason==R::Failure::Changed&&changed.available&&changed.first!=changed.second);
+    }
     h=Setup();assert(R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
     assert(!changed.available&&changed.first==empty&&changed.second==empty);
     changed.available=true;changed.first=out;
     h=Setup();h.throwing=Array;
     assert(!R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
     assert(reason==R::Failure::ReadException&&!changed.available&&changed.first==empty&&changed.second==empty);
+    // Exclude only positive numeric refcounts, not any identity/descriptor/state
+    // field. Test both retain and release directions without mutating arguments.
+    for(size_t i=0;i<3;++i)
+    {
+        auto a=out,b=out; a.textures[i].refs=2;
+        assert(R::SameBindingIdentity(a,b)&&R::SameBindingIdentity(b,a));
+        assert(a.textures[i].refs==2&&b.textures[i].refs==1);
+        for(int invalid:{0,-1})
+        {b.textures[i].refs=invalid;assert(!R::SameBindingIdentity(a,b)&&!R::SameBindingIdentity(b,a));}
+        for(unsigned field=0;field<18;++field)
+        {
+            b=out;auto& t=b.textures[i];
+            switch(field) {
+            case 0:++t.handle;break;case 1:++t.slot;break;case 2:++t.native;break;
+            case 3:++t.descriptor;break;case 4:++t.requestedSrvState;break;
+            case 5:++t.extra;break;case 6:++t.uavArray;break;
+            case 7:++t.compact[0];break;case 8:++t.compact[11];break;
+            case 9:++t.binding.shaderRegister;break;case 10:++t.binding.descriptorIndex;break;
+            case 11:++t.binding.mapAddress;break;case 12:++t.binding.descriptor;break;
+            case 13:++t.binding.range[0];break;case 14:++t.binding.range[15];break;
+            case 15:++t.binding.rangeIndex;break;case 16:++t.binding.rootParameter;break;
+            case 17:++t.compact[6];break;}
+            assert(!R::SameBindingIdentity(a,b));
+        }
+    }
+    for(unsigned field=0;field<17;++field)
+    {
+        auto b=out;
+        switch(field) {
+        case 0:++b.scope.serial;break;case 1:++b.scope.recordingGeneration;break;
+        case 2:++b.scope.graphContext;break;case 3:++b.scope.view;break;case 4:++b.scope.tls;break;
+        case 5:++b.scope.engine;break;case 6:++b.scope.list;break;case 7:++b.scope.frameSource;break;
+        case 8:++b.callerRva;break;case 9:++b.list4;break;case 10:++b.cache;break;
+        case 11:++b.layout;break;case 12:++b.descriptorArray;break;case 13:++b.registry;break;
+        case 14:++b.b6.descriptor;break;case 15:++b.b6.range[0];break;case 16:++b.b6.rootParameter;break;}
+        assert(!R::SameBindingIdentity(out,b));
+    }
     h=Setup();Range(h,0,65535,6,1);h.Put<uintptr_t>(Array+8*65535,B6);
     assert(Observe(h,repeated)&&repeated.b6.descriptorIndex==65535);
     h=Setup();Range(h,1,10,2,3);h.Put<uintptr_t>(Array+8*12,Motion);

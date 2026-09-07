@@ -59,13 +59,28 @@ struct Snapshot
     std::array<TextureBinding, 3> textures {}; // Original motion t4, radiance u0, hit u8.
     bool operator==(const Snapshot&) const = default;
 };
-// Diagnostic copies only, populated exclusively when two complete CPU reads
-// disagree. They never authorize recording or replace the accepted snapshot.
+// Diagnostic copies only, populated when two complete CPU reads disagree,
+// including accepted positive refcount changes. They never authorize recording.
 struct ChangedSnapshots
 {
     Snapshot first {}, second {};
     bool available = false;
 };
+
+// The authenticated engine retains/releases handles concurrently (native
+// 21c992 atomically increments slot-8). That count is not resource identity.
+// Require it to remain positive in BOTH reads, and compare every other field
+// exactly. Original-use lifetime, owned resource and state gates remain separate.
+// Preserve the actual sampled counts; normalize only these local comparison copies.
+inline bool SameBindingIdentity(Snapshot first, Snapshot second) noexcept
+{
+    for (size_t i = 0; i < first.textures.size(); ++i)
+    {
+        if (first.textures[i].refs <= 0 || second.textures[i].refs <= 0) return false;
+        first.textures[i].refs = second.textures[i].refs = 0;
+    }
+    return first == second;
+}
 enum class Failure : uint8_t
 {
     None, Caller, UploadReceipt, CurrentScope, TextureSource, BindingRange, DescriptorMismatch, Changed, ReadException
@@ -186,6 +201,8 @@ template<class Host> bool ReadCurrent(Host& host, uintptr_t image, uintptr_t lis
 // the receipt on every later/nested upload and verify current list generation,
 // frame/view/graph selection at the actual API boundary. List and List4 interface
 // addresses need not equal; both are matched to the original engine context.
+// Both complete reads must retain the same binding identities. Positive handle
+// refcount changes are reported, not treated as an identity change or a lease.
 template<class Host>
 bool Observe(Host& host, uintptr_t image, uintptr_t caller, uintptr_t list4,
              const Scope& scope, const Receipt& receipt, const TextureHandles& handles,
@@ -210,8 +227,9 @@ bool Observe(Host& host, uintptr_t image, uintptr_t caller, uintptr_t list4,
                     Detail::ReadCurrent(host, image, list4, scope, receipt, handles, second, failure))
                 {
                     failure = Failure::Changed;
-                    if (first == second) { output = first; failure = Failure::None; success = true; }
-                    else if (changed) { *changed = { first, second, true }; }
+                    if (first != second && changed) *changed = { first, second, true };
+                    if (SameBindingIdentity(first, second))
+                    { output = second; failure = Failure::None; success = true; }
                 }
             }
         }
