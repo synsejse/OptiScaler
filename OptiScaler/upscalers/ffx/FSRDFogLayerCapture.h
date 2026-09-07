@@ -4,6 +4,7 @@
 #include <wrl/client.h>
 #include <memory>
 #include <string>
+#include <array>
 
 // Research only. This helper does not hook, repeat, replace, or modify a game draw.
 // Nothing is captured until Request() and Record() are explicitly called.
@@ -25,6 +26,10 @@ struct Layers
     // Optional, independently validated companion; never part of the three matching layers.
     // Exactly 5x1 RGBA32_UINT, texels = raw cb12 registers 21,22,23,24,27 in that order.
     Texture boundCb12;
+    // Optional all-or-none private guide outputs, captured without format conversion:
+    // diffuse RGBA8_UNORM, specular RGBA8_UNORM, normal/roughness RGBA16F.
+    // Caller must establish their early dispatch/input provenance independently.
+    std::array<Texture, 3> earlyGuides;
 };
 
 struct Status
@@ -67,6 +72,10 @@ Status GetStatus();
 // single-sample typed RGBA32_UINT texture. It is copied as 80 native uint32 bytes
 // into companions, not converted or admitted through the floating-layer checks.
 // The shared 256 MiB readback budget includes this companion when present.
+// Optional earlyGuides must be three distinct private mip0/slice0 textures,
+// matching scene dimensions and the exact typed formats above. None may alias
+// another layer/companion. Stored as separate native companions under the same
+// completion fence; their pixels are not substituted into any scene layer.
 // provenanceJson must be a JSON object; it is saved as caller-supplied evidence,
 // not treated as proof that the above draw constraints were satisfied.
 //

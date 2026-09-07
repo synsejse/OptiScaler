@@ -42,6 +42,7 @@ struct Batch
 {
     std::array<Entry, 3> entries;
     std::optional<Entry> boundCb12;
+    std::optional<std::array<Entry, 3>> earlyGuides;
     std::shared_ptr<void> keepAlive;
     Json metadata;
     std::filesystem::path directory;
@@ -108,7 +109,7 @@ void CheckSameDevice(ID3D12Device* device, ID3D12DeviceChild* child)
         throw std::runtime_error("fog capture resources/list must belong to the supplied device");
 }
 
-void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false)
+void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false, bool guideAlbedo = false)
 {
     if (!entry.source.resource)
         throw std::runtime_error("fog capture requires all three immutable textures");
@@ -126,6 +127,15 @@ void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false)
         entry.componentType = "uint32";
         entry.pixelBytes = 16;
         entry.filename = std::string(entry.role) + ".rgba32u";
+    }
+    else if (guideAlbedo)
+    {
+        if (entry.source.viewFormat != DXGI_FORMAT_R8G8B8A8_UNORM ||
+            desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
+            throw std::runtime_error("guide albedo companion requires exact typed RGBA8_UNORM");
+        entry.componentType = "unorm8";
+        entry.pixelBytes = 4;
+        entry.filename = std::string(entry.role) + ".rgba8unorm";
     }
     else if (entry.source.viewFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
         (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS))
@@ -318,6 +328,9 @@ void WriteWhenComplete(const WorkerArgs& args)
             WriteEntry(batch, entry);
         if (batch.boundCb12)
             WriteEntry(batch, *batch.boundCb12);
+        if (batch.earlyGuides)
+            for (const auto& entry : *batch.earlyGuides)
+                WriteEntry(batch, entry);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
         FinishStatus(true, "Fog capture saved: three native floating-point RGBA layers and provenance.", true);
@@ -462,6 +475,42 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                 throw std::runtime_error("fog capture including bound cb12 exceeds the 256 MiB readback limit");
             AllocateReadback(device, *batch->boundCb12);
         }
+        const auto guideCount = std::count_if(layers.earlyGuides.begin(), layers.earlyGuides.end(),
+                                              [](const auto& texture) { return bool(texture.resource); });
+        if (guideCount && guideCount != 3)
+            throw std::runtime_error("early guide companions must be all present or all absent");
+        if (guideCount)
+        {
+            constexpr const char* roles[] = { "early_diffuse_albedo", "early_specular_albedo", "early_normal_roughness" };
+            std::array<Entry, 3> guides;
+            for (size_t i = 0; i < guides.size(); ++i)
+            {
+                const auto& texture = layers.earlyGuides[i];
+                for (const auto& entry : batch->entries)
+                    if (texture.resource.Get() == entry.source.resource.Get())
+                        throw std::runtime_error("early guide must not alias a scene layer");
+                if (texture.resource.Get() == layers.boundCb12.resource.Get())
+                    throw std::runtime_error("early guide must not alias the bound constant companion");
+                for (size_t previous = 0; previous < i; ++previous)
+                    if (texture.resource.Get() == layers.earlyGuides[previous].resource.Get())
+                        throw std::runtime_error("early guide companions must be distinct");
+                const auto desc = texture.resource->GetDesc();
+                const auto format = i < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+                const auto& scene = batch->entries.front().footprint.Footprint;
+                if (texture.subresource != 0 || texture.viewFormat != format || desc.Format != format ||
+                    desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Quality != 0 ||
+                    desc.Width != scene.Width || desc.Height != scene.Height)
+                    throw std::runtime_error("early guide companion layout does not match its native contract");
+                guides[i] = Entry { .role = roles[i], .source = texture };
+                PrepareEntry(device, guides[i], false, i < 2);
+                totalBytes += guides[i].bytes;
+                if (totalBytes > MaxBytes)
+                    throw std::runtime_error("fog capture including early guides exceeds the 256 MiB readback limit");
+            }
+            for (auto& entry : guides)
+                AllocateReadback(device, entry);
+            batch->earlyGuides = std::move(guides);
+        }
         batch->directory = Util::ExePath().parent_path() / "FSRRR-fog-captures" / Timestamp();
         batch->metadata = { { "schema", "optiscaler.fsr_rr.fog_layers.v1" },
                             { "complete", false },
@@ -484,6 +533,17 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
             companion["value_transform"] = "none; raw uint32 constant bits, no floating-point conversion";
             batch->metadata["companions"].push_back(std::move(companion));
         }
+        if (batch->earlyGuides)
+            for (size_t i = 0; i < batch->earlyGuides->size(); ++i)
+            {
+                auto companion = Describe((*batch->earlyGuides)[i]);
+                companion["schema"] = "optiscaler.fsr_rr.early_guide.v1";
+                companion["uav_register"] = i;
+                companion["register_space"] = 0;
+                companion["value_transform"] = "none; native authored guide output bytes";
+                companion["input_provenance"] = "caller_supplied; not authenticated by readback helper";
+                batch->metadata["companions"].push_back(std::move(companion));
+            }
 
         auto args = std::make_unique<WorkerArgs>();
         args->batch = batch;
@@ -508,6 +568,9 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
             RecordCopy(list, entry);
         if (batch->boundCb12)
             RecordCopy(list, *batch->boundCb12);
+        if (batch->earlyGuides)
+            for (const auto& entry : *batch->earlyGuides)
+                RecordCopy(list, entry);
         recorded = true;
 
         const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);

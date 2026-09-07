@@ -753,3 +753,43 @@ It never invokes the virtual function. This records the early CPU source value;
 only a subsequent token observation can establish whether that value was used
 by a particular SL evaluation. Repeated reads are not an atomic snapshot or GPU
 execution guarantee.
+
+Capture `fog-20260907-054003-111Z-324` on build `4b15dad6` observes early
+source frame 108866, then actual nested SL RR tokens 108867 and 108868 (viewport
+zero). These candidates are not accepted as same-frame inputs. Their widespread
+color differences agree with that rejection; the current-view ray-matrix recipe
+nevertheless matches all 20 bound GPU words again. Supplying an explicit frame
+index bypasses Streamline's internal counting, per its [programming guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuide.md#29-tagging-resources).
+The late feature-local RR counter (24567/24568 here) is a different counter and
+must not be compared directly to the engine/SL frame ID.
+
+### Private early-guide experiment components
+
+The isolated guide pass reproduces the authenticated game's guide shader into
+private outputs only: diffuse/specular RGBA8_UNORM and normal/perceptual-roughness
+RGBA16F. The shader is supplied from the installed game at runtime and accepted
+only with the exact byte count/container length/SHA256; no proprietary shader
+payload is distributed in the source tree. Active render dimensions are distinct
+from the possibly larger GBuffer allocation. t0/t1/t2 use copied authored CPU
+SRVs and t4 the authored alternate stencil view. Inactive t3/t5 have typed null
+texture descriptors, while inactive t6 is a null 28-byte-stride structured buffer.
+The initial experiment explicitly rejects enabled transparent/extra-specular
+branches, rather than silently substituting missing inputs.
+
+Pure CPU helpers pack the original 32-byte b6 layout and the five consumed
+registers in a sparse 1584-byte b12. The matrix helper reproduces the observed
+float32 operation order even under the project's fast-FP build settings. It
+rejects unvalidated rounding modes, nonfinite/subnormal inputs, overflow and
+underflow-dependent intermediates without changing the caller's FP environment.
+
+The pass owns its private descriptors/constants/PSO/output textures through the
+existing submission fence before recording any commands. Optional diagnostic
+companions preserve all three native output formats, share the capture budget
+and completion fence, and are never substituted into scene layers. An isolated
+engine-access protocol additionally checks authenticated live helper bodies,
+initialized TLS, current native list/PSO and admitted resources; it requests
+combined pixel/compute readability through the engine tracker and restores the
+engine's root/heap bindings plus the original PSO. It does not invent StateBefore
+values or claim that recording implies GPU completion. These components alone
+do not establish producer order or enable a live rendering correction: the
+caller must validate those conditions before invoking them at the original draw.

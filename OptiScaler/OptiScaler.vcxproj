@@ -530,6 +530,10 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\ffx\FSRDResearchCapture.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogProbe.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkEarlyGuides.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkGuideConstants.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkGuideMatrix.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkEngineAccess.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkGuidePass.h" />
     <ClInclude Include="upscalers\ffx\FSRDFogLayerCapture.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h" />
     <ClInclude Include="inputs\FfxApi_Dx12.h" />
@@ -789,6 +793,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\ffx\FSRDResearchCapture.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDCyberpunkFogProbe.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDCyberpunkEarlyGuides.cpp" />
+    <ClCompile Include="upscalers\ffx\FSRDCyberpunkGuidePass.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDFogLayerCapture.cpp" />
     <ClCompile Include="upscalers\ffx\FFXFeature_Vk.cpp" />
     <ClCompile Include="upscalers\IFeature_Dx11.cpp" />
