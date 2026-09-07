@@ -83,6 +83,8 @@ struct Host
     unsigned readonlyChecks=0;
     bool exposureAdmitted=false;
     unsigned exposureChecks=0;
+    bool lightingAdmitted=false;
+    unsigned lightingChecks=0;
     template<class T> void Put(uintptr_t address,T value)
     { auto& bytes=memory[address]; bytes.resize(sizeof(T)); std::memcpy(bytes.data(),&value,sizeof(T)); }
     bool Read(uintptr_t address,void* output,size_t bytes) noexcept
@@ -106,6 +108,8 @@ struct Host
     { ++readonlyChecks;return readonlyDepth&&texture.handle==4&&texture.native==0x703000; }
     bool IsExposureBufferAdmitted(const E::BufferBorrow& buffer) noexcept
     { ++exposureChecks;return exposureAdmitted&&buffer.handle==10&&buffer.native==0x810000; }
+    bool IsLightingT8Admitted(const E::TextureBorrow& texture) noexcept
+    { ++lightingChecks;return lightingAdmitted&&texture.handle==11&&texture.native==0x820000; }
     uint32_t ThreadId() noexcept { return thread; }
     bool ReadTlsSlotZero(uintptr_t& result) noexcept { result=tls;return tlsOk; }
     bool ListIsDirect(uintptr_t list) noexcept { assert(list==List);return direct; }
@@ -114,7 +118,7 @@ struct Host
     void RequestState(uintptr_t address,uintptr_t context,uint32_t handle,uint32_t state,uint32_t subresource) noexcept
     {
         assert(address==Image+E::RequestStateRva&&context==Context&&subresource==0xffffffff);
-        assert(state==((readonlyDepth&&handle==4)?0xe0u:0xc0u));states.push_back(state);
+        assert(state==(handle==11?0x8c0u:(readonlyDepth&&handle==4)?0xe0u:0xc0u));states.push_back(state);
         calls.push_back("read"+std::to_string(handle));
     }
     void Flush(uintptr_t address,uintptr_t context) noexcept
@@ -154,12 +158,20 @@ void AddExposure(Host& h,E::Input& in)
     h.Put<uint8_t>(ExposureSlot+0xe,0x38);
     h.Put<uintptr_t>(ExposureSlot+0x70,0);
 }
+constexpr uintptr_t LightingSlot=Registry+0x2f1d8+10*0xb0;
+void AddLighting(Host& h,E::Input& in)
+{
+    in.lightingT8={11,0x820000};h.lightingAdmitted=true;
+    h.Put<int32_t>(LightingSlot-8,2);h.Put<uintptr_t>(LightingSlot,in.lightingT8.native);
+    h.Put<uint8_t>(LightingSlot+0x56,0);h.Put<uintptr_t>(LightingSlot+0x68,0);
+}
 // Existing adapters need neither optional method when no buffer was requested.
 struct LegacyHost:Host
 {
 private:
     using Host::IsExposureBufferAdmitted;
     using Host::RequestBufferState;
+    using Host::IsLightingT8Admitted;
 };
 int main()
 {
@@ -203,6 +215,15 @@ int main()
     for(unsigned view:{0,1,2,3,4,5,6,7,11,12,13,15})
         rejected([view](Host& h,E::Input& in){AddExposure(h,in);h.Put<uint8_t>(ExposureSlot+0xe,0x30|view);});
     rejected([](Host& h,E::Input& in){AddExposure(h,in);h.memory.erase(ExposureSlot+0xe);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.lightingAdmitted=false;});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);in.lightingT8.handle=0;});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);in.lightingT8.handle=0x8001;});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);in.lightingT8.native=0;});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<int32_t>(LightingSlot-8,0);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uintptr_t>(LightingSlot,1);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uint8_t>(LightingSlot+0x56,0x40);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uintptr_t>(LightingSlot+0x68,1);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uint32_t>(Context+0x68,4);h.Put<uint8_t>(Registry+0x1a8e988,1);});
     { Host h;auto in=Setup(h);h.Put<uint8_t>(Tls+0x14,0);
       E::RecordPrivateCompute(h,in,[]{return true;});assert(!h.getters); }
     for(unsigned mode=0;mode<3;++mode)
@@ -272,6 +293,27 @@ int main()
     { LegacyHost h;auto in=Setup(h);AddExposure(h,in);
       const auto result=E::RecordPrivateCompute(h,in,[]{assert(false);return true;});
       assert(result.outcome==E::Outcome::Refused&&h.calls.empty()); }
+    { LegacyHost h;auto in=Setup(h);AddLighting(h,in);
+      const auto result=E::RecordPrivateCompute(h,in,[]{assert(false);return true;});
+      assert(result.outcome==E::Outcome::Refused&&h.calls.empty()); }
+    { Host h;auto in=Setup(h);AddExposure(h,in);AddLighting(h,in);
+      const auto result=E::RecordPrivateCompute(h,in,[&]{h.calls.push_back("private");return true;});
+      assert(result.outcome==E::Outcome::PrivateRecordedRestored&&result.requestsIssued==6&&h.lightingChecks>=4);
+      assert((h.calls==std::vector<std::string>{"read1","read2","read3","read4","buffer10","read11","flush","private","reentry","pso"}));
+      assert(h.states.back()==0x8c0); }
+    for(unsigned change=0;change<5;++change)
+    {
+        Host h;auto in=Setup(h);AddLighting(h,in);
+        const auto result=E::RecordPrivateCompute(h,in,[&]{
+            if(change==0)h.lightingAdmitted=false;
+            if(change==1)h.Put<int32_t>(LightingSlot-8,3);
+            if(change==2)h.Put<uintptr_t>(LightingSlot,1);
+            if(change==3)h.Put<uint8_t>(LightingSlot+0x56,0x40);
+            if(change==4)h.Put<uintptr_t>(LightingSlot+0x68,1);
+            return true;
+        });
+        assert(result.outcome==E::Outcome::ScopeLostAfterPrivate&&!result.bindingsRestored);
+    }
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-engine-access-") as name:

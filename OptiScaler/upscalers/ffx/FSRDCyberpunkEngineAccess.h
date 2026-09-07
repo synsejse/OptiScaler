@@ -25,6 +25,7 @@ inline constexpr uintptr_t RequestBufferStateRva = 0x1f51c4;
 // Preserve pixel readability if an input is also used by the intercepted draw:
 // that raw DrawInstanced resumes AFTER its engine binding/transition setup.
 inline constexpr uint32_t InputReadState = 0xc0; // NON_PIXEL | PIXEL_SHADER_RESOURCE
+inline constexpr uint32_t LightingCaptureReadState = 0x8c0; // Also COPY_SOURCE, all read-only.
 inline constexpr uint32_t AllSubresources = 0xffffffff;
 
 struct CodeRange
@@ -82,6 +83,9 @@ struct Input
     // Optional exact buffer used by BOTH original vertex/pixel t37. This is not
     // a generic buffer-read API; the host proves descriptor/format/current-use.
     BufferBorrow exposure {};
+    // Optional original final-lighting pixel t8. Host proves actual current
+    // binder/use and excludes all writable/DSV aliases. No arbitrary texture API.
+    TextureBorrow lightingT8 {};
 };
 
 enum class Outcome
@@ -106,6 +110,17 @@ inline bool HasExposure(const Input& input)
 {
     // A partial nonzero pair is an invalid request, not an absent optional.
     return input.exposure.handle || input.exposure.native;
+}
+
+inline bool HasLightingT8(const Input& input)
+{ return input.lightingT8.handle || input.lightingT8.native; }
+
+template <typename Host> bool LightingT8Admitted(Host& host, const Input& input)
+{
+    if (!HasLightingT8(input)) return true;
+    if constexpr (requires { host.IsLightingT8Admitted(input.lightingT8); })
+        return host.IsLightingT8Admitted(input.lightingT8);
+    return false;
 }
 
 template <typename Host> bool ExposureAdmitted(Host& host, const Input& input)
@@ -164,7 +179,10 @@ struct Snapshot
     uint32_t thread = 0, kind = 0;
     std::array<int32_t, 4> refs {};
     int32_t exposureRefs = 0;
+    int32_t lightingT8Refs = 0;
 };
+
+template <typename Host> bool ReadTexture(Host&, uintptr_t, const TextureBorrow&, int32_t&);
 
 template <typename Host> bool SameScope(Host& host, const Input& input, const Snapshot& saved)
 {
@@ -172,9 +190,11 @@ template <typename Host> bool SameScope(Host& host, const Input& input, const Sn
     uint8_t initialized = 0;
     uint32_t kind = 0;
     int32_t exposureRefs = 0;
+    int32_t lightingT8Refs = 0;
     return host.ThreadId() == saved.thread &&
         ReadOnlyDepthAdmitted(host, input) &&
         ExposureAdmitted(host, input) &&
+        LightingT8Admitted(host, input) &&
         host.IsAdmittedFogScope(input.originalFogScope, input.list, input.originalPso, input.textures) &&
         host.ReadTlsSlotZero(tls) && tls == saved.tls &&
         Read(host, tls, 0x14, initialized) && initialized &&
@@ -185,7 +205,9 @@ template <typename Host> bool SameScope(Host& host, const Input& input, const Sn
         Read(host, context, 0x3d0, pso) && pso == input.originalPso &&
         Read(host, input.image, RegistryRva, registry) && registry == saved.registry &&
         (!HasExposure(input) || (ReadExposure(host, registry, input.exposure, exposureRefs) &&
-                                 exposureRefs == saved.exposureRefs));
+                                 exposureRefs == saved.exposureRefs)) &&
+        (!HasLightingT8(input) || (ReadTexture(host, registry, input.lightingT8, lightingT8Refs) &&
+                                   lightingT8Refs == saved.lightingT8Refs));
 }
 
 template <typename Host> bool ReadTexture(Host& host, uintptr_t registry, const TextureBorrow& texture,
@@ -214,6 +236,7 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
     for (const auto& code : Code)
         if (!host.LiveCodeMatches(input.image, code))
             return false;
+    if (!LightingT8Admitted(host, input)) return false;
     if (HasExposure(input))
     {
         if (!ExposureAdmitted(host, input)) return false;
@@ -231,6 +254,7 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
         !Read(host, saved.context, 0x68, saved.kind) ||
         !Read(host, input.image, RegistryRva, saved.registry) || !saved.registry ||
         (HasExposure(input) && !ReadExposure(host, saved.registry, input.exposure, saved.exposureRefs)) ||
+        (HasLightingT8(input) && !ReadTexture(host, saved.registry, input.lightingT8, saved.lightingT8Refs)) ||
         !SameScope(host, input, saved))
         return false;
     // Internal kind is NOT D3D12_COMMAND_LIST_TYPE. Reject only the known
@@ -271,6 +295,11 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
 //   authored structured SRV/28-byte stride, descriptor ownership/range, current
 //   native BUFFER extent, no writable alias, and retained same-scope lifetime.
 //   It is rechecked at each gate together with the buffer registry fields.
+// - Optional IsLightingT8Admitted proves exact original final-lighting PS t8
+//   binder/descriptor/current-resource ownership and no target/DSV aliases.
+//   It receives a fixed COPY_SOURCE|NON_PIXEL|PIXEL read request. Native state
+//   may remain a compatible superset; subsequent diagnostic readback must NOT
+//   emit a source barrier with a guessed exact StateBefore/restore value.
 // - CurrentNativeList invokes the authenticated Win64 void*() getter.
 // - RequestState invokes void(context*, uint32 handle, uint32 nativeState,
 //   uint32 subresource); Flush invokes void(context*); Reenter invokes void(list*).
@@ -311,6 +340,12 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
             ++result.requestsIssued;
         }
         // Missing method was already refused before any mutation in Prepare.
+    }
+    if (Detail::HasLightingT8(input))
+    {
+        host.RequestState(input.image + RequestStateRva, saved.context, input.lightingT8.handle,
+                          LightingCaptureReadState, AllSubresources);
+        ++result.requestsIssued;
     }
     host.Flush(input.image + FlushRva, saved.context);
     if (!Detail::SameScope(host, input, saved))

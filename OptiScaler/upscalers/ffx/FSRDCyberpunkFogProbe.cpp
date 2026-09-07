@@ -8,6 +8,8 @@
 #include "FSRDCyberpunkLightingShaders.h"
 #include "FSRDCyberpunkExposurePass.h"
 #include "FSRDCyberpunkExposureSource.h"
+#include "FSRDCyberpunkLightingSource.h"
+#include "FSRDCyberpunkLightingConstants.h"
 
 #include <Util.h>
 #include <resource_tracking/FSRDSubmission.h>
@@ -328,6 +330,10 @@ FogNode originalFogNode = nullptr;
 FogNode originalLightingNode = nullptr;
 using FullscreenHelper = void(__fastcall*)(void*, uint32_t, uint8_t);
 FullscreenHelper originalFullscreenHelper = nullptr;
+using BindTextures = void(__fastcall*)(uint32_t, uint32_t, const uint32_t*, uint8_t);
+BindTextures originalBindTextures = nullptr;
+using UploadLightingConstants = void(__fastcall*)(uint32_t, const void*);
+UploadLightingConstants originalUploadLightingConstants = nullptr;
 using GBufferInitializer = void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
 GBufferInitializer originalGBufferInitializer = nullptr;
 using SetPso = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetPipelineState)>::type;
@@ -418,6 +424,11 @@ struct LightingScope
     bool shaderArgumentObserved = false;
     uint32_t shaderArgument = 0;
     unsigned finalDraws = 0;
+    unsigned t8BindCalls = 0;
+    bool t8BindObserved = false;
+    uint32_t t8Handle = 0, t8BindCount = 0;
+    uintptr_t t8BindCaller = 0;
+    FSRD::CyberpunkLightingConstants::Receipt lightingConstants;
 };
 thread_local LightingScope* lightingScope = nullptr;
 
@@ -1296,10 +1307,68 @@ void __fastcall HookFogNode(void* node, void* context)
 void __fastcall HookLightingNode(void* node, void* context)
 {
     PollRearm();
+    // Nested original callbacks can reuse TLS upload/binding descriptor slots.
+    // Never let a parent's old receipt survive that intervening original work.
+    for (auto* parent = lightingScope; parent; parent = parent->previous)
+    {
+        parent->t8BindObserved = false;
+        FSRD::CyberpunkLightingConstants::Invalidate(parent->lightingConstants);
+    }
     LightingScope current { lightingScope, scopes.fetch_add(1) + 1, node, context };
     lightingScope = &current;
     struct Restore { LightingScope* previous; ~Restore() { lightingScope = previous; } } restore { current.previous };
     originalLightingNode(node, context); // Exactly one original callback, including ordinary refusal paths.
+}
+
+FSRD::CyberpunkLightingConstants::Scope CurrentLightingConstantScope()
+{
+    FSRD::CyberpunkLightingConstants::Scope result;
+    uint8_t initialized = 0;
+    if (!lightingScope ||
+        !ReadEarly(uintptr_t(__readgsqword(0x58)), result.tls) ||
+        !ReadEarlyAt(result.tls, 0x14, initialized) || !initialized ||
+        !ReadEarlyAt(result.tls, 0x188, result.engine) ||
+        !ReadEarlyAt(result.engine, 0x30, result.list))
+        throw std::runtime_error("current lighting constant upload TLS/list unavailable");
+    result.serial = lightingScope->serial;
+    result.graphContext = uintptr_t(lightingScope->context);
+    if (!ReadEarlyAt(result.graphContext, 0x18, result.view))
+        throw std::runtime_error("current lighting constant view unavailable");
+    auto identity = ListIdentity(reinterpret_cast<ID3D12GraphicsCommandList*>(result.list));
+    auto& data = Data();
+    std::lock_guard lock(data.mutex);
+    const auto found = data.lists.find(identity.Get());
+    if (found == data.lists.end() || !found->second.known)
+        throw std::runtime_error("current lighting constant list generation unavailable");
+    result.recordingGeneration = found->second.generation;
+    return result;
+}
+
+void __fastcall HookUploadLightingConstants(uint32_t bytes, const void* source)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = lightingScope;
+    FSRD::CyberpunkLightingConstants::Scope observed;
+    bool begun = false;
+    if (current && !inMetadata && lightingRequested.load() && !lightingAttempted.load())
+    {
+        FSRD::CyberpunkLightingConstants::Invalidate(current->lightingConstants);
+        Metadata([&] {
+            if (caller != authenticatedImage.load() + FSRD::CyberpunkLightingConstants::UploadReturnRva) return;
+            observed = CurrentLightingConstantScope();
+            struct Reader { bool Read(uintptr_t p, void* out, size_t n) { return ReadExactMemory(p, out, n); } } reader;
+            begun = FSRD::CyberpunkLightingConstants::Begin(reader, authenticatedImage.load(), caller,
+                observed, bytes, uintptr_t(source), current->lightingConstants);
+        });
+    }
+    originalUploadLightingConstants(bytes, source); // Unmodified bytes, exactly one original upload.
+    if (begun && current == lightingScope)
+        Metadata([&] {
+            struct Reader { bool Read(uintptr_t p, void* out, size_t n) { return ReadExactMemory(p, out, n); } } reader;
+            FSRD::CyberpunkLightingConstants::Complete(reader, CurrentLightingConstantScope(), current->lightingConstants);
+        });
+    if (begun && current->lightingConstants.phase == FSRD::CyberpunkLightingConstants::Phase::Pending)
+        FSRD::CyberpunkLightingConstants::Invalidate(current->lightingConstants);
 }
 
 void __fastcall HookFullscreenHelper(void* renderer, uint32_t shader, uint8_t flag)
@@ -1329,6 +1398,33 @@ void __fastcall HookFullscreenHelper(void* renderer, uint32_t shader, uint8_t fl
         }
     } restore { current, previous, previousShaderObserved, previousShader };
     originalFullscreenHelper(renderer, shader, flag); // Scope only; never invoke an extra engine draw.
+}
+
+void __fastcall HookBindTextures(uint32_t first, uint32_t count, const uint32_t* handles, uint8_t stage)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = lightingScope;
+    uint32_t selected = 0;
+    bool admitted = false;
+    if (current && !inMetadata && lightingRequested.load() && !lightingAttempted.load() &&
+        stage == 1 && first <= 8 && uint64_t(first) + count > 8)
+    {
+        // ANY later scoped PS t8 write invalidates the one original receipt.
+        current->t8BindObserved = false;
+        ++current->t8BindCalls;
+        admitted = current->t8BindCalls == 1 &&
+            FSRD::CyberpunkLightingSource::IsFinalBind(authenticatedImage.load(), caller, first, count, stage) &&
+            uintptr_t(handles) <= UINTPTR_MAX - 3 * sizeof(uint32_t) &&
+            ReadExactMemory(uintptr_t(handles) + 3 * sizeof(uint32_t), &selected, sizeof(selected));
+    }
+    originalBindTextures(first, count, handles, stage); // Exactly one untouched native call.
+    if (admitted && current == lightingScope)
+    {
+        uint32_t repeated = 0;
+        current->t8BindObserved = ReadExactMemory(uintptr_t(handles) + 3 * sizeof(uint32_t), &repeated,
+            sizeof(repeated)) && selected == repeated && selected && selected <= 0x8000;
+        current->t8Handle = selected; current->t8BindCount = count; current->t8BindCaller = caller;
+    }
 }
 
 void WINAPI HookSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
@@ -1794,6 +1890,10 @@ struct LightingCapturePlan
     FSRD::CyberpunkGuidePass::SourceView exposureView;
     Json exposureBindings;
     std::shared_ptr<FSRD::CyberpunkExposurePass::Work> exposureWork;
+    FSRD::CyberpunkLightingSource::Snapshot lightingT8Source {};
+    FSRD::CyberpunkGuidePass::SourceView lightingT8View;
+    Json lightingT8Bindings;
+    bool lightingT8Prepared = false;
 };
 
 struct ExposureMemory
@@ -1802,10 +1902,48 @@ struct ExposureMemory
     { return ReadExactMemory(address, destination, bytes); }
 };
 
-// Both original stages must currently consume this exact structured descriptor.
-// The selector/registry alone do not prove that a buffer is used by this draw.
-Json ObserveExposureBindings(const LightingCapturePlan& plan, uintptr_t expectedDescriptor)
+void DescribeLightingConstants(LightingCapturePlan& plan)
 {
+    auto& evidence = plan.provenance["original_lighting_cb6"];
+    evidence = { { "status", "unavailable" }, { "gpu_payload_proven", false },
+        { "scope", "original 240-byte CPU upload; descriptor correspondence only" } };
+    try
+    {
+        ExposureMemory memory;
+        const auto current = CurrentLightingConstantScope();
+        const auto& receipt = lightingScope->lightingConstants;
+        FSRD::CyberpunkLightingConstants::Binding binding, repeated;
+        if (current.serial != plan.serial || current.list != plan.list || current.recordingGeneration != plan.drawState.generation ||
+            receipt.phase != FSRD::CyberpunkLightingConstants::Phase::Uploaded || current != receipt.scope)
+            throw std::runtime_error("no matching current original lighting CPU upload receipt");
+        evidence["words"] = receipt.words; evidence["byte_count"] = 240;
+        evidence["upload_return_rva"] = FSRD::CyberpunkLightingConstants::UploadReturnRva;
+        evidence["cpu_descriptor"] = receipt.descriptor;
+        evidence["decode_flags_cpu_words"] = { { "optional_decode_byte144", receipt.words[36] },
+            { "t8_t10_decode_byte148", receipt.words[37] }, { "t10_enable_byte164", receipt.words[41] },
+            { "optional_enable_byte216", receipt.words[54] } };
+        const bool corresponds = FSRD::CyberpunkLightingConstants::ObserveBound(memory, current, uintptr_t(plan.pso.Get()), receipt, binding) &&
+            FSRD::CyberpunkLightingConstants::ObserveBound(memory, current, uintptr_t(plan.pso.Get()), receipt, repeated) && binding == repeated;
+        evidence["descriptor_correspondence"] = corresponds;
+        if (corresponds)
+            evidence["pixel_cb6_binding"] = { { "layout", binding.layout }, { "cache", binding.cache },
+                { "descriptor_array", binding.descriptorArray }, { "descriptor_index", binding.descriptorIndex },
+                { "range_index", binding.rangeIndex }, { "native_root_parameter", binding.nativeRootParameter },
+                { "range_bytes", binding.range } };
+        evidence["status"] = "original_cpu_upload_observed";
+        // Reusable descriptor contents/allocation have not been witnessed. These
+        // CPU words are evidence, never authority to dispatch or transform t8.
+    }
+    catch (const std::exception& error) { evidence["reason"] = error.what(); }
+}
+
+// Actual original SRV ranges, defaulting to both stages' exposure t37. The
+// optional PS-only t8 caller uses the same map, not a cached stale descriptor.
+Json ObserveExposureBindings(const LightingCapturePlan& plan, uintptr_t expectedDescriptor,
+                             uint32_t reg = 37, uint32_t firstStage = 0)
+{
+    if ((reg != 37 || firstStage != 0) && (reg != 8 || firstStage != 1))
+        throw std::runtime_error("unsupported original lighting SRV observation");
     uintptr_t tls = 0, engine = 0, cache = 0, layout = 0, descriptors = 0, native = 0, pso = 0;
     uint8_t initialized = 0;
     if (!ReadEarly(uintptr_t(__readgsqword(0x58)), tls) || !ReadEarlyAt(tls, 0x14, initialized) || !initialized ||
@@ -1816,9 +1954,8 @@ Json ObserveExposureBindings(const LightingCapturePlan& plan, uintptr_t expected
         throw std::runtime_error("current exposure binding cache unavailable");
     Json result = { { "tls", tls }, { "engine", engine }, { "cache", cache },
         { "layout", layout }, { "descriptor_array", descriptors }, { "stages", Json::array() } };
-    for (uint32_t stage = 0; stage < 2; ++stage)
+    for (uint32_t stage = firstStage; stage < 2; ++stage)
     {
-        constexpr uint32_t reg = 37;
         uint8_t rangeIndex = 0xff;
         std::array<uint8_t, 16> range {};
         uint64_t resources = 0, samplers = 0, dirty70 = 0, dirty78 = 0;
@@ -1845,6 +1982,91 @@ Json ObserveExposureBindings(const LightingCapturePlan& plan, uintptr_t expected
             { "native_root_parameter", range[14] }, { "cpu_srv_handle", descriptor } });
     }
     return result;
+}
+
+bool SameLightingT8Source(const LightingCapturePlan& plan) noexcept
+{
+    try
+    {
+        ExposureMemory memory;
+        FSRD::CyberpunkLightingSource::Snapshot fresh;
+        return lightingScope && lightingScope->serial == plan.serial && lightingScope->t8BindObserved &&
+            lightingScope->t8BindCalls == 1 && lightingScope->t8Handle == plan.lightingT8Source.handle &&
+            earlyHeapTrackingValid.load() && plan.lightingT8View.resource && plan.lightingT8View.heap &&
+            FSRD::CyberpunkLightingSource::Observe(memory, authenticatedImage.load(), plan.context, fresh) &&
+            fresh == plan.lightingT8Source && uintptr_t(plan.lightingT8View.resource.Get()) == fresh.native &&
+            plan.lightingT8View.descriptor.ptr == fresh.descriptor &&
+            ObserveExposureBindings(plan, fresh.descriptor, 8, 1) == plan.lightingT8Bindings;
+    }
+    catch (...) { return false; }
+}
+
+void PrepareLightingT8(LightingCapturePlan& plan)
+{
+    auto& evidence = plan.provenance["lighting_t8"];
+    evidence = { { "status", "refused" }, { "signal_semantics", "encoded original lighting input; raw-ray/undenoised status not proven" },
+        { "pixel_transform", "none" }, { "read_state_requirement", 0x8c0 }, { "native_state_exact", false } };
+    try
+    {
+        const auto& shader = plan.provenance.at("lighting_shader");
+        if (!shader.at("matched").get<bool>() || shader.at("variant") != "RayTracing_All_NRD" ||
+            !lightingScope->t8BindObserved || lightingScope->t8BindCalls != 1)
+            throw std::runtime_error("selected All_NRD shader or original PS t8 binder receipt absent");
+        ExposureMemory memory;
+        if (!FSRD::CyberpunkLightingSource::Observe(memory, authenticatedImage.load(), plan.context, plan.lightingT8Source))
+            throw std::runtime_error("current owner t8 resource/ordinary view route refused");
+        const auto& source = plan.lightingT8Source;
+        if (source.handle != lightingScope->t8Handle)
+            throw std::runtime_error("current owner t8 differs from original scoped binder handle");
+        plan.lightingT8Bindings = ObserveExposureBindings(plan, source.descriptor, 8, 1);
+        for (const auto& target : plan.targets)
+            if (source.native == uintptr_t(target.resource.Get())) throw std::runtime_error("t8 writable MRT alias");
+        for (const auto& input : plan.textures)
+            if (source.native == input.native) throw std::runtime_error("t8 guide/DSV alias");
+        // This AddRef is at the authenticated original final draw's CURRENT
+        // bound-use boundary, not a registry sample or historical frame pointer.
+        plan.lightingT8View.resource = reinterpret_cast<ID3D12Resource*>(source.native);
+        plan.lightingT8View.descriptor.ptr = source.descriptor;
+        const auto desc = plan.lightingT8View.resource->GetDesc();
+        const auto dimensions = plan.metadata.at("view_dimensions").get<std::array<uint32_t, 2>>();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != dimensions[0] ||
+            desc.Height != dimensions[1] || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+            desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality ||
+            (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+            throw std::runtime_error("actual t8 native format/extents unsupported");
+        const auto bytes = plan.device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        if (!bytes || bytes > 64ull * 1024 * 1024) throw std::runtime_error("t8 ownership budget exceeded");
+        uint64_t generation = 0;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            for (const auto& heap : data.cpuSrvHeaps)
+                if (source.descriptor >= heap.start && (source.descriptor - heap.start) % heap.increment == 0 &&
+                    (source.descriptor - heap.start) / heap.increment < heap.count)
+                {
+                    if (plan.lightingT8View.heap) throw std::runtime_error("t8 CPU descriptor range ambiguous");
+                    plan.lightingT8View.heap = heap.heap; generation = heap.generation;
+                }
+        }
+        if (!SameLightingT8Source(plan)) throw std::runtime_error("current t8 changed before capture admission");
+        evidence["status"] = "prepared";
+        evidence["handle"] = source.handle; evidence["native"] = source.native;
+        evidence["view"] = source.view; evidence["owner"] = source.owner; evidence["view_flags"] = source.viewFlags;
+        evidence["owner_offset"] = 0x26c; evidence["registry"] = source.registry; evidence["slot"] = source.slot;
+        evidence["refs"] = source.refs; evidence["compact_descriptor_bytes"] = source.compact;
+        evidence["cpu_srv_handle"] = source.descriptor; evidence["heap_generation"] = generation;
+        evidence["binder_return_rva"] = lightingScope->t8BindCaller - authenticatedImage.load();
+        evidence["binder_first_register"] = 5; evidence["binder_count"] = lightingScope->t8BindCount;
+        evidence["actual_pixel_binding"] = plan.lightingT8Bindings;
+        evidence["native_view_format"] = unsigned(desc.Format);
+        plan.lightingT8Prepared = true;
+    }
+    catch (const std::exception& error)
+    {
+        plan.lightingT8Prepared = false;
+        evidence["status"] = "refused"; evidence["reason"] = error.what();
+        LOG_WARN("[FSRRR lighting t8] optional capture refused: {}", error.what());
+    }
 }
 
 bool SameExposureSource(const LightingCapturePlan& plan) noexcept
@@ -2030,6 +2252,11 @@ struct LightingEngineHost
     {
         return plan.exposureWork && buffer.handle == plan.exposureSource.handle &&
             buffer.native == plan.exposureSource.native && SameExposureSource(plan);
+    }
+    bool IsLightingT8Admitted(const FSRD::CyberpunkEngineAccess::TextureBorrow& texture) noexcept
+    {
+        return plan.lightingT8Prepared && texture.handle == plan.lightingT8Source.handle &&
+            texture.native == plan.lightingT8Source.native && SameLightingT8Source(plan);
     }
     bool IsAdmittedFogScope(uint64_t serial, uintptr_t list, uintptr_t pso,
                             const std::array<FSRD::CyberpunkEngineAccess::TextureBorrow, 4>& inputs) noexcept
@@ -2255,6 +2482,8 @@ std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsComman
         throw std::runtime_error("current lighting camera/settings changed during preparation");
     plan->work = PrepareLightingGuideWork(*plan);
     PrepareLightingExposure(*plan); // Optional raw words; three native guides remain available if refused.
+    PrepareLightingT8(*plan); // Original encoded texture, without denoising/decoding.
+    DescribeLightingConstants(*plan);
     plan->provenance["current_inputs"] = plan->metadata;
     plan->provenance["actual_pixel_bindings"] = plan->bindings;
     plan->provenance["native_list"] = plan->list;
@@ -2277,6 +2506,7 @@ void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_pt
     input.image = authenticatedImage.load(); input.list = plan->list; input.originalPso = uintptr_t(plan->pso.Get());
     input.originalFogScope = plan->serial; input.textures = plan->textures; input.preserveReadOnlyDepth = true;
     if (plan->exposureWork) input.exposure = { plan->exposureSource.handle, plan->exposureSource.native };
+    if (plan->lightingT8Prepared) input.lightingT8 = { plan->lightingT8Source.handle, plan->lightingT8Source.native };
     if (!FSRDSubmission::Retain(plan->device.Get(), list, plan))
         throw std::runtime_error("lighting capture lifetime retention unavailable");
     const auto result = FSRD::CyberpunkEngineAccess::RecordPrivateCompute(host, input, [&] {
@@ -2318,8 +2548,18 @@ void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_pt
         exposure.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         plan->provenance["exposure_words"]["status"] = "private_dispatch_recorded";
     }
+    FSRDFogLayerCapture::Texture lightingT8;
+    if (plan->lightingT8Prepared)
+    {
+        lightingT8.resource = plan->lightingT8View.resource;
+        lightingT8.viewFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        // Native tracker requested/flushed this read mask; actual can be a
+        // compatible superset. Readback records NO input barrier/guessed Before.
+        lightingT8.state = D3D12_RESOURCE_STATES(FSRD::CyberpunkEngineAccess::LightingCaptureReadState);
+        plan->provenance["lighting_t8"]["status"] = "native_read_mask_requested_and_flushed";
+    }
     const bool recorded = FSRDFogLayerCapture::RecordEarlyGuides(plan->device.Get(), list, outputs, plan->provenance.dump(), plan,
-        plan->exposureWork ? &exposure : nullptr);
+        plan->exposureWork ? &exposure : nullptr, plan->lightingT8Prepared ? &lightingT8 : nullptr);
     LOG_INFO("[FSRRR lighting guides] original draw preserved; private guide readback recorded={} scope={}", recorded, plan->serial);
 }
 
@@ -3362,6 +3602,10 @@ void Initialize(bool enabled)
             {
                 originalLightingNode = reinterpret_cast<FogNode>(image + LightingNodeRva);
                 originalFullscreenHelper = reinterpret_cast<FullscreenHelper>(image + FullscreenHelperRva);
+                originalBindTextures = reinterpret_cast<BindTextures>(image + FSRD::CyberpunkLightingSource::BinderRva);
+                if (std::all_of(std::begin(FSRD::CyberpunkLightingConstants::Code), std::end(FSRD::CyberpunkLightingConstants::Code),
+                    [&](const auto& code) { return MatchLiveCode(image, { code.rva, code.bytes, code.sha256 }); }))
+                    originalUploadLightingConstants = reinterpret_cast<UploadLightingConstants>(image + FSRD::CyberpunkLightingConstants::UploadRva);
             }
             originalFogNode = reinterpret_cast<FogNode>(entry);
             LONG error = DetourTransactionBegin();
@@ -3376,6 +3620,10 @@ void Initialize(bool enabled)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalLightingNode), HookLightingNode);
                 if (error == NO_ERROR && originalFullscreenHelper)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalFullscreenHelper), HookFullscreenHelper);
+                if (error == NO_ERROR && originalBindTextures)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalBindTextures), HookBindTextures);
+                if (error == NO_ERROR && originalUploadLightingConstants)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalUploadLightingConstants), HookUploadLightingConstants);
                 if (error == NO_ERROR)
                     error = DetourTransactionCommit();
                 else
@@ -3387,6 +3635,8 @@ void Initialize(bool enabled)
                 originalGBufferInitializer = nullptr;
                 originalLightingNode = nullptr;
                 originalFullscreenHelper = nullptr;
+                originalBindTextures = nullptr;
+                originalUploadLightingConstants = nullptr;
                 authenticatedImage.store(0);
                 LOG_WARN("[FSRRR fog probe] engine hook failed: {}", error);
                 return;

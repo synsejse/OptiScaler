@@ -200,6 +200,17 @@ int main() {
  plan=Setup();AlterRange(1,[](auto& r){uint32_t b=65535;std::memcpy(r.data()+4,&b,4);});
  Put<uintptr_t>(Descriptors+65535*8,Expected);
  assert(ObserveExposureBindings(plan,Expected)["stages"][1]["descriptor_index"]==65535);
+ // Optional original PS-only t8 uses the SAME authenticated SRV route, without
+ // accepting an absent VS t8 or confusing t8 with t37's descriptor index.
+ plan=Setup();Put<uint8_t>(Layout+0x4c3+2*(128+8),Ranges[1]);
+ AlterRange(1,[](auto& r){uint16_t first=5,count=6;std::memcpy(r.data()+8,&first,2);std::memcpy(r.data()+10,&count,2);});
+ Put<uintptr_t>(Descriptors+303*8,Expected);
+ auto t8=ObserveExposureBindings(plan,Expected,8,1);
+ assert(t8["stages"].size()==1&&t8["stages"][0]["stage"]=="pixel"&&t8["stages"][0]["register"]==8);
+ assert(t8["stages"][0]["descriptor_index"]==303);
+ Put<uintptr_t>(Descriptors+303*8,Expected+1);
+ bool refused=false;try{ObserveExposureBindings(plan,Expected,8,1);}catch(const std::exception&){refused=true;}
+ assert(refused);
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-lighting-exposure-") as directory:

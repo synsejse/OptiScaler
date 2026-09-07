@@ -64,7 +64,7 @@ bool WantsEarlyGuideCapture();
 // NON_PIXEL|PIXEL_SHADER_RESOURCE (0xc0), the private GuidePass's completed-recording
 // state. No shader, exposure, normalization, alpha or integer conversion is made.
 // Caller authenticates the original scene scope/inputs and restores any earlier
-// compute binding changes. This helper only copies private textures/restores states.
+// compute binding changes. This helper only records native copies/restores states.
 // keepAlive is REQUIRED and must retain the dispatch Work's resources/PSO/heaps;
 // earlier dispatch references must already be retained even if this call refuses.
 // Copies are retained before recording on this exact list. Callback return is NOT
@@ -78,12 +78,28 @@ bool WantsEarlyGuideCapture();
 // helper does not read an engine exposure resource or interpret/normalize words.
 // Caller must supply actual GPU-word producer/binding provenance separately and
 // retain its producer Work in keepAlive; a well-formed texture is NOT that proof.
-// All four entries share the existing256MiB cap, owner and completion fence.
+// Optional lightingT8 is a distinct caller-owned typed RGBA16_FLOAT mip0/slice0,
+// single-mip/array/sample texture matching the guide render extent. Pass the
+// required read-state tag0x8c0 (PIXEL|NON_PIXEL_SHADER_RESOURCE|COPY_SOURCE).
+// It may be a private snapshot OR the actual original-lighting pixel t8, owned
+// at its current valid use, with no writable alias. Caller must prove the engine
+// requested and flushed ALL required read bits on THIS recording; the actual
+// native state may be a read-only superset, not an established exact mask. The
+// helper immediately records a native readback copy with NO source barriers;
+// it neither guesses StateBefore nor changes the engine-managed read state.
+// The worker reads only the copied readback memory, never later source pixels.
+// Caller must retain earlier references even
+// if this call refuses. The helper preserves encoded RGBA bits: this input is
+// NOT established as raw-ray or undenoised radiance, and
+// no exposure, alpha, demodulation or other shader math is performed here.
+// All entries share the existing256MiB cap, owner and completion fence.
 // Output: <exe>/FSRRR-early-guide-captures/<UTC timestamp>/manifest.json plus three
-// guides and the optional raw-word companion. Caller evidence is not frame proof.
+// guides and optional exposure_words.rgba32u / lighting_t8.rgba16f companions.
+// Caller evidence is not frame proof. Existing three/four-entry calls are unchanged.
 bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                        const std::array<Texture, 3>& guides, const std::string& provenanceJson,
-                       const std::shared_ptr<void>& keepAlive, const Texture* exposureWords = nullptr) noexcept;
+                       const std::shared_ptr<void>& keepAlive, const Texture* exposureWords = nullptr,
+                       const Texture* lightingT8 = nullptr) noexcept;
 
 // Caller preconditions (not authenticated by this generic readback helper):
 // - Authenticate the exact fog PSO, draw, bindings, subresource and blend descriptor.
