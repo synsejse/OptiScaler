@@ -51,6 +51,7 @@ struct Batch
     std::optional<std::array<Entry, 2>> rayCopies; // Private original-ray snapshots; units remain caller evidence.
     std::optional<Entry> hardwareDepth; // Fog-only private scalar snapshot, never a base scene layer.
     std::optional<std::array<Entry, 3>> privateReset; // Fog-only independent RESET diagnostics, no scene substitution.
+    std::optional<Entry> rgbIdentity; // Private post-identity/pre-Fog snapshot; success is not inferred.
     std::shared_ptr<void> keepAlive;
     Json metadata;
     std::filesystem::path directory;
@@ -432,6 +433,8 @@ void WriteWhenComplete(const WorkerArgs& args)
         if (batch.privateReset)
             for (const auto& entry : *batch.privateReset)
                 WriteEntry(batch, entry);
+        if (batch.rgbIdentity)
+            WriteEntry(batch, *batch.rgbIdentity);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
         FinishStatus(kind, true, batch.guidesOnly ? (batch.rayCopies ?
@@ -723,6 +726,45 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
             }
             batch->privateReset = std::move(outputs);
         }
+        if (layers.rgbIdentity.resource)
+        {
+            if (!keepAlive)
+                throw std::runtime_error("RGB identity snapshot requires retained recording owners");
+            const auto& texture = layers.rgbIdentity;
+            const auto& scene = batch->entries.front().footprint.Footprint;
+            // Layout/state reuse only: this companion is not a ray-copy signal.
+            if (!IsRayCopyTexture(texture.resource->GetDesc(), texture.viewFormat, texture.subresource,
+                                  texture.state, scene.Width, scene.Height, false))
+                throw std::runtime_error("RGB identity snapshot must be exact private RGBA16F/state0xc0 at scene extent");
+            ComPtr<IUnknown> snapshotIdentity;
+            Check(texture.resource->QueryInterface(IID_PPV_ARGS(&snapshotIdentity)),
+                  "RGB identity snapshot resource identity unavailable");
+            if (!snapshotIdentity)
+                throw std::runtime_error("RGB identity snapshot resource identity is null");
+            const auto distinct = [&](const Entry& entry) {
+                ComPtr<IUnknown> identity;
+                Check(entry.source.resource->QueryInterface(IID_PPV_ARGS(&identity)),
+                      "RGB identity companion resource identity unavailable");
+                if (!identity || identity.Get() == snapshotIdentity.Get())
+                    throw std::runtime_error("RGB identity snapshot must not alias any layer or companion");
+            };
+            for (const auto& entry : batch->entries) distinct(entry);
+            if (batch->boundCb12) distinct(*batch->boundCb12);
+            if (batch->earlyGuides)
+                for (const auto& entry : *batch->earlyGuides) distinct(entry);
+            if (batch->hardwareDepth) distinct(*batch->hardwareDepth);
+            if (batch->exposureWords) distinct(*batch->exposureWords);
+            if (batch->lightingT8) distinct(*batch->lightingT8);
+            if (batch->rayCopies)
+                for (const auto& entry : *batch->rayCopies) distinct(entry);
+            if (batch->privateReset)
+                for (const auto& entry : *batch->privateReset) distinct(entry);
+            batch->rgbIdentity = Entry { .role = "rgb_identity", .source = texture };
+            PrepareEntry(device, *batch->rgbIdentity);
+            totalBytes += batch->rgbIdentity->bytes;
+            if (totalBytes > MaxBytes)
+                throw std::runtime_error("RGB identity snapshot exceeds the shared256MiB readback limit");
+        }
         // Validate every optional entry and the aggregate budget before allocating.
         for (auto& entry : batch->entries) AllocateReadback(device, entry);
         if (batch->boundCb12) AllocateReadback(device, *batch->boundCb12);
@@ -731,6 +773,7 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
         if (batch->hardwareDepth) AllocateReadback(device, *batch->hardwareDepth);
         if (batch->privateReset)
             for (auto& entry : *batch->privateReset) AllocateReadback(device, entry);
+        if (batch->rgbIdentity) AllocateReadback(device, *batch->rgbIdentity);
         batch->directory = Util::ExePath().parent_path() / "FSRRR-fog-captures" / Timestamp();
         batch->metadata = { { "schema", "optiscaler.fsr_rr.fog_layers.v1" },
                             { "complete", false },
@@ -789,6 +832,18 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                 batch->metadata["companions"].push_back(std::move(companion));
             }
 
+        if (batch->rgbIdentity)
+        {
+            auto companion = Describe(*batch->rgbIdentity);
+            companion["schema"] = "optiscaler.fsr_rr.fog_rgb_identity.v1";
+            companion["snapshot_stage"] = "pre_fog_after_identity_rgb; caller_supplied";
+            companion["identity_passed"] = false;
+            companion["identity_validation"] = "not_performed; native comparison required";
+            companion["value_transform"] = "none; native RGBA float16 bits including unmodified alpha";
+            companion["input_provenance"] = "caller_supplied; identity draw, bindings and snapshot order not authenticated by readback helper";
+            batch->metadata["companions"].push_back(std::move(companion));
+        }
+
         auto args = std::make_unique<WorkerArgs>();
         args->batch = batch;
         // Hold a module reference only while worker code may execute; do not permanently pin it.
@@ -822,6 +877,8 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
         if (batch->privateReset)
             for (const auto& entry : *batch->privateReset)
                 RecordCopy(list, entry);
+        if (batch->rgbIdentity)
+            RecordCopy(list, *batch->rgbIdentity);
         recorded = true;
 
         const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);

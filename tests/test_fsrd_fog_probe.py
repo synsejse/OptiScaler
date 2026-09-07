@@ -190,7 +190,7 @@ class FogProbe(unittest.TestCase):
     def test_capture_storage_retained_before_first_gpu_copy(self):
         prepare = function("PrepareCapture")
         self.assertLess(prepare.index("FSRDSubmission::Retain("), prepare.index("CopyMain("))
-        self.assertIn("mainBytes + 2 * copyBytes + authoredBytes > MaxCaptureTextureBytes", prepare)
+        self.assertIn("mainBytes + copyCount * copyBytes + authoredBytes > MaxCaptureTextureBytes", prepare)
         self.assertIn("MaxCaptureTextureBytes = 256ull * 1024 * 1024", SOURCE)
         self.assertIn("D3D12_RTV_DIMENSION_TEXTURE2D", prepare)
         self.assertIn("bound.view.Texture2D.MipSlice != 0", prepare)

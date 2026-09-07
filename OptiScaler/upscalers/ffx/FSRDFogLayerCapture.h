@@ -39,6 +39,10 @@ struct Layers
     // Exactly typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
     // exact state0xc0. These are diagnostic copies, never scene replacements.
     std::array<Texture, 3> privateReset;
+    // Optional private snapshot AFTER the identity RGB draw, still BEFORE Fog.
+    // Exact typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
+    // state0xc0. Presence does not establish that the RGB identity test passed.
+    Texture rgbIdentity;
 };
 
 struct Status
@@ -170,6 +174,16 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 // is performed; provider input semantics, current-frame joins and RESET context
 // admission are caller evidence, not inferred from the three file layouts. These
 // companions do NOT enable a live correction or modify any original scene layer.
+// Optional rgbIdentity is a distinct private immutable snapshot after a caller's
+// identity RGB draw and before the original Fog draw. before remains the native
+// snapshot BEFORE the identity draw; after remains AFTER the original Fog draw.
+// Exact typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, matching scene extent
+// and state0xc0 are required. It must not alias ANY layer/companion, including the
+// private RESET outputs. keepAlive must retain its producer's acyclic owners, with
+// earlier-command retention still the caller's responsibility. Shares the existing
+// 256MiB budget/fence/worker and writes rgb_identity.rgba16f without any float or
+// alpha transformation. Snapshot order and identity success are NOT authenticated
+// or inferred by this helper; an actual native comparison remains necessary.
 // provenanceJson must be a JSON object; it is saved as caller-supplied evidence,
 // not treated as proof that the above draw constraints were satisfied.
 //

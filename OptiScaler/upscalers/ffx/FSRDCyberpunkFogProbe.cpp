@@ -15,6 +15,7 @@
 #include "FSRDCyberpunkFogDepth.h"
 #include "FSRDCyberpunkFogDepthCopy.h"
 #include "FSRDCyberpunkFogDenoiseAccess.h"
+#include "FSRDCyberpunkFogRgbWrite.h"
 #include "FSRDPrivateRayCopy.h"
 #include "FSRDCyberpunkResetCamera.h"
 #include "FSRDCyberpunkLightingConstants.h"
@@ -36,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -91,6 +93,11 @@ constexpr FSRD::CyberpunkEngineAccess::CodeRange ProducerCode[] = {
 };
 constexpr uintptr_t LightingNodeRva = 0x154610, FullscreenHelperRva = 0x20c954;
 constexpr uintptr_t FinalLightingHelperReturnRva = 0x155e0c, NativeFullscreenDrawReturnRva = 0x20ccac;
+// Original20cc64 calls this with EDX=2 before the admitted native Draw. It
+// maps2 to TRIANGLELIST4 and sets/caches native IA topology at engine+0x628.
+// There are no directly branched external cold chunks in this exact body.
+constexpr FSRD::CyberpunkEngineAccess::CodeRange FogTopologyCode {
+    0x1f6fbc, 0x1a7, "2c52a561dbce82c04eed3c3b0cfa4ee525ae3aee61d430529b9ff1a6b579b275" };
 constexpr FSRD::CyberpunkEngineAccess::CodeRange LightingCode[] = {
     { 0x154610, 0x1960, "3beb50773dd93b66302aef64a3facea1d9a46976867546abfb16dbc6661ca761" },
     { 0x20c954, 0x63, "dcc4dcd485f4318d8708181a715d6c4b26619a9c8523648525821a49dec92180" },
@@ -361,6 +368,7 @@ std::atomic<unsigned> drawLogs { 0 }, emptyLogs { 0 };
 std::atomic<unsigned> arm { 0 };
 std::atomic<uint64_t> scopes { 0 };
 std::mutex hookMutex;
+std::mutex captureRequestMutex; // Serializes ALL marker admission, not native recording.
 
 namespace ResetPolicy = FSRD::CyberpunkPrivateResetPolicy;
 namespace ResetSource = FSRD::CyberpunkPrivateResetSource;
@@ -387,14 +395,25 @@ struct PrivateResetPacket
 // Published only after CPU allocation/provider initialization has completed on
 // the late RR caller. Exactly one packet/process; never replace an embedded read.
 std::atomic<PrivateResetPacket*> privateResetPacket { nullptr };
+struct RgbIdentityPacket
+{
+    ComPtr<ID3D12Device> device;
+    ComPtr<IUnknown> deviceIdentity;
+    UINT width = 0, height = 0;
+};
+// Dedicated one-shot identity control. Never replaces/joins a RESET packet or
+// changes the late RR route; no early guide/ray producer is requested.
+std::atomic<RgbIdentityPacket*> rgbIdentityPacket { nullptr };
+// Shared publication latch for both exclusive diagnostic modes. It also keeps
+// first native consumers out while either request transaction is incomplete.
 std::atomic<bool> privateResetArming { false };
 
 [[noreturn]] void PrivateResetFatal() noexcept
 {
     earlyFatalRecording.store(true);
-    try { LOG_ERROR("[FSRRR private RESET] FATAL unsafe private dependency; refusing native submission in authenticated Cyberpunk"); }
+    try { LOG_ERROR("[FSRRR pre-Fog diagnostic] FATAL unsafe recording/dependency; refusing further native work in authenticated Cyberpunk"); }
     catch (...) {}
-    // This function is reachable only through a packet armed under the exact
+    // This function is reachable only through a diagnostic armed under the exact
     // executable authentication. Never terminates a launcher or another process.
     TerminateProcess(GetCurrentProcess(), 0xf51d0002u);
     RaiseFailFastException(nullptr, nullptr, 0);
@@ -1210,9 +1229,9 @@ void PollRearm() noexcept
     if (now < due || !nextPoll.compare_exchange_strong(due, now + 1000))
         return;
     Metadata([] {
-        static std::mutex requestMutex;
-        std::unique_lock lock(requestMutex, std::try_to_lock);
-        if (!lock || privateResetArming.load(std::memory_order_acquire))
+        std::unique_lock lock(captureRequestMutex, std::try_to_lock);
+        if (!lock || privateResetArming.load(std::memory_order_acquire) ||
+            rgbIdentityPacket.load(std::memory_order_acquire))
             return;
         if (captureEnabled.load() && captureTrackingValid.load())
         {
@@ -2397,6 +2416,7 @@ struct CapturePlan
     uintptr_t depthFrameObject = 0;
     uint32_t depthFrame = 0;
     bool depthPrepared = false;
+    bool rgbIdentity = false, rgbIdentityPrepared = false;
     UINT64 retainedTextureBytes = 0;
 };
 
@@ -3749,6 +3769,156 @@ struct FogDepthEngineHost
     }
 };
 
+bool IsFullRgbViewport(const ListState& state, UINT width, UINT height) noexcept
+{
+    if (state.viewportCount != 1 || state.scissorCount != 1 || !width || !height || width > 8192 || height > 8192)
+        return false;
+    const auto exact = [](float a, float b) { return std::bit_cast<uint32_t>(a) == std::bit_cast<uint32_t>(b); };
+    const auto& v = state.viewports[0];
+    const auto& r = state.scissors[0];
+    return exact(v.TopLeftX, 0) && exact(v.TopLeftY, 0) && exact(v.Width, float(width)) &&
+        exact(v.Height, float(height)) && exact(v.MinDepth, 0) && exact(v.MaxDepth, 1) &&
+        r.left == 0 && r.top == 0 && r.right == LONG(width) && r.bottom == LONG(height);
+}
+
+bool SameFogRgbSource(const CapturePlan& plan) noexcept
+{
+    try
+    {
+        auto* packet = rgbIdentityPacket.load(std::memory_order_acquire);
+        if (!packet || privateResetPacket.load(std::memory_order_acquire) || privateResetArming.load(std::memory_order_acquire) ||
+            !plan.rgbIdentity || !plan.rgbIdentityPrepared || !plan.privateHeap || !plan.frozenOriginalRtv.ptr ||
+            !plan.layers.before.resource || plan.layers.before.state != D3D12_RESOURCE_STATES(0xc0) ||
+            !plan.layers.rgbIdentity.resource || !originalSetRtv || !originalSetPso || !SameFogDepthSource(plan)) return false;
+        const auto& d = plan.depthSnapshot;
+        const auto& current = *scope;
+        const auto& bound = current.boundRtv;
+        const auto& view = plan.originalView;
+        uint32_t topology = 0;
+        ComPtr<IUnknown> identity;
+        if (!MatchLiveCode(authenticatedImage.load(), FogTopologyCode) ||
+            !ReadEarlyAt(d.scope.engine, 0x628, topology) || topology != 4 ||
+            current.rtvList != reinterpret_cast<ID3D12GraphicsCommandList*>(d.scope.list) ||
+            current.rtvs[0].ptr != plan.originalRtv.ptr || !bound.known || bound.resource.Get() != plan.main.Get() ||
+            bound.heap.Get() != plan.sourceHeap.Get() || bound.view.Format != view.Format ||
+            bound.view.ViewDimension != view.ViewDimension || bound.view.Texture2D.MipSlice != view.Texture2D.MipSlice ||
+            bound.view.Texture2D.PlaneSlice != view.Texture2D.PlaneSlice ||
+            FAILED(plan.device->QueryInterface(IID_PPV_ARGS(&identity))) || !identity || identity.Get() != packet->deviceIdentity.Get())
+            return false;
+        // Scope holds the actual original-use RTV resource/view, not a reread of
+        // its reusable CPU slot. The approved helper changes no IA/RS/VRS; the
+        // exact original20cc64→1f6fbc path and repeated engine cache4 witness
+        // TRIANGLELIST. Unsupported external untracked IA mutation is not admitted.
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        const auto found = data.lists.find(plan.endpoint->list.Get());
+        return found != data.lists.end() && found->second.known && !found->second.predicated &&
+            !found->second.renderPass && !found->second.queryCount && found->second.generation == plan.drawState.generation &&
+            IsFullRgbViewport(found->second, packet->width, packet->height);
+    }
+    catch (...) { return false; }
+}
+
+struct FogRgbEngineHost : FogDepthEngineHost
+{
+    explicit FogRgbEngineHost(const CapturePlan& value) : FogDepthEngineHost { value } {}
+    bool targetRestored = false;
+    bool IsAdmittedFogRgbScope(const FSRD::CyberpunkFogDenoiseAccess::Input& input) noexcept
+    { return !input.copySource && SameFogRgbSource(plan); }
+    void RestoreOriginalFogTarget(uintptr_t list) noexcept
+    {
+        // Real OM setter, not an engine-cache assignment. One frozen equivalent
+        // original RTV, no DSV, no color write. Bypasses diagnostic hook tracking.
+        originalSetRtv(reinterpret_cast<ID3D12GraphicsCommandList*>(list), 1, &plan.frozenOriginalRtv, FALSE, nullptr);
+        targetRestored = true;
+    }
+};
+
+void RecordRgbIdentity(ID3D12GraphicsCommandList* list, CapturePlan& plan)
+{
+    if (!plan.rgbIdentity) return;
+    auto& evidence = plan.provenance["rgb_identity_control"];
+    bool snapshotStarted = false;
+    bool privateStatesKnown = true;
+    try
+    {
+        if (!plan.rgbIdentityPrepared || !plan.depthPrepared || !SameFogDepthSource(plan) ||
+            plan.layers.before.state != D3D12_RESOURCE_STATE_COPY_DEST ||
+            plan.layers.rgbIdentity.state != D3D12_RESOURCE_STATE_COPY_DEST)
+            throw std::runtime_error("RGB identity original Fog depth/scope unavailable");
+        auto* packet = rgbIdentityPacket.load(std::memory_order_acquire);
+        if (!packet) throw std::runtime_error("RGB identity explicit packet unavailable");
+        const auto& original = plan.depthSnapshot.scope;
+        evidence["scope"] = original.serial;
+        evidence["view"] = original.view;
+        evidence["frame_source_object"] = plan.depthFrameObject;
+        evidence["frame_source_value"] = plan.depthFrame;
+        evidence["list"] = original.list;
+        evidence["recording_generation"] = original.recordingGeneration;
+        evidence["render_extent"] = { packet->width, packet->height };
+        evidence["source_snapshot_address"] = uintptr_t(plan.layers.before.resource.Get());
+        evidence["target_address"] = uintptr_t(plan.main.Get());
+        evidence["identity_snapshot_address"] = uintptr_t(plan.layers.rgbIdentity.resource.Get());
+        const char* error = nullptr;
+        // Work is local, not owned by the CapturePlan retained through readback.
+        // Its separate leaf lease retains resources/root/PSO before any RGB command.
+        auto work = FSRD::CyberpunkFogRgbWrite::Prepare(plan.device.Get(), packet->width, packet->height,
+            plan.layers.before.resource, plan.main, plan.originalView, plan.drawState.viewports[0],
+            plan.drawState.scissors[0], &error);
+        if (!work) throw std::runtime_error(error && *error ? error : "RGB identity preparation refused");
+        // CopyMain already captured this exact same-list pre-Fog image and
+        // restored main RT. Only this OWNED source receives a private barrier.
+        privateStatesKnown = false;
+        Transition(list, plan.layers.before.resource.Get(), plan.layers.before.state, D3D12_RESOURCE_STATES(0xc0));
+        plan.layers.before.state = D3D12_RESOURCE_STATES(0xc0);
+        privateStatesKnown = true;
+        FogRgbEngineHost host { plan };
+        FSRD::CyberpunkFogDenoiseAccess::Input input;
+        input.image = authenticatedImage.load(); input.list = uintptr_t(list);
+        input.originalPso = uintptr_t(plan.originalPso.Get()); input.originalFogScope = plan.depthSnapshot.scope.serial;
+        input.depth = { plan.depthSnapshot.handle, plan.depthSnapshot.native };
+        const auto result = FSRD::CyberpunkFogDenoiseAccess::RecordSceneRgb(host, input, [&] { return work->Record(list); });
+        if (result.outcome == FSRD::CyberpunkFogDenoiseAccess::SceneOutcome::ScopeLostAfterMutation ||
+            (result.bindingsRestored && !host.targetRestored))
+        {
+            plan.fatalEarlyRecording = true;
+            PrivateResetFatal(); // Terminal latch precedes logging/JSON; never resume a corrupt Fog recording.
+        }
+        evidence["outcome"] = unsigned(result.outcome);
+        evidence["callback_entered"] = result.callbackEntered;
+        evidence["bindings_restored"] = result.bindingsRestored;
+        evidence["original_target_restored"] = host.targetRestored;
+        evidence["draw_recorded"] = work->Recorded();
+        evidence["identity_passed"] = nullptr; // Only actual raw before/snapshot comparison can establish this.
+        if (!result.bindingsRestored || !result.callbackEntered)
+            throw std::runtime_error("RGB identity scene admission refused before draw");
+        // Even a callback failure can have partial RGB writes. Capture them for
+        // the control, never report rollback/success/retry or run a second denoiser.
+        snapshotStarted = true;
+        privateStatesKnown = false;
+        CopyMain(list, plan, plan.layers.rgbIdentity.resource.Get());
+        Transition(list, plan.layers.rgbIdentity.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATES(0xc0));
+        plan.layers.rgbIdentity.state = D3D12_RESOURCE_STATES(0xc0);
+        privateStatesKnown = true;
+        evidence["status"] = result.outcome == FSRD::CyberpunkFogDenoiseAccess::SceneOutcome::SceneRecordedRestored
+            ? "rgb_draw_and_pre_fog_snapshot_recorded" : "rgb_draw_failed_restored_snapshot_recorded";
+        evidence["snapshot_order"] = "original pre-Fog copy -> RGB-only identity -> snapshot -> original Fog once";
+    }
+    catch (const std::exception& error)
+    {
+        // Do not pass a potentially half-transitioned private resource into
+        // later readback. The outer caller abandons capture; its prior retention
+        // still owns every recorded resource, and CopyMain restores native RT.
+        if (!privateStatesKnown) throw;
+        // Before snapshot recording this optional owner is unused and can be
+        // dropped. After any copy attempt keep it in the already-retained plan,
+        // even if later readback refuses its incomplete state.
+        if (!snapshotStarted) plan.layers.rgbIdentity = {};
+        evidence["status"] = "identity_control_refused_or_incomplete";
+        evidence["reason"] = error.what();
+    }
+}
+
 void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
 {
     auto& evidence = plan.provenance["hardware_depth"];
@@ -4062,6 +4232,8 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         return {};
     }
     auto plan = std::make_shared<CapturePlan>();
+    const auto* rgbPacket = rgbIdentityPacket.load(std::memory_order_acquire);
+    plan->rgbIdentity = rgbPacket != nullptr;
     plan->endpoint = std::make_shared<EndpointTrace>();
     ListState state;
     {
@@ -4168,6 +4340,17 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         RefuseCapture("RTV resource is not a supported single-array/single-sample RGBA16F target");
         return {};
     }
+    if (plan->rgbIdentity &&
+        (privateResetPacket.load(std::memory_order_acquire) || lightingRequested.load() || earlyRequested.load() ||
+         !s.fogHelper || nativeCaller != authenticatedImage.load() + FSRD::CyberpunkFogDepth::DrawReturnRva ||
+         desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.MipLevels != 1 ||
+         desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+         desc.Width != rgbPacket->width || desc.Height != rgbPacket->height ||
+         !IsFullRgbViewport(state, rgbPacket->width, rgbPacket->height)))
+    {
+        RefuseCapture("RGB identity requires exact full typed RGBA16F original Fog draw and exclusive mode");
+        return {};
+    }
     Json earlyAvailability;
     if (lightingRequested.load())
     {
@@ -4211,6 +4394,13 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     ComPtr<ID3D12Device> listDevice;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&listDevice))) || listDevice.Get() != plan->device.Get())
         throw std::runtime_error("fog target/list device mismatch");
+    if (rgbPacket)
+    {
+        ComPtr<IUnknown> identity;
+        if (FAILED(plan->device->QueryInterface(IID_PPV_ARGS(&identity))) || !identity ||
+            identity.Get() != rgbPacket->deviceIdentity.Get())
+            throw std::runtime_error("RGB identity armed device differs from original Fog target");
+    }
 
     plan->originalRtv = s.rtvs[0];
     plan->contiguous = s.contiguous;
@@ -4227,8 +4417,9 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     const auto mainBytes = plan->device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
     const auto copyBytes = plan->device->GetResourceAllocationInfo(0, 1, &beforeDesc).SizeInBytes;
     const auto authoredBytes = plan->device->GetResourceAllocationInfo(0, 1, &authoredDesc).SizeInBytes;
+    const UINT64 copyCount = plan->rgbIdentity ? 3 : 2;
     if (mainBytes > MaxCaptureTextureBytes || copyBytes > MaxCaptureTextureBytes || authoredBytes > MaxCaptureTextureBytes ||
-        mainBytes + 2 * copyBytes + authoredBytes > MaxCaptureTextureBytes)
+        mainBytes + copyCount * copyBytes + authoredBytes > MaxCaptureTextureBytes)
         throw std::runtime_error("fog capture retained texture allocation exceeds 256 MiB");
     SYSTEMTIME now {};
     GetSystemTime(&now);
@@ -4265,6 +4456,18 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     allocate(beforeDesc, D3D12_RESOURCE_STATE_COPY_DEST, plan->layers.before);
     allocate(beforeDesc, D3D12_RESOURCE_STATE_COPY_DEST, plan->layers.after);
     allocate(authoredDesc, D3D12_RESOURCE_STATE_RENDER_TARGET, plan->layers.authored);
+    if (plan->rgbIdentity)
+    {
+        allocate(beforeDesc, D3D12_RESOURCE_STATE_COPY_DEST, plan->layers.rgbIdentity);
+        plan->rgbIdentityPrepared = true;
+        plan->provenance["rgb_identity_control"] = {
+            { "mode", "rgb_identity_only" }, { "status", "private_snapshot_prepared" },
+            { "scene_write", "RGB only from same-list pre-Fog copy; native alpha unwritten" },
+            { "denoising", "unchanged ordinary late RR; no early guide/RESET work" },
+            { "identity_passed", nullptr }, { "topology", "authenticated original preparation and engine+0x628==4" },
+            { "coordinates", "sample-interpolated UV; actual compiled sample-frequency reflection required" }
+        };
+    }
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc {};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     heapDesc.NumDescriptors = 2;
@@ -4280,8 +4483,8 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     plan->device->CreateRenderTargetView(plan->main.Get(), &plan->originalView, plan->frozenOriginalRtv);
     plan->provenance["restoration"] = { { "frozen_rtv_handle", plan->frozenOriginalRtv.ptr },
         { "binding", "exact owned original resource/view; original CPU descriptor may have been reused" } };
-    PrepareBoundCb12Target(*plan, MaxCaptureTextureBytes - (mainBytes + 2 * copyBytes + authoredBytes));
-    plan->retainedTextureBytes = mainBytes + 2 * copyBytes + authoredBytes;
+    PrepareBoundCb12Target(*plan, MaxCaptureTextureBytes - (mainBytes + copyCount * copyBytes + authoredBytes));
+    plan->retainedTextureBytes = mainBytes + copyCount * copyBytes + authoredBytes;
     if (plan->layers.boundCb12.resource)
     {
         const auto cbDesc = plan->layers.boundCb12.resource->GetDesc();
@@ -4296,8 +4499,13 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     CopyMain(list, *plan, plan->layers.before.resource.Get());
     RecordFogDepth(list, *plan); // Independent private snapshot on Fog's own list, no guide reads.
     if (plan->fatalEarlyRecording) return plan;
-    RecordPrivateReset(list, *plan);
-    PrepareAndRecordEarlyGuides(list, *plan); // Optional private outputs; never writes the original scene.
+    if (plan->rgbIdentity)
+        RecordRgbIdentity(list, *plan); // Explicit identity-only marker; no denoised replacement or late-route change.
+    else
+    {
+        RecordPrivateReset(list, *plan);
+        PrepareAndRecordEarlyGuides(list, *plan); // Optional private outputs; never writes the original scene.
+    }
     return plan;
 }
 
@@ -4784,15 +4992,84 @@ bool Authenticate(uintptr_t& entry)
 }
 } // namespace
 
-void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
+void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept
 {
     if (!active.load() || !captureEnabled.load() || !captureTrackingValid.load() ||
-        privateResetPacket.load(std::memory_order_acquire)) return;
+        rgbIdentityPacket.load(std::memory_order_acquire) || privateResetPacket.load(std::memory_order_acquire)) return;
     static std::atomic<ULONGLONG> nextPoll { 0 };
     auto due = nextPoll.load();
     const auto now = GetTickCount64();
     if (now < due || !nextPoll.compare_exchange_strong(due, now + 1000)) return;
     Metadata([&] {
+        std::unique_lock requestLock(captureRequestMutex, std::try_to_lock);
+        if (!requestLock) return;
+        const auto path = Util::ExePath().parent_path() / L"FSRRR-prefog-rgb-identity.request";
+        const auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return;
+        if (privateResetArming.exchange(true, std::memory_order_acq_rel)) return;
+        struct FinishArming
+        {
+            ~FinishArming() { privateResetArming.store(false, std::memory_order_release); }
+        } finishArming;
+        if (rgbIdentityPacket.load(std::memory_order_acquire) || privateResetPacket.load(std::memory_order_acquire)) return;
+        bool queued = false;
+        try
+        {
+            const auto fog = FSRDFogLayerCapture::GetStatus();
+            const auto guides = FSRDFogLayerCapture::GetEarlyGuideStatus();
+            if (!device || !width || !height || width > 8192 || height > 8192 ||
+                captureStarted.load() || lightingRequested.load() || lightingAttempted.load() ||
+                earlyRequested.load() || earlyAttempted.load() || rayCopyAttempted.load() ||
+                fog.queued || fog.busy || fog.attempted || guides.queued || guides.busy || guides.attempted ||
+                !fogDepthAuthenticated.load() || authenticatedImage.load() != uintptr_t(GetModuleHandleW(nullptr)) ||
+                !MatchLiveCode(authenticatedImage.load(), FogTopologyCode) || std::filesystem::file_size(path) > 4096)
+                throw std::runtime_error("RGB identity requires an unused authenticated capture session");
+            Json controls;
+            {
+                // Close the Windows reader before DeleteFileW; no open handle
+                // without DELETE sharing may survive marker consumption.
+                std::ifstream file(path, std::ios::binary);
+                file >> controls;
+            }
+            if (!controls.is_object() || controls.size() != 1 || controls.at("mode") != "rgb_identity_only")
+                throw std::runtime_error("RGB identity requires exactly the explicit rgb_identity_only mode");
+            auto packet = std::make_unique<RgbIdentityPacket>();
+            packet->device = device; packet->width = width; packet->height = height;
+            if (FAILED(device->QueryInterface(IID_PPV_ARGS(&packet->deviceIdentity))) || !packet->deviceIdentity)
+                throw std::runtime_error("RGB identity device identity unavailable");
+            if (!FSRDFogLayerCapture::Request())
+                throw std::runtime_error("RGB identity Fog capture slot unavailable");
+            queued = true;
+            if (!DeleteFileW(path.c_str()))
+                throw std::runtime_error(std::format("RGB identity marker could not be consumed (Win32 {})", GetLastError()));
+            rgbIdentityPacket.store(packet.release(), std::memory_order_release);
+            queued = false;
+            LOG_INFO("[FSRRR RGB identity] armed {}x{} one-shot RGB-only control; alpha unwritten, no guide/RESET or late-route change", width, height);
+        }
+        catch (const std::exception& error)
+        {
+            if (queued) FSRDFogLayerCapture::CancelRequest();
+            LOG_WARN("[FSRRR RGB identity] arm refused: {}", error.what());
+        }
+        catch (...)
+        {
+            if (queued) FSRDFogLayerCapture::CancelRequest();
+            throw; // Metadata contains logging/allocation failures; latch still clears.
+        }
+    });
+}
+
+void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
+{
+    if (!active.load() || !captureEnabled.load() || !captureTrackingValid.load() ||
+        privateResetPacket.load(std::memory_order_acquire) || rgbIdentityPacket.load(std::memory_order_acquire)) return;
+    static std::atomic<ULONGLONG> nextPoll { 0 };
+    auto due = nextPoll.load();
+    const auto now = GetTickCount64();
+    if (now < due || !nextPoll.compare_exchange_strong(due, now + 1000)) return;
+    Metadata([&] {
+        std::unique_lock requestLock(captureRequestMutex, std::try_to_lock);
+        if (!requestLock) return;
         const auto path = Util::ExePath().parent_path() / L"FSRRR-prefog-reset.request";
         const auto attributes = GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return;
@@ -4801,7 +5078,7 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
         {
             ~FinishArming() { privateResetArming.store(false, std::memory_order_release); }
         } finishArming;
-        if (privateResetPacket.load(std::memory_order_acquire)) return;
+        if (privateResetPacket.load(std::memory_order_acquire) || rgbIdentityPacket.load(std::memory_order_acquire)) return;
         try
         {
             if (!device || !width || !height || width > 8192 || height > 8192 ||

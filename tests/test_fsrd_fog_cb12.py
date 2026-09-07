@@ -101,7 +101,7 @@ class BoundCb12Probe(unittest.TestCase):
         prepare = body(PROBE, "PrepareCapture")
         self.assertLess(prepare.index("PrepareBoundCb12Target("), prepare.index("FSRDSubmission::Retain("))
         self.assertLess(prepare.index("FSRDSubmission::Retain("), prepare.index("CopyMain("))
-        self.assertIn("MaxCaptureTextureBytes - (mainBytes + 2 * copyBytes + authoredBytes)", prepare)
+        self.assertIn("MaxCaptureTextureBytes - (mainBytes + copyCount * copyBytes + authoredBytes)", prepare)
         self.assertIn("plan->drawState = state", prepare)
 
     def test_companion_draw_preserves_roots_heaps_and_restores_exact_graphics_arrays(self):

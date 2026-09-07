@@ -7,7 +7,7 @@
 
 // Research-only probe for one authenticated Cyberpunk executable. Metadata-only
 // unless the separate CyberpunkFogCapture INI opt-in AND an explicit one-shot
-// FSRRR-fog-capture.request marker are present. That capture copies the original
+// capture/control marker are present. FSRRR-fog-capture.request copies the original
 // target and repeats the authenticated shader only against a private RGBA target;
 // it does not implement a fog correction or change the normal RR input mapping.
 // Initialize at device setup, never under DllMain's loader lock. Once installed,
@@ -23,6 +23,13 @@ void HookCommandList(ID3D12GraphicsCommandList* commandList);
 // one-shot packet for an explicit FSRRR-prefog-reset.request JSON marker; its
 // supplied extent is allocation metadata, never a future frame association.
 void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept;
+// Separate one-shot FSRRR-prefog-rgb-identity.request JSON marker with exactly
+// {"mode":"rgb_identity_only"}. Requires an unused authenticated capture session.
+// Copies pre-Fog RGB back through the approved RGB-only raster helper, snapshots
+// the result, then resumes the original Fog draw once. Original alpha is unwritten;
+// actual identity is tested from the snapshots, NOT assumed. No guide/RESET packet,
+// denoised scene substitution, or change to the ordinary late RR/SR route.
+void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept;
 // Mandatory dependency veto BEFORE both native Execute branches and their
 // FSRDSubmission::Preparing calls. A refusal terminates this authenticated game
 // diagnostic, never drops a native list or pretends that submission succeeded.

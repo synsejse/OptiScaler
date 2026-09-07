@@ -1,0 +1,352 @@
+"""Compile the actual inactive RGB-write helper with D3D/COM recording mocks.
+
+Checks exact admission, PSO/reflection gates, recording order and ownership.
+The compiler/reflection and GPU are mocked: no real shader execution, original
+Fog restoration, frame dependency or alpha preservation on hardware is claimed.
+"""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / 'OptiScaler/upscalers/ffx'
+SOURCE = (BASE / 'FSRDCyberpunkFogRgbWrite.cpp').read_text()
+HEADER = (BASE / 'FSRDCyberpunkFogRgbWrite.h').read_text()
+
+
+class FogRgbWrite(unittest.TestCase):
+    def test_isolated_explicit_scene_write_contract(self):
+        for forbidden in ('Config::', 'State::', 'NVSDK_', 'ResourceBarrier', 'CopyTexture',
+                          'ClearRenderTargetView', 'IASet', 'RSSet', 'SetPredication', 'Dispatch(',
+                          'ExecuteCommandLists', 'WaitFor', 'shared_from_this', 'GetModuleHandle',
+                          'CyberpunkFogDenoiseAccess'):
+            self.assertNotIn(forbidden, SOURCE)
+        self.assertIn('RGB-only write mask leaves original alpha UNWRITTEN', HEADER)
+        self.assertIn('scene-write operation, NOT authorized by the private-compute-only wrapper', HEADER)
+        self.assertIn('TRIANGLELIST', HEADER)
+        self.assertIn('including invalid-list/retention failures', HEADER)
+        self.assertIn('NOT submitted or completed', HEADER)
+        record = SOURCE.split('bool Work::Record', 1)[1]
+        self.assertEqual(record.count('DrawInstanced('), 1)
+        self.assertIn('DrawInstanced(3, 1, 0, 0)', record)
+        self.assertLess(record.index('FSRDSubmission::Retain'), record.index('SetGraphicsRootSignature'))
+        self.assertLess(record.index('Require(bool(retained)'), record.index('SetGraphicsRootSignature'))
+        lease = SOURCE.split('struct Lease\n', 1)[1].split('};', 1)[0]
+        self.assertNotIn('Work', lease)
+        self.assertNotIn('Ticket', lease)
+        self.assertNotIn('CapturePlan', lease)
+
+    def test_actual_compiled_shader_frequency_is_required(self):
+        self.assertIn('Compile("VSMain", "vs_5_0")', SOURCE)
+        self.assertIn('Compile("PSMain", "ps_5_0")', SOURCE)
+        self.assertIn('float2 uv : TEXCOORD0;', SOURCE)
+        self.assertIn('output.uv = p;', SOURCE)
+        self.assertIn('output.position = float4(p * float2(2, -2) + float2(-1, 1), 0, 1);', SOURCE)
+        self.assertIn('float4 PSMain(sample float2 uv : TEXCOORD0)', SOURCE)
+        self.assertIn('Input.GetDimensions(width, height);', SOURCE)
+        self.assertIn('Input.Load(int3(uint2(uv * float2(width, height)), 0)).rgb', SOURCE)
+        pixel_shader = SOURCE.split('float4 PSMain(', 1)[1].split(')";', 1)[0]
+        self.assertNotIn('position.xy', pixel_shader)
+        self.assertNotIn('SV_SampleIndex', pixel_shader)
+        self.assertIn('D3DReflect(ps->GetBufferPointer(), ps->GetBufferSize()', SOURCE)
+        self.assertIn('reflection && reflection->IsSampleFrequencyShader()', SOURCE)
+        self.assertLess(SOURCE.index('reflection->IsSampleFrequencyShader()'),
+                        SOURCE.index('device->CreateGraphicsPipelineState'))
+        self.assertNotIn('D3DCOMPILE_SKIP_OPTIMIZATION', SOURCE)
+        self.assertNotIn('D3DCOMPILE_SKIP_VALIDATION', SOURCE)
+        self.assertNotIn('D3D12_COLOR_WRITE_ENABLE_ALPHA', SOURCE)
+        self.assertNotIn('D3D12_COLOR_WRITE_ENABLE_ALL', SOURCE)
+        self.assertIn('MaxDiagnosticBytes = 2048', SOURCE)
+        self.assertIn('size < MaxDiagnosticBytes ? size : MaxDiagnosticBytes', SOURCE)
+        self.assertIn('compilation HRESULT={:08x}', SOURCE)
+
+    def test_actual_cpp_prepare_record_and_failure_lifetime(self):
+        compiler = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++')
+        if not compiler:
+            self.skipTest('Set CXX to compile the actual RGB-write helper')
+        windows = r'''
+#pragma once
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+using UINT=unsigned;using UINT64=uint64_t;using HRESULT=int;using BOOL=int;using LONG=int32_t;
+#define SUCCEEDED(x) ((x)>=0)
+#define IID_PPV_ARGS(x) (x)
+template<class... T>void MockLog(T&&...){}
+#define LOG_WARN(...) MockLog(__VA_ARGS__)
+#ifndef __fastcall
+#define __fastcall
+#endif
+constexpr BOOL TRUE=1,FALSE=0;
+enum {DXGI_FORMAT_R16G16B16A16_FLOAT=10,D3D12_RESOURCE_DIMENSION_TEXTURE2D=3,
+ D3D12_TEXTURE_LAYOUT_UNKNOWN=0,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET=1,
+ D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL=2,D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE=8,
+ D3D12_DESCRIPTOR_RANGE_TYPE_SRV=0,D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE=0,
+ D3D12_SHADER_VISIBILITY_PIXEL=5,D3D_ROOT_SIGNATURE_VERSION_1=1,
+ D3D12_BLEND_ONE=2,D3D12_BLEND_ZERO=1,D3D12_BLEND_OP_ADD=1,D3D12_LOGIC_OP_NOOP=4,
+ D3D12_COLOR_WRITE_ENABLE_RED=1,D3D12_COLOR_WRITE_ENABLE_GREEN=2,D3D12_COLOR_WRITE_ENABLE_BLUE=4,
+ D3D12_FILL_MODE_SOLID=3,D3D12_CULL_MODE_NONE=1,D3D12_DEPTH_WRITE_MASK_ZERO=0,
+ D3D12_COMPARISON_FUNC_ALWAYS=8,D3D12_DEFAULT_STENCIL_READ_MASK=255,
+ D3D12_DEFAULT_STENCIL_WRITE_MASK=255,D3D12_STENCIL_OP_KEEP=1,
+ D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE=3,D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV=0,
+ D3D12_DESCRIPTOR_HEAP_TYPE_RTV=2,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE=1,
+ D3D12_DESCRIPTOR_HEAP_FLAG_NONE=0,D3D12_SRV_DIMENSION_TEXTURE2D=4,
+ D3D12_RTV_DIMENSION_TEXTURE2D=4,D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING=5768,
+ D3D12_COMMAND_LIST_TYPE_DIRECT=0,D3DCOMPILE_ENABLE_STRICTNESS=1,D3DCOMPILE_OPTIMIZATION_LEVEL3=2};
+struct D3D12_CPU_DESCRIPTOR_HANDLE{size_t ptr=0;};
+struct D3D12_GPU_DESCRIPTOR_HANDLE{UINT64 ptr=0;};
+struct D3D12_VIEWPORT{float TopLeftX=0,TopLeftY=0,Width=0,Height=0,MinDepth=0,MaxDepth=1;};
+struct D3D12_RECT{LONG left=0,top=0,right=0,bottom=0;};
+struct D3D12_RESOURCE_DESC{UINT Dimension=3;UINT64 Width=4;UINT Height=4,DepthOrArraySize=1,MipLevels=1;
+ UINT Format=10;struct{UINT Count=1,Quality=0;}SampleDesc;UINT Layout=0,Flags=0;};
+struct D3D12_RESOURCE_ALLOCATION_INFO{UINT64 SizeInBytes;};
+struct D3D12_RENDER_TARGET_VIEW_DESC{UINT Format=0,ViewDimension=0;struct{UINT MipSlice=0,PlaneSlice=0;}Texture2D;};
+struct D3D12_SHADER_RESOURCE_VIEW_DESC{UINT Format=0,ViewDimension=0,Shader4ComponentMapping=0;
+ struct{UINT MostDetailedMip=0,MipLevels=0,PlaneSlice=0;float ResourceMinLODClamp=0;}Texture2D;};
+struct D3D12_DESCRIPTOR_HEAP_DESC{UINT Type=0,NumDescriptors=0,Flags=0,NodeMask=0;};
+struct D3D12_DESCRIPTOR_RANGE{UINT RangeType=0,NumDescriptors=0,BaseShaderRegister=0,RegisterSpace=0,OffsetInDescriptorsFromTableStart=0;};
+struct D3D12_ROOT_PARAMETER{UINT ParameterType=0;struct{UINT NumDescriptorRanges=0;
+ const D3D12_DESCRIPTOR_RANGE* pDescriptorRanges=nullptr;}DescriptorTable;UINT ShaderVisibility=0;};
+struct D3D12_ROOT_SIGNATURE_DESC{UINT NumParameters=0;const D3D12_ROOT_PARAMETER* pParameters=nullptr;
+ UINT NumStaticSamplers=0;const void* pStaticSamplers=nullptr;UINT Flags=0;};
+struct ID3D12RootSignature;
+struct D3D12_GRAPHICS_PIPELINE_STATE_DESC{
+ ID3D12RootSignature* pRootSignature=nullptr;
+ struct Bytecode{const void* pShaderBytecode=nullptr;size_t BytecodeLength=0;}VS,PS,DS,HS,GS;
+ struct{UINT NumEntries=0,NumStrides=0;}StreamOutput;
+ struct Blend{BOOL AlphaToCoverageEnable=0,IndependentBlendEnable=0;
+  struct Target{BOOL BlendEnable=0,LogicOpEnable=0;UINT SrcBlend=0,DestBlend=0,BlendOp=0,
+   SrcBlendAlpha=0,DestBlendAlpha=0,BlendOpAlpha=0,LogicOp=0;unsigned char RenderTargetWriteMask=0;};
+  Target RenderTarget[8];}BlendState;
+ UINT SampleMask=0;
+ struct{UINT FillMode=0,CullMode=0;BOOL FrontCounterClockwise=0;int DepthBias=0;
+  float DepthBiasClamp=0,SlopeScaledDepthBias=0;BOOL DepthClipEnable=0,MultisampleEnable=0,AntialiasedLineEnable=0;
+  UINT ForcedSampleCount=0,ConservativeRaster=0;}RasterizerState;
+ struct DepthStencil{BOOL DepthEnable=0;UINT DepthWriteMask=0,DepthFunc=0;BOOL StencilEnable=0;
+  UINT StencilReadMask=0,StencilWriteMask=0;struct Face{UINT StencilFailOp=0,StencilDepthFailOp=0,StencilPassOp=0,StencilFunc=0;};
+  Face FrontFace,BackFace;}DepthStencilState;
+ struct{const void* pInputElementDescs=nullptr;UINT NumElements=0;}InputLayout;
+ UINT IBStripCutValue=0,PrimitiveTopologyType=0,NumRenderTargets=0;UINT RTVFormats[8]{};UINT DSVFormat=0;
+ struct{UINT Count=0,Quality=0;}SampleDesc;UINT NodeMask=0;
+ struct{const void* pCachedBlob=nullptr;size_t CachedBlobSizeInBytes=0;}CachedPSO;UINT Flags=0;
+};
+struct IUnknown{std::atomic<unsigned> refs=0;IUnknown* canonical=nullptr;bool identityFail=false;
+ virtual ~IUnknown()=default;void AddRef(){++refs;}void Release(){assert(refs);if(!--refs)delete this;}
+ HRESULT QueryInterface(IUnknown** p){if(identityFail)return -1;*p=canonical?canonical:this;(*p)->AddRef();return 0;}};
+struct ID3D12Resource;struct ID3D12DescriptorHeap;struct ID3D12PipelineState;
+namespace Fake{
+inline unsigned resources=0,heaps=0,roots=0,pipelines=0,draws=0,compiles=0;
+inline unsigned failCompile=0,failHeap=0;inline bool reflectionFail=false,reflectionNull=false,sampleFrequency=true;
+inline bool serializeFail=false,rootFail=false,psoFail=false,zeroDescriptor=false;
+inline bool retainFail=false,retainThrow=false;inline int throwCommand=-1;inline size_t nextHeap=1000;
+inline std::vector<std::string> events;
+inline std::unordered_map<size_t,ID3D12Resource*> descriptors;
+inline void Command(const char* label){events.push_back(label);if(int(events.size())-2==throwCommand)throw 1;}
+}
+struct ID3D12Device:IUnknown{UINT64 allocation=0;unsigned creates=0;
+ D3D12_RESOURCE_ALLOCATION_INFO GetResourceAllocationInfo(UINT mask,UINT n,const D3D12_RESOURCE_DESC* d){
+  assert(mask==0&&n==1);return{allocation?allocation:d->Width*d->Height*8};}
+ HRESULT CreateRootSignature(UINT,const void*,size_t,ID3D12RootSignature**);
+ HRESULT CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC*,ID3D12PipelineState**);
+ HRESULT CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC*,ID3D12DescriptorHeap**);
+ void CreateShaderResourceView(ID3D12Resource*,const D3D12_SHADER_RESOURCE_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE);
+ void CreateRenderTargetView(ID3D12Resource*,const D3D12_RENDER_TARGET_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE);
+};
+struct ID3D12DeviceChild:IUnknown{ID3D12Device* device;bool deviceFail=false;
+ explicit ID3D12DeviceChild(ID3D12Device* d):device(d){device->AddRef();}~ID3D12DeviceChild(){device->Release();}
+ HRESULT GetDevice(ID3D12Device** p){if(deviceFail)return -1;*p=device;device->AddRef();return 0;}};
+struct ID3D12Resource:ID3D12DeviceChild{D3D12_RESOURCE_DESC desc;std::vector<uint16_t> words;
+ UINT state=0;explicit ID3D12Resource(ID3D12Device* d):ID3D12DeviceChild(d){++Fake::resources;words.resize(4*4*4);}
+ ~ID3D12Resource(){--Fake::resources;}D3D12_RESOURCE_DESC GetDesc(){return desc;}};
+struct ID3D12RootSignature:ID3D12DeviceChild{explicit ID3D12RootSignature(ID3D12Device* d):ID3D12DeviceChild(d){++Fake::roots;}
+ ~ID3D12RootSignature(){--Fake::roots;}};
+struct ID3D12PipelineState:ID3D12DeviceChild{D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
+ explicit ID3D12PipelineState(ID3D12Device* d):ID3D12DeviceChild(d){++Fake::pipelines;}
+ ~ID3D12PipelineState(){--Fake::pipelines;}};
+struct ID3D12DescriptorHeap:ID3D12DeviceChild{D3D12_DESCRIPTOR_HEAP_DESC desc;size_t handle=0;
+ explicit ID3D12DescriptorHeap(ID3D12Device* d):ID3D12DeviceChild(d){++Fake::heaps;handle=Fake::nextHeap;Fake::nextHeap+=100;}
+ ~ID3D12DescriptorHeap(){--Fake::heaps;}
+ D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandleForHeapStart(){return{Fake::zeroDescriptor?0:handle};}
+ D3D12_GPU_DESCRIPTOR_HANDLE GetGPUDescriptorHandleForHeapStart(){return{Fake::zeroDescriptor?0:handle};}};
+struct ID3DBlob:IUnknown{std::string profile;void* GetBufferPointer(){return profile.data();}size_t GetBufferSize(){return profile.size();}};
+struct ID3D11ShaderReflection:IUnknown{BOOL IsSampleFrequencyShader(){return Fake::sampleFrequency;}};
+inline HRESULT D3DCompile(const void* source,size_t size,const char* name,const void* defines,const void* inc,
+ const char* entry,const char* profile,UINT flags,UINT effect,ID3DBlob** out,ID3DBlob**){
+ ++Fake::compiles;assert(source&&size&&std::string(name)=="FSRDCyberpunkFogRgbWrite"&&!defines&&!inc&&flags==3&&!effect);
+ assert(std::string(source?static_cast<const char*>(source):"").find("sample float2 uv : TEXCOORD0")!=std::string::npos);
+ assert(std::string(source?static_cast<const char*>(source):"").find("uint2(uv * float2(width, height)), 0)).rgb")!=std::string::npos);
+ assert((std::string(entry)=="VSMain"&&std::string(profile)=="vs_5_0")||
+        (std::string(entry)=="PSMain"&&std::string(profile)=="ps_5_0"));
+ if(Fake::compiles==Fake::failCompile)return -1;*out=new ID3DBlob;(*out)->AddRef();(*out)->profile=profile;return 0;}
+inline HRESULT D3DReflect(const void* bytes,size_t size,ID3D11ShaderReflection** out){
+ assert(std::string(static_cast<const char*>(bytes),size)=="ps_5_0");
+ if(Fake::reflectionFail)return -1;if(Fake::reflectionNull)return 0;*out=new ID3D11ShaderReflection;(*out)->AddRef();return 0;}
+inline HRESULT D3D12SerializeRootSignature(const D3D12_ROOT_SIGNATURE_DESC* d,UINT version,ID3DBlob** out,ID3DBlob**){
+ assert(version==1&&d->NumParameters==1&&!d->NumStaticSamplers&&!d->pStaticSamplers&&!d->Flags);
+ const auto& p=d->pParameters[0];assert(p.ShaderVisibility==5&&p.ParameterType==0&&p.DescriptorTable.NumDescriptorRanges==1);
+ const auto& r=p.DescriptorTable.pDescriptorRanges[0];assert(!r.RangeType&&r.NumDescriptors==1&&!r.BaseShaderRegister&&
+ !r.RegisterSpace&&!r.OffsetInDescriptorsFromTableStart);
+ if(Fake::serializeFail)return -1;*out=new ID3DBlob;(*out)->AddRef();(*out)->profile="root";return 0;}
+inline HRESULT ID3D12Device::CreateRootSignature(UINT node,const void*,size_t,ID3D12RootSignature** out){
+ assert(!node);if(Fake::rootFail)return -1;*out=new ID3D12RootSignature(this);(*out)->AddRef();return 0;}
+inline HRESULT ID3D12Device::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d,ID3D12PipelineState** out){
+ assert(d->pRootSignature&&d->VS.BytecodeLength&&d->PS.BytecodeLength&&!d->HS.BytecodeLength&&!d->DS.BytecodeLength&&!d->GS.BytecodeLength);
+ assert(!d->StreamOutput.NumEntries&&!d->InputLayout.NumElements&&d->NumRenderTargets==1&&d->RTVFormats[0]==10);
+ assert(!d->BlendState.AlphaToCoverageEnable&&!d->BlendState.IndependentBlendEnable);
+ const auto& b=d->BlendState.RenderTarget[0];assert(!b.BlendEnable&&!b.LogicOpEnable&&b.RenderTargetWriteMask==7);
+ assert(d->SampleMask==~UINT(0)&&d->SampleDesc.Count==1&&!d->SampleDesc.Quality&&d->PrimitiveTopologyType==3);
+ assert(d->RasterizerState.FillMode==3&&d->RasterizerState.CullMode==1&&d->RasterizerState.DepthClipEnable);
+ assert(!d->RasterizerState.ForcedSampleCount&&!d->RasterizerState.ConservativeRaster&&!d->DepthStencilState.DepthEnable&&
+ !d->DepthStencilState.StencilEnable&&!d->DSVFormat&&!d->Flags&&!d->CachedPSO.CachedBlobSizeInBytes);
+ if(Fake::psoFail)return -1;*out=new ID3D12PipelineState(this);(*out)->AddRef();(*out)->desc=*d;return 0;}
+inline HRESULT ID3D12Device::CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* d,ID3D12DescriptorHeap** out){
+ assert(d->NumDescriptors==1&&!d->NodeMask&&((d->Type==0&&d->Flags==1)||(d->Type==2&&!d->Flags)));
+ if(++creates==Fake::failHeap)return -1;*out=new ID3D12DescriptorHeap(this);(*out)->AddRef();(*out)->desc=*d;return 0;}
+inline void ID3D12Device::CreateShaderResourceView(ID3D12Resource* r,const D3D12_SHADER_RESOURCE_VIEW_DESC* d,D3D12_CPU_DESCRIPTOR_HANDLE h){
+ assert(r&&d->Format==10&&d->ViewDimension==4&&d->Shader4ComponentMapping==5768&&d->Texture2D.MipLevels==1&&
+ !d->Texture2D.MostDetailedMip&&!d->Texture2D.PlaneSlice&&!d->Texture2D.ResourceMinLODClamp&&h.ptr);
+ Fake::descriptors[h.ptr]=r;}
+inline void ID3D12Device::CreateRenderTargetView(ID3D12Resource* r,const D3D12_RENDER_TARGET_VIEW_DESC* d,D3D12_CPU_DESCRIPTOR_HANDLE h){
+ assert(r&&d->Format==10&&d->ViewDimension==4&&!d->Texture2D.MipSlice&&!d->Texture2D.PlaneSlice&&h.ptr);
+ Fake::descriptors[h.ptr]=r;}
+struct ID3D12GraphicsCommandList:ID3D12DeviceChild{UINT type=0;ID3D12Resource* source=nullptr;ID3D12Resource* target=nullptr;
+ ID3D12PipelineState* pso=nullptr;explicit ID3D12GraphicsCommandList(ID3D12Device* d):ID3D12DeviceChild(d){}
+ UINT GetType(){return type;}
+ void SetGraphicsRootSignature(ID3D12RootSignature* p){assert(p);Fake::Command("root");}
+ void SetDescriptorHeaps(UINT n,ID3D12DescriptorHeap** h){assert(n==1&&h[0]);Fake::Command("heap");}
+ void SetGraphicsRootDescriptorTable(UINT i,D3D12_GPU_DESCRIPTOR_HANDLE h){assert(!i);source=Fake::descriptors.at(h.ptr);Fake::Command("table");}
+ void SetPipelineState(ID3D12PipelineState* p){pso=p;Fake::Command("pso");}
+ void OMSetRenderTargets(UINT n,const D3D12_CPU_DESCRIPTOR_HANDLE* h,BOOL contiguous,const void* depth){
+  assert(n==1&&!contiguous&&!depth);target=Fake::descriptors.at(h[0].ptr);Fake::Command("om");}
+ void DrawInstanced(UINT a,UINT b,UINT c,UINT d){assert(a==3&&b==1&&!c&&!d&&source&&target&&pso);
+  assert(source->state==0xc0&&target->state==4);Fake::Command("draw");++Fake::draws;
+  // Models write-mask accounting only, NOT compiled HLSL execution.
+  for(size_t i=0;i<target->words.size();++i)if(pso->desc.BlendState.RenderTarget[0].RenderTargetWriteMask&(1u<<(i%4)))
+   target->words[i]=source->words[i];}
+};
+namespace Microsoft::WRL{template<class T>class ComPtr{T* p=nullptr;public:
+ ComPtr()=default;ComPtr(T* q):p(q){if(p)p->AddRef();}ComPtr(const ComPtr& q):ComPtr(q.p){}
+ ComPtr(ComPtr&& q):p(q.p){q.p=nullptr;}~ComPtr(){if(p)p->Release();}
+ T* Get()const{return p;}T* operator->()const{return p;}explicit operator bool()const{return p!=nullptr;}
+ ComPtr& operator=(T* q){if(q)q->AddRef();if(p)p->Release();p=q;return *this;}
+ ComPtr& operator=(const ComPtr& q){return *this=q.p;}ComPtr& operator=(ComPtr&& q){
+  if(this!=std::addressof(q)){if(p)p->Release();p=q.p;q.p=nullptr;}return *this;}
+ T** operator&(){assert(!p);return &p;}};}
+struct ScopedSkipHeapCapture{};
+'''
+        submission = r'''
+#pragma once
+#include "d3d12.h"
+namespace FSRDSubmission{struct Ticket{std::shared_ptr<void> owner;};inline std::shared_ptr<Ticket> pending;
+inline std::shared_ptr<Ticket> Retain(ID3D12Device*,ID3D12GraphicsCommandList*,std::shared_ptr<void> owner){
+ Fake::events.push_back("retain");if(Fake::retainThrow)throw 1;if(Fake::retainFail)return{};
+ pending=std::make_shared<Ticket>();pending->owner=std::move(owner);return pending;}}
+'''
+        harness = r'''
+#include "FSRDCyberpunkFogRgbWrite.cpp"
+using namespace FSRD::CyberpunkFogRgbWrite;
+using Microsoft::WRL::ComPtr;
+struct Fixture{
+ ComPtr<ID3D12Device> device=new ID3D12Device;
+ ComPtr<ID3D12Resource> source=new ID3D12Resource(device.Get()),target=new ID3D12Resource(device.Get());
+ ComPtr<ID3D12GraphicsCommandList> list=new ID3D12GraphicsCommandList(device.Get());
+ D3D12_RENDER_TARGET_VIEW_DESC view{10,4,{0,0}};
+ D3D12_VIEWPORT viewport{0,0,4,4,0,1};D3D12_RECT scissor{0,0,4,4};UINT width=4,height=4;
+ Fixture(){Fake::events.clear();Fake::descriptors.clear();Fake::draws=Fake::compiles=Fake::failCompile=Fake::failHeap=0;
+  Fake::reflectionFail=Fake::reflectionNull=Fake::serializeFail=Fake::rootFail=Fake::psoFail=Fake::zeroDescriptor=false;
+  Fake::retainFail=Fake::retainThrow=false;Fake::sampleFrequency=true;Fake::throwCommand=-1;
+  source->state=0xc0;target->state=4;target->desc.Flags=1;
+  for(size_t i=0;i<source->words.size();++i){source->words[i]=uint16_t(i+100);target->words[i]=uint16_t(i+500);}}
+ auto prepare(const char** e=nullptr){return Prepare(device.Get(),width,height,source,target,view,viewport,scissor,e);}
+ ~Fixture(){FSRDSubmission::pending.reset();}
+};
+void NoGpu(){assert(Fake::events.empty()&&!Fake::draws);}
+int main(){
+ {Fixture f;auto w=f.prepare();assert(w&&!w->Recorded()&&w->Error().empty());NoGpu();
+  assert(Fake::heaps==2&&Fake::roots==1&&Fake::pipelines==1);auto alpha=f.target->words;
+  assert(w->Record(f.list.Get())&&w->Recorded()&&w->Error().empty());
+  assert((Fake::events==std::vector<std::string>{"retain","root","heap","table","pso","om","draw"}));
+  for(size_t i=0;i<alpha.size();++i)assert(f.target->words[i]==(i%4==3?alpha[i]:f.source->words[i]));
+  assert(f.source->state==0xc0&&f.target->state==4&&!w->Record(f.list.Get())&&Fake::draws==1);
+  f.source=nullptr;f.target=nullptr;w.reset();assert(Fake::resources==2&&Fake::heaps==2&&Fake::roots==1&&Fake::pipelines==1);
+  FSRDSubmission::pending.reset();assert(!Fake::resources&&!Fake::heaps&&!Fake::roots&&!Fake::pipelines);}
+ for(unsigned bad=0;bad<28;++bad){Fixture f;const char* error="unchanged";
+  switch(bad){case 0:f.width=0;break;case 1:f.height=8193;break;
+   case 2:f.source=nullptr;break;case 3:f.target=f.source;break;
+   case 4:f.target->canonical=f.source.Get();break;case 5:f.source->identityFail=true;break;
+   case 6:f.source->deviceFail=true;break;case 7:f.source->desc.Width=5;break;
+   case 8:f.target->desc.Height=5;break;case 9:f.source->desc.MipLevels=2;break;
+   case 10:f.target->desc.DepthOrArraySize=2;break;case 11:f.target->desc.SampleDesc.Count=2;break;
+   case 12:f.source->desc.SampleDesc.Quality=1;break;case 13:f.target->desc.Format=9;break;
+   case 14:f.source->desc.Layout=1;break;case 15:f.target->desc.Flags=3;break;
+   case 16:f.target->desc.Flags=0;break;case 17:f.source->desc.Flags=8;break;
+   case 18:f.view.Format=9;break;case 19:f.view.ViewDimension=5;break;
+   case 20:f.view.Texture2D.MipSlice=1;break;case 21:f.view.Texture2D.PlaneSlice=1;break;
+   case 22:f.scissor.right=3;break;case 23:f.scissor.left=1;break;
+   case 24:f.viewport.Width=3;break;case 25:f.viewport.TopLeftX=-0.0f;break;
+   case 26:f.viewport.MaxDepth=0;break;case 27:f.device->allocation=~UINT64(0);break;}
+  assert(!f.prepare(&error)&&error&&*error);NoGpu();assert(!Fake::heaps&&!Fake::roots&&!Fake::pipelines);}
+ for(uint32_t bits:{0x7f800000u,0xff800000u,0x7fc00000u,0x7f800001u,1u}){
+  Fixture f;f.viewport.TopLeftY=std::bit_cast<float>(bits);assert(!f.prepare());NoGpu();}
+ {Fixture f;ComPtr<ID3D12Device> other=new ID3D12Device;
+  f.source=new ID3D12Resource(other.Get());assert(!f.prepare());NoGpu();}
+ {Fixture f;f.device->allocation=128ull*1024*1024;assert(f.prepare());}
+ {Fixture f;f.device->allocation=128ull*1024*1024+1;assert(!f.prepare());}
+ for(unsigned bad=0;bad<11;++bad){Fixture f;const char* error=nullptr;
+  switch(bad){case 0:Fake::failCompile=1;break;case 1:Fake::failCompile=2;break;
+   case 2:Fake::reflectionFail=true;break;case 3:Fake::reflectionNull=true;break;
+   case 4:Fake::sampleFrequency=false;break;case 5:Fake::serializeFail=true;break;
+   case 6:Fake::rootFail=true;break;case 7:Fake::psoFail=true;break;
+   case 8:Fake::failHeap=1;break;case 9:Fake::failHeap=2;break;case 10:Fake::zeroDescriptor=true;break;}
+  assert(!f.prepare(&error)&&error&&*error);NoGpu();assert(!Fake::heaps&&!Fake::roots&&!Fake::pipelines);}
+ for(unsigned bad=0;bad<4;++bad){Fixture f;auto w=f.prepare();
+  ComPtr<ID3D12Device> other=new ID3D12Device;ComPtr<ID3D12GraphicsCommandList> foreign=new ID3D12GraphicsCommandList(other.Get());
+  if(bad==0)assert(!w->Record(nullptr));
+  if(bad==1){f.list->type=2;assert(!w->Record(f.list.Get()));}
+  if(bad==2)assert(!w->Record(foreign.Get()));
+  if(bad==3){f.list->deviceFail=true;assert(!w->Record(f.list.Get()));}
+  assert(!w->Recorded()&&!w->Error().empty());NoGpu();
+  f.list->type=0;f.list->deviceFail=false;assert(!w->Record(f.list.Get()));NoGpu();}
+ for(bool throws:{false,true}){Fixture f;auto w=f.prepare();Fake::retainThrow=throws;Fake::retainFail=!throws;
+  assert(!w->Record(f.list.Get())&&!w->Recorded()&&!w->Error().empty());
+  assert(Fake::events==std::vector<std::string>{"retain"}&&!FSRDSubmission::pending&&!Fake::draws);
+  assert(!w->Record(f.list.Get()));}
+ for(int at=0;at<6;++at){Fixture f;auto w=f.prepare();Fake::throwCommand=at;
+  assert(!w->Record(f.list.Get())&&!w->Recorded()&&!w->Error().empty()&&FSRDSubmission::pending);
+  assert(!w->Record(f.list.Get()));f.source=nullptr;f.target=nullptr;w.reset();
+  assert(Fake::resources==2&&Fake::heaps==2&&Fake::roots==1&&Fake::pipelines==1);
+  FSRDSubmission::pending.reset();assert(!Fake::resources&&!Fake::heaps&&!Fake::roots&&!Fake::pipelines);}
+ assert(!Fake::resources&&!Fake::heaps&&!Fake::roots&&!Fake::pipelines);
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='fsrd-fog-rgb-write-') as temporary:
+            temp = Path(temporary)
+            files = {'d3d12.h': windows, 'pch.h': '#include "d3d12.h"\n',
+                     'd3dcompiler.h': '#include "d3d12.h"\n', 'd3d11shader.h': '#include "d3d12.h"\n',
+                     'wrl/client.h': '#include "d3d12.h"\n',
+                     'resource_tracking/FSRDSubmission.h': submission, 'test.cpp': harness}
+            for name, contents in files.items():
+                target = temp / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents)
+            for flags in (['-O0'], ['-O3', '-ffast-math', '-ffp-contract=fast']):
+                result = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', *flags,
+                                         '-I', str(temp), '-I', str(BASE), str(temp / 'test.cpp'),
+                                         '-o', str(temp / 'test')], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                result = subprocess.run([str(temp / 'test')], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 namespace FSRD::CyberpunkFogDenoiseAccess
 {
@@ -47,6 +48,20 @@ struct Result
     bool callbackEntered = false, bindingsRestored = false;
 };
 
+enum class SceneOutcome : uint8_t
+{
+    Refused,                 // No state request or scene callback occurred.
+    SceneFailedRestored,      // Callback false/throw; bindings restored, NOT an RGB rollback.
+    SceneRecordedRestored,    // Scene commands recorded/restored, NOT GPU completion.
+    ScopeLostAfterMutation    // Fatal/unverified recording; do not resume the raw Fog draw.
+};
+struct SceneResult
+{
+    SceneOutcome outcome = SceneOutcome::Refused;
+    unsigned requestsIssued = 0;
+    bool callbackEntered = false, bindingsRestored = false;
+};
+
 namespace Detail
 {
 struct Saved
@@ -55,7 +70,16 @@ struct Saved
     uint32_t thread = 0, kind = 0;
 };
 
-template<class Host> bool SameScope(Host& host, const Input& input, const Saved& saved) noexcept
+template<bool SceneRgb, class Host> bool AdmittedScope(Host& host, const Input& input)
+{
+    // Scene permission is distinct from the original native-depth/private-input
+    // admission. The private API neither requires nor invokes scene methods.
+    if constexpr (SceneRgb)
+        if (input.copySource || !host.IsAdmittedFogRgbScope(input)) return false;
+    return host.IsAdmittedFogDenoiseScope(input);
+}
+
+template<bool SceneRgb, class Host> bool SameScope(Host& host, const Input& input, const Saved& saved) noexcept
 {
     try
     {
@@ -63,7 +87,7 @@ template<class Host> bool SameScope(Host& host, const Input& input, const Saved&
         uint8_t initialized = 0, masksStates = 0;
         uint32_t kind = 0;
         int32_t refs = 0;
-        return host.ThreadId() == saved.thread && host.IsAdmittedFogDenoiseScope(input) &&
+        return host.ThreadId() == saved.thread && AdmittedScope<SceneRgb>(host, input) &&
             host.ReadTlsSlotZero(tls) && tls == saved.tls &&
             Engine::Detail::Read(host, tls, 0x14, initialized) && initialized &&
             Engine::Detail::Read(host, tls, 0x188, context) && context == saved.context &&
@@ -80,7 +104,7 @@ template<class Host> bool SameScope(Host& host, const Input& input, const Saved&
     catch (...) { return false; }
 }
 
-template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) noexcept
+template<bool SceneRgb, class Host> bool Prepare(Host& host, const Input& input, Saved& saved) noexcept
 {
     try
     {
@@ -88,7 +112,7 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
             !input.list || !input.originalPso || !input.originalFogScope ||
             !input.depth.handle || input.depth.handle > 0x8000 || !input.depth.native ||
             !host.ExactImageAuthenticated(input.image, Engine::ImageBytes, Engine::ImageTimestamp, Engine::ExeSha256) ||
-            !host.IsAdmittedFogDenoiseScope(input)) return false;
+            !AdmittedScope<SceneRgb>(host, input)) return false;
         for (const auto& code : Code)
             if (!host.LiveCodeMatches(input.image, code)) return false;
         // Exclude the lazy initialization branch before invoking the existing
@@ -101,9 +125,9 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
             !Engine::Detail::Read(host, saved.context, 0x60, saved.cache) || !saved.cache ||
             !Engine::Detail::Read(host, saved.context, 0x68, saved.kind) ||
             !Engine::Detail::Read(host, input.image, Engine::RegistryRva, saved.registry) || !saved.registry ||
-            !SameScope(host, input, saved) || !host.ListIsDirect(input.list)) return false;
+            !SameScope<SceneRgb>(host, input, saved) || !host.ListIsDirect(input.list)) return false;
         return host.CurrentNativeList(input.image + Engine::GetCurrentListRva) == input.list &&
-            SameScope(host, input, saved);
+            SameScope<SceneRgb>(host, input, saved);
     }
     catch (...) { return false; }
 }
@@ -150,8 +174,10 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
 // - Host must honor ScopeLostAfterMutation as an unusable/fatal recording. After
 //   ordinary refusal/false it still executes the original Fog draw exactly once;
 //   this helper does not forward that draw or authorize any scene color write.
-template<class Host, class PrivateWork>
-Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privateWork) noexcept
+namespace Detail
+{
+template<bool SceneRgb, class Host, class Work>
+Result RecordWork(Host& host, const Input& input, Work&& work) noexcept
 {
     static_assert(noexcept(host.CurrentNativeList(uintptr_t {})));
     static_assert(noexcept(host.RequestState(uintptr_t {}, uintptr_t {}, uint32_t {}, uint32_t {}, uint32_t {})));
@@ -160,9 +186,11 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
     static_assert(noexcept(host.RestorePso(uintptr_t {}, uintptr_t {})));
     static_assert(noexcept(host.FlushGraphicsTables(uintptr_t {}, uintptr_t {}, uintptr_t {})));
     static_assert(noexcept(host.OriginalFogDepthTableRestored(uintptr_t {}, uintptr_t {})));
+    if constexpr (SceneRgb)
+        static_assert(noexcept(host.RestoreOriginalFogTarget(uintptr_t {})));
     Result result;
     Detail::Saved saved;
-    if (!Detail::Prepare(host, input, saved)) return result;
+    if (!Detail::Prepare<SceneRgb>(host, input, saved)) return result;
 
     // The native helper owns StateBefore and first-use reconciliation. Combined
     // read preserves pixel access for the unchanged original Fog draw that follows.
@@ -170,22 +198,22 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
     host.RequestState(input.image + Engine::RequestStateRva, saved.context, input.depth.handle,
                       Engine::InputReadState | (input.copySource ? CopySourceState : 0u), Engine::AllSubresources);
     ++result.requestsIssued;
-    if (!Detail::SameScope(host, input, saved))
+    if (!Detail::SameScope<SceneRgb>(host, input, saved))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
     }
     host.Flush(input.image + Engine::FlushRva, saved.context);
-    if (!Detail::SameScope(host, input, saved))
+    if (!Detail::SameScope<SceneRgb>(host, input, saved))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
     }
     result.callbackEntered = true;
     bool recorded = false;
-    try { recorded = privateWork(); }
-    catch (...) { /* Partial private recording still requires native binding restoration. */ }
-    if (!Detail::SameScope(host, input, saved))
+    try { recorded = work(); }
+    catch (...) { /* Partial recording still requires native binding restoration. */ }
+    if (!Detail::SameScope<SceneRgb>(host, input, saved))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
@@ -197,27 +225,88 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
     // the original PSO and run the exact native graphics dynamic-table flush too.
     // Check the original scope before/after each step, including false/throw.
     host.Reenter(input.image + Engine::ReenterRva, input.list);
-    if (!Detail::SameScope(host, input, saved))
+    if (!Detail::SameScope<SceneRgb>(host, input, saved))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
     }
     host.RestorePso(input.list, input.originalPso);
-    if (!Detail::SameScope(host, input, saved))
+    if (!Detail::SameScope<SceneRgb>(host, input, saved))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
     }
     host.FlushGraphicsTables(input.image + FlushGraphicsTablesRva, saved.cache, saved.context);
-    if (!Detail::SameScope(host, input, saved) ||
+    if (!Detail::SameScope<SceneRgb>(host, input, saved) ||
         !host.OriginalFogDepthTableRestored(saved.cache, saved.context))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
     }
+    if constexpr (SceneRgb)
+    {
+        // The RGB helper may bind a frozen equivalent view of ONLY the original
+        // main target. Restore that admitted original Fog OM binding (no DSV),
+        // including ordinary false/throw. This never rolls back changed RGB.
+        host.RestoreOriginalFogTarget(input.list);
+        if (!Detail::SameScope<SceneRgb>(host, input, saved) ||
+            !host.OriginalFogDepthTableRestored(saved.cache, saved.context))
+        {
+            result.outcome = Outcome::ScopeLostAfterMutation;
+            return result;
+        }
+    }
     result.bindingsRestored = true;
     result.outcome = recorded ? Outcome::PrivateRecordedRestored : Outcome::PrivateFailedRestored;
     // Leave the engine-managed read-only superset truthful. No source undo barrier.
     return result;
+}
+} // namespace Detail
+
+// Existing private-output-only API; no scene permission or target restoration
+// methods are required, and no scene RGB/alpha writes are authorized.
+template<class Host, class PrivateWork>
+Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privateWork) noexcept
+{
+    return Detail::RecordWork<false>(host, input, std::forward<PrivateWork>(privateWork));
+}
+
+// Explicit, separately admitted scene write API. In addition to the shared
+// original Fog scope/depth/input contract above, IsAdmittedFogRgbScope MUST prove:
+// - current original main RT, exact original RTV semantics and retained/frozen
+//   equivalent descriptor, one target and NO DSV; source is owned private RGB on
+//   this device/extent with enforced producer ordering, not an old native borrow;
+// - current full viewport/scissor, TRIANGLELIST and supported inherited coverage,
+//   with no query/predication/render-pass/bundle ambiguity, and explicit scene
+//   write authority for ONLY the approved CyberpunkFogRgbWrite raster helper;
+// - that helper preserves target alpha, IA/RS/VRS and original resource states.
+//   It may change graphics roots/heaps/tables/PSO and bind ONLY the same main RT
+//   using the frozen equivalent RTV/no DSV. No other OM changes are authorized.
+// The scene gate repeats at every original scope check, before any state request
+// and after every native step. It must tolerate the approved private bindings,
+// but never a replacement source/target/view/list/Reset or descriptor lifetime.
+// RestoreOriginalFogTarget(list) is noexcept, calls the real native OM setter
+// with the retained frozen original-equivalent RTV and no DSV, and performs no
+// color write. The final gate verifies that target binding was restored.
+//
+// Callback false/throw restores all bindings when scope remains valid, but may
+// leave PARTIAL scene RGB writes. SceneFailedRestored is not rollback, success,
+// retry permission or permission to fall back to another denoising route.
+// ScopeLostAfterMutation remains fatal; no raw original Fog draw may resume.
+// copySource=true is not admitted here; native depth copies remain the separate
+// private-output API. This header installs no hooks and never forwards the draw.
+template<class Host, class SceneWork>
+SceneResult RecordSceneRgb(Host& host, const Input& input, SceneWork&& sceneWork) noexcept
+{
+    const auto result = Detail::RecordWork<true>(host, input, std::forward<SceneWork>(sceneWork));
+    SceneOutcome outcome = SceneOutcome::ScopeLostAfterMutation;
+    switch (result.outcome)
+    {
+    case Outcome::Refused: outcome = SceneOutcome::Refused; break;
+    case Outcome::PrivateFailedRestored: outcome = SceneOutcome::SceneFailedRestored; break;
+    case Outcome::PrivateRecordedRestored: outcome = SceneOutcome::SceneRecordedRestored; break;
+    case Outcome::ScopeLostAfterMutation: break;
+    }
+    return { outcome, result.requestsIssued, result.callbackEntered, result.bindingsRestored };
 }
 } // namespace FSRD::CyberpunkFogDenoiseAccess

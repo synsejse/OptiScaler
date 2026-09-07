@@ -29,7 +29,7 @@ class FogDenoiseAccess(unittest.TestCase):
         self.assertEqual(text.count('host.Reenter(input.image'), 1)
         self.assertEqual(text.count('host.RestorePso(input.list'), 1)
         self.assertEqual(text.count('host.FlushGraphicsTables(input.image'), 1)
-        record = text.split('Result RecordPrivateCompute', 1)[1]
+        record = text.split('Result RecordWork', 1)[1].split('} // namespace Detail', 1)[0]
         self.assertLess(record.index('Detail::Prepare'), record.index('host.RequestState(input.image'))
         self.assertLess(record.index('catch (...)'), record.index('host.Reenter(input.image'))
         self.assertLess(record.index('host.Reenter(input.image'), record.index('host.RestorePso(input.list'))

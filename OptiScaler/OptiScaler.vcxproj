@@ -548,6 +548,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkPrivateResetSource.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkPrivateResetPolicy.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogDenoiseAccess.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogRgbWrite.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkMotionScale.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkResetCamera.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingConstants.h" />
@@ -809,6 +810,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="upscalers\ffx\FSRDFeature_Dx12.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDResearchCapture.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDCyberpunkFogProbe.cpp" />
+    <ClCompile Include="upscalers\ffx\FSRDCyberpunkFogRgbWrite.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDPrivateDenoise.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDPrivateRayCopy.cpp" />
     <ClCompile Include="upscalers\ffx\FSRDCyberpunkEarlyGuides.cpp" />

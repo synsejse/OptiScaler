@@ -708,6 +708,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     {
         if (_denoiser.IsCreated())
             FSRDCyberpunkFogProbe::ArmPrivateReset(Device, RenderWidth(), RenderHeight());
+        if (_denoiser.IsCreated())
+            FSRDCyberpunkFogProbe::ArmRgbIdentity(Device, RenderWidth(), RenderHeight());
         ID3D12Resource* color = nullptr;
         ID3D12Resource* beforeParticles = nullptr;
         TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Color, color);

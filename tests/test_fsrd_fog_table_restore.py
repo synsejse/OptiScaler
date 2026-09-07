@@ -39,7 +39,7 @@ class FogTableRestore(unittest.TestCase):
         self.assertIn('FlushGraphicsTablesRva = 0x1f22e4', header)
         self.assertIn('{ FlushGraphicsTablesRva, 0x4dc, "f4a5782e0cead125409e02ce0ff209aa5468564dc286cd1403798a1bb18f8bfc" }', header)
         self.assertIn('{ 0x1e3d3ae, 0xd3, "d3e50b16ded932a6705c42e857498792ca5f92b31694cc70699ed9049b160c35" }', header)
-        record = header.split('Result RecordPrivateCompute', 1)[1]
+        record = header.split('Result RecordWork', 1)[1].split('} // namespace Detail', 1)[0]
         self.assertLess(record.index('host.FlushGraphicsTables('), record.index('host.OriginalFogDepthTableRestored('))
         self.assertLess(record.index('host.OriginalFogDepthTableRestored('), record.index('result.bindingsRestored = true'))
 
