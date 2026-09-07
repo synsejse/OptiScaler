@@ -11,6 +11,7 @@
 #include <bcrypt.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -50,7 +51,8 @@ constexpr unsigned MaxPsoLogs = 16;
 constexpr unsigned MaxRearms = 2;
 constexpr SIZE_T FogVertexBytes = 2361;
 constexpr std::string_view FogVertexSha256 = "174ce05e0a97ce65f80358b2a01bbadea4c314fb386cfac6064940a870f91a5a";
-constexpr size_t MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 128;
+constexpr size_t MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 2048;
+constexpr unsigned MaxListEvictionLogs = 8;
 constexpr UINT64 MaxCaptureTextureBytes = 256ull * 1024 * 1024;
 constexpr unsigned MaxNgxEndpoints = 8;
 constexpr UINT64 MaxEndpointResourceBytes = 256ull * 1024 * 1024;
@@ -187,6 +189,9 @@ struct Registry
     size_t slots = 0;
     uint64_t reservedRtvSlots = 0;
     uint64_t nextHeap = 0, nextSlot = 0, nextRecording = 0;
+    size_t peakListCount = 0;
+    uint64_t listEvictions = 0;
+    unsigned listEvictionLogs = 0;
 };
 Registry& Data()
 {
@@ -554,12 +559,41 @@ HRESULT WINAPI HookReset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator
             const auto identity = ListIdentity(list);
             auto& data = Data();
             std::lock_guard lock(data.mutex);
+            uint64_t evictedGeneration = 0;
+            uintptr_t evictedIdentity = 0;
             if (!data.lists.contains(identity.Get()) && data.lists.size() >= MaxCommandLists)
-                throw std::runtime_error("command-list provenance budget exhausted");
+            {
+                // This registry is evidence, not object ownership. Pool churn must
+                // not disable all diagnostics. An evicted list stays UNKNOWN in
+                // TrackList/PrepareCapture/ObserveNgxInput until a new observed Reset;
+                // no state is reconstructed from pointers or later draw calls.
+                const auto oldest = std::min_element(data.lists.begin(), data.lists.end(),
+                    [](const auto& a, const auto& b) { return a.second.generation < b.second.generation; });
+                evictedGeneration = oldest->second.generation;
+                evictedIdentity = uintptr_t(oldest->first);
+                data.lists.erase(oldest);
+                ++data.listEvictions;
+            }
             auto& state = data.lists[identity.Get()];
             state = {};
             state.generation = ++data.nextRecording;
             state.known = true;
+            if (evictedGeneration && data.listEvictionLogs < MaxListEvictionLogs)
+            {
+                ++data.listEvictionLogs;
+                LOG_INFO("[FSRRR fog capture] command-list provenance retained={}/{} total_evictions={} evicted_identity={:x} evicted_Reset_generation={} incoming_identity={:x} incoming_Reset_generation={}; evicted lists remain unknown until Reset; eviction_log={}/{}",
+                         data.lists.size(), MaxCommandLists, data.listEvictions, evictedIdentity, evictedGeneration,
+                         uintptr_t(identity.Get()), state.generation, data.listEvictionLogs, MaxListEvictionLogs);
+            }
+            if (data.lists.size() > data.peakListCount)
+            {
+                data.peakListCount = data.lists.size();
+                const auto count = data.peakListCount;
+                if (count == 1 || count == 128 || count == 512 || count == 1024 || count == MaxCommandLists)
+                    LOG_INFO("[FSRRR fog capture] command-list provenance retained={}/{} peak={} total_evictions={} state_payload_bytes={} (excludes map overhead)",
+                             data.lists.size(), MaxCommandLists, count, data.listEvictions,
+                             data.lists.size() * sizeof(ListState));
+            }
         });
     return hr;
 }

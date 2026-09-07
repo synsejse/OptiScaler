@@ -204,7 +204,7 @@ class FogProbe(unittest.TestCase):
         self.assertIn('"scissor_rects"', prepare)
 
     def test_descriptor_and_list_tracking_bounded_and_forwarded_once(self):
-        self.assertIn("MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 128", SOURCE)
+        self.assertIn("MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 2048", SOURCE)
         self.assertIn("captureTrackingValid.store(false)", function("Track"))
         copied = function("TrackDescriptorCopy")
         self.assertLess(copied.index("snapshot.push_back"), copied.index("*slot = snapshot[cursor]"))
@@ -217,6 +217,34 @@ class FogProbe(unittest.TestCase):
                                ("HookSetScissors", "originalSetScissors"), ("HookBeginRenderPass", "originalBeginRenderPass"),
                                ("HookEndRenderPass", "originalEndRenderPass")):
             self.assertEqual(function(hook).count(original + "("), 1)
+
+    def test_list_registry_evicts_oldest_reset_without_inventing_state_or_disabling_tracking(self):
+        reset = function("HookReset")
+        self.assertIn("!data.lists.contains(identity.Get()) && data.lists.size() >= MaxCommandLists", reset)
+        self.assertIn("a.second.generation < b.second.generation", reset)
+        self.assertLess(reset.index("data.lists.erase(oldest)"), reset.index("data.lists[identity.Get()]"))
+        self.assertIn("state = {}", reset)
+        self.assertIn("state.generation = ++data.nextRecording", reset)
+        self.assertNotIn("captureTrackingValid.store(false)", reset)
+        self.assertNotIn("command-list provenance budget exhausted", reset)
+        track = function("TrackList")
+        self.assertIn("data.lists.find(identity.Get())", track)
+        self.assertNotIn("data.lists[", track)
+        self.assertIn("foundState == data.lists.end()", function("PrepareCapture"))
+        self.assertIn("found != data.lists.end()", function("ObserveNgxInput"))
+
+    def test_list_registry_size_and_eviction_logging_are_bounded(self):
+        reset = function("HookReset")
+        self.assertIn("MaxListEvictionLogs = 8", SOURCE)
+        self.assertIn("data.listEvictionLogs < MaxListEvictionLogs", reset)
+        self.assertIn("++data.listEvictions", reset)
+        self.assertIn("data.lists.size() > data.peakListCount", reset)
+        for count in (1, 128, 512, 1024):
+            self.assertIn("count == " + str(count), reset)
+        self.assertIn("count == MaxCommandLists", reset)
+        for field in ("retained={}/{}", "total_evictions={}", "evicted_Reset_generation={}",
+                      "incoming_Reset_generation={}", "state_payload_bytes={}"):
+            self.assertIn(field, reset)
 
     def test_rtv_heap_budget_reports_exact_cause_counts_and_bounded_milestones(self):
         create = function("HookCreateHeap")
