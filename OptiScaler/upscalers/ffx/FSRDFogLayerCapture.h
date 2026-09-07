@@ -92,14 +92,25 @@ bool WantsEarlyGuideCapture();
 // if this call refuses. The helper preserves encoded RGBA bits: this input is
 // NOT established as raw-ray or undenoised radiance, and
 // no exposure, alpha, demodulation or other shader math is performed here.
+// Optional rayCopies is an all-or-none pair of DISTINCT private immutable snapshots:
+// [0] motion RGBA16_FLOAT, [1] hit R32_FLOAT. Both must be typed mip0/slice0,
+// single-mip/array/sample, match the active guide extent and be in exact state0xc0.
+// Neither may alias any guide, exposure or lighting companion. The caller retains
+// their original-ray copy Work in keepAlive and independently proves the original
+// ray snapshot stage, motion/hit units, selected writer and any final-write claim;
+// layout acceptance and a completed readback do NOT establish those semantics.
+// All channels/bits are copied unchanged, with no unpacking or hit normalization.
 // All entries share the existing256MiB cap, owner and completion fence.
 // Output: <exe>/FSRRR-early-guide-captures/<UTC timestamp>/manifest.json plus three
-// guides and optional exposure_words.rgba32u / lighting_t8.rgba16f companions.
+// guides and optional exposure_words.rgba32u / lighting_t8.rgba16f companions,
+// ray_motion.rgba16f and ray_hit.r32f. A non-null retention ticket is required
+// before the first readback command, including when no companions are supplied.
 // Caller evidence is not frame proof. Existing three/four-entry calls are unchanged.
 bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                        const std::array<Texture, 3>& guides, const std::string& provenanceJson,
                        const std::shared_ptr<void>& keepAlive, const Texture* exposureWords = nullptr,
-                       const Texture* lightingT8 = nullptr) noexcept;
+                       const Texture* lightingT8 = nullptr,
+                       const std::array<Texture, 2>* rayCopies = nullptr) noexcept;
 
 // Caller preconditions (not authenticated by this generic readback helper):
 // - Authenticate the exact fog PSO, draw, bindings, subresource and blend descriptor.

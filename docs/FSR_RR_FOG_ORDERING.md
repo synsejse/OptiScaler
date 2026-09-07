@@ -152,6 +152,22 @@ evidence, not proof of the selected GPU shader, immutable GPU constants, or a
 fog-stage handoff. The next observer records original t4/u0/u8 and b6 descriptor
 correspondence at the actual ray dispatch.
 
+That observer succeeded in the `68dedefb` live capture. The first original
+dispatch had matching b6/t4/u0/u8 receipts, and its view/list/reset/CPU frame
+source matched the lighting sample. The current authored motion-scale
+properties were both 1. The adaptive ray work domain was flattened, so it
+must not be mistaken for the native 1280x720 texture extent. A second dispatch
+changed u0 and constants; the observer correctly refused to reuse its earlier
+receipts. This is not a claim that the first dispatch is the final hit writer.
+
+The optional next-stage raw copy inserts copy-only commands synchronously
+after the admitted original dispatch, before its end-use cleanup. It uses
+the authenticated engine state-request/flush helpers and restores hit UAV
+state before returning. Only private native-format copies may cross to the
+lighting capture, with an exact same-list/reset/view/CPU-source join. Original
+scene color is untouched; copy completion does not certify signal units or
+final-writer semantics.
+
 `FSRDPrivateDenoise` is an independent, one-shot RESET helper with private
 outputs and explicit parameters. It passed local failure/lifetime tests and a
 Windows build, but is not yet invoked by the live host. RESET avoids borrowing

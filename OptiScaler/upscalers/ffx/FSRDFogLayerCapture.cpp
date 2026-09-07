@@ -37,6 +37,7 @@ struct Entry
     UINT64 bytes = 0;
     const char* componentType = nullptr;
     UINT pixelBytes = 0;
+    const char* channels = "RGBA";
 };
 
 struct Batch
@@ -47,6 +48,7 @@ struct Batch
     std::optional<std::array<Entry, 3>> earlyGuides;
     std::optional<Entry> exposureWords; // Standalone guide batches only; never a floating fog layer.
     std::optional<Entry> lightingT8; // Owned copy-readable encoded input; never a reconstructed scene layer.
+    std::optional<std::array<Entry, 2>> rayCopies; // Private original-ray snapshots; units remain caller evidence.
     std::shared_ptr<void> keepAlive;
     Json metadata;
     std::filesystem::path directory;
@@ -142,14 +144,41 @@ bool IsLightingT8Texture(const D3D12_RESOURCE_DESC& desc, DXGI_FORMAT viewFormat
         desc.SampleDesc.Quality == 0 && subresource == 0 && state == RequiredState;
 }
 
+bool IsRayCopyTexture(const D3D12_RESOURCE_DESC& desc, DXGI_FORMAT viewFormat,
+                      UINT subresource, D3D12_RESOURCE_STATES state, UINT width, UINT height,
+                      bool rayHit) noexcept
+{
+    constexpr D3D12_RESOURCE_STATES RequiredState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const auto format = rayHit ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    return width > 0 && height > 0 && width <= MaxDimension && height <= MaxDimension &&
+        viewFormat == format && desc.Format == format &&
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Width == width && desc.Height == height &&
+        desc.MipLevels == 1 && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 &&
+        desc.SampleDesc.Quality == 0 && subresource == 0 && state == RequiredState;
+}
+
 void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false, bool guideAlbedo = false,
-                  bool exposureWords = false)
+                  bool exposureWords = false, bool rayHit = false)
 {
     if (!entry.source.resource)
         throw std::runtime_error("fog capture requires all three immutable textures");
     CheckSameDevice(device, entry.source.resource.Get());
     const auto desc = entry.source.resource->GetDesc();
-    if (exposureWords)
+    if (rayHit)
+    {
+        // R32_FLOAT is admitted ONLY for this explicit private companion role;
+        // none of the original fog layers or guide formats gain scalar support.
+        if (boundCb12 || guideAlbedo || exposureWords || desc.Width > MaxDimension ||
+            !IsRayCopyTexture(desc, entry.source.viewFormat, entry.source.subresource, entry.source.state,
+                              static_cast<UINT>(desc.Width), desc.Height, true))
+            throw std::runtime_error("ray hit requires exact private mip0 R32_FLOAT in state0xc0");
+        entry.componentType = "float32";
+        entry.pixelBytes = 4;
+        entry.channels = "R";
+        entry.filename = std::string(entry.role) + ".r32f";
+    }
+    else if (exposureWords)
     {
         if (boundCb12 || guideAlbedo ||
             !IsExposureWordsTexture(desc, entry.source.viewFormat, entry.source.subresource, entry.source.state))
@@ -238,7 +267,7 @@ Json Describe(const Entry& entry)
              { "file", entry.filename },
              { "width", entry.footprint.Footprint.Width },
              { "height", entry.footprint.Footprint.Height },
-             { "channels", "RGBA" },
+             { "channels", entry.channels },
              { "component_type", entry.componentType },
              { "pixel_bytes", entry.pixelBytes },
              { "byte_order", "little_endian" },
@@ -388,9 +417,14 @@ void WriteWhenComplete(const WorkerArgs& args)
             WriteEntry(batch, *batch.exposureWords, true);
         if (batch.lightingT8)
             WriteEntry(batch, *batch.lightingT8);
+        if (batch.rayCopies)
+            for (const auto& entry : *batch.rayCopies)
+                WriteEntry(batch, entry);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
-        FinishStatus(true, batch.guidesOnly ? (batch.lightingT8 ?
+        FinishStatus(true, batch.guidesOnly ? (batch.rayCopies ?
+                         "Early guide capture saved: native guides, private ray snapshots and optional lighting companions." :
+                         batch.lightingT8 ?
                          "Early guide capture saved: native guides, encoded lighting t8 and optional exposure words." :
                          batch.exposureWords ?
                          "Early guide capture saved: three native guides, raw exposure words and provenance." :
@@ -676,7 +710,7 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
 bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                        const std::array<Texture, 3>& guides, const std::string& provenanceJson,
                        const std::shared_ptr<void>& keepAlive, const Texture* exposureWords,
-                       const Texture* lightingT8) noexcept
+                       const Texture* lightingT8, const std::array<Texture, 2>* rayCopies) noexcept
 {
     HMODULE module = nullptr;
     bool recorded = false;
@@ -711,6 +745,7 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         std::array<ComPtr<IUnknown>, 3> identities;
         ComPtr<IUnknown> exposureIdentity;
+        ComPtr<IUnknown> inputIdentity;
         UINT64 totalBytes = 0;
         for (size_t i = 0; i < guides.size(); ++i)
         {
@@ -757,7 +792,6 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
         {
             if (!lightingT8->resource)
                 throw std::runtime_error("supplied lighting t8 companion must contain an owned source resource");
-            ComPtr<IUnknown> inputIdentity;
             Check(lightingT8->resource->QueryInterface(IID_PPV_ARGS(&inputIdentity)),
                   "lighting t8 resource identity unavailable");
             for (const auto& identity : identities)
@@ -775,12 +809,48 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                 throw std::runtime_error("guides and optional lighting companions exceed the shared256MiB readback limit");
             totalBytes += batch->lightingT8->bytes;
         }
+        if (rayCopies)
+        {
+            constexpr const char* rayRoles[] = { "ray_motion", "ray_hit" };
+            std::array<ComPtr<IUnknown>, 2> rayIdentities;
+            batch->rayCopies.emplace();
+            for (size_t i = 0; i < rayCopies->size(); ++i)
+            {
+                const auto& texture = (*rayCopies)[i];
+                if (!texture.resource)
+                    throw std::runtime_error("ray snapshot companions require both private resources");
+                Check(texture.resource->QueryInterface(IID_PPV_ARGS(&rayIdentities[i])),
+                      "ray snapshot resource identity unavailable");
+                for (const auto& identity : identities)
+                    if (rayIdentities[i].Get() == identity.Get())
+                        throw std::runtime_error("ray snapshots must not alias any native guide");
+                if ((exposureIdentity && rayIdentities[i].Get() == exposureIdentity.Get()) ||
+                    (inputIdentity && rayIdentities[i].Get() == inputIdentity.Get()))
+                    throw std::runtime_error("ray snapshots must not alias exposure or lighting companions");
+                for (size_t previous = 0; previous < i; ++previous)
+                    if (rayIdentities[i].Get() == rayIdentities[previous].Get())
+                        throw std::runtime_error("ray snapshots require distinct canonical resource identities");
+                const auto& first = batch->entries.front().footprint.Footprint;
+                if (!IsRayCopyTexture(texture.resource->GetDesc(), texture.viewFormat, texture.subresource,
+                                      texture.state, first.Width, first.Height, i == 1))
+                    throw std::runtime_error("ray snapshots require active-sized typed RGBA16F/R32F in state0xc0");
+                auto& entry = (*batch->rayCopies)[i];
+                entry = Entry { .role = rayRoles[i], .source = texture };
+                PrepareEntry(device, entry, false, false, false, i == 1);
+                if (entry.bytes > MaxBytes - totalBytes)
+                    throw std::runtime_error("guides and optional ray companions exceed the shared256MiB readback limit");
+                totalBytes += entry.bytes;
+            }
+        }
         for (auto& entry : batch->entries)
             AllocateReadback(device, entry);
         if (batch->exposureWords)
             AllocateReadback(device, *batch->exposureWords);
         if (batch->lightingT8)
             AllocateReadback(device, *batch->lightingT8);
+        if (batch->rayCopies)
+            for (auto& entry : *batch->rayCopies)
+                AllocateReadback(device, entry);
 
         batch->directory = Util::ExePath().parent_path() / "FSRRR-early-guide-captures" / Timestamp("early-guides");
         const auto& extent = batch->entries.front().footprint.Footprint;
@@ -831,6 +901,21 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
             companion["input_provenance"] = "caller_supplied; original binding, ownership, required source read bits and frame association not authenticated by readback helper";
             batch->metadata["companions"].push_back(std::move(companion));
         }
+        if (batch->rayCopies)
+        {
+            for (size_t i = 0; i < batch->rayCopies->size(); ++i)
+            {
+                auto companion = Describe((*batch->rayCopies)[i]);
+                companion["schema"] = "optiscaler.fsr_rr.private_ray_copy.v1";
+                companion["snapshot_stage"] = "original_ray_dispatch; caller_supplied";
+                companion["source_role"] = i == 0 ? "motion" : "hit";
+                companion["value_transform"] = "none; native byte copy, all channels and bits preserved";
+                companion["semantic_units"] = "caller must prove motion scale and hit encoding; not inferred from format";
+                companion["final_write_authority"] = "caller must prove selected writer and any final-write claim; not established by readback completion";
+                companion["input_provenance"] = "caller_supplied; original ray binding, producer ordering and frame association not authenticated by readback helper";
+                batch->metadata["companions"].push_back(std::move(companion));
+            }
+        }
 
         auto args = std::make_unique<WorkerArgs>();
         args->batch = batch;
@@ -842,6 +927,8 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
         // Same native-list observer as fog/RR capture. No callback/frame-order
         // heuristic substitutes for observed submission and successful fencing.
         args->ticket = FSRDSubmission::Retain(device, list, batch);
+        if (!args->ticket)
+            throw std::runtime_error("early guide capture could not retain its readback batch");
         {
             std::lock_guard lock(registry.mutex);
             registry.pending = batch;
@@ -855,6 +942,9 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
             RecordCopy(list, *batch->exposureWords);
         if (batch->lightingT8)
             RecordCopy(list, *batch->lightingT8);
+        if (batch->rayCopies)
+            for (const auto& entry : *batch->rayCopies)
+                RecordCopy(list, entry);
         recorded = true;
 
         const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);

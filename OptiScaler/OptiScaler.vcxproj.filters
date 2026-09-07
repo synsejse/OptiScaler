@@ -848,6 +848,12 @@
     <ClInclude Include="upscalers\ffx\FSRDPrivateDenoise.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDPrivateRayCopy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayAccess.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingConstants.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1479,6 +1485,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="upscalers\ffx\FSRDPrivateDenoise.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\ffx\FSRDPrivateRayCopy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="upscalers\ffx\FSRDCyberpunkEarlyGuides.cpp">

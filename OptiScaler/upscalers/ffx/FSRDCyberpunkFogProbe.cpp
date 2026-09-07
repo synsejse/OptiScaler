@@ -11,6 +11,8 @@
 #include "FSRDCyberpunkLightingSource.h"
 #include "FSRDCyberpunkRayConstants.h"
 #include "FSRDCyberpunkRayBindings.h"
+#include "FSRDCyberpunkRayAccess.h"
+#include "FSRDPrivateRayCopy.h"
 #include "FSRDCyberpunkResetCamera.h"
 #include "FSRDCyberpunkLightingConstants.h"
 
@@ -281,6 +283,19 @@ struct EndpointTrace
     bool endpointsClosed = false, fogRecorded = false, finalized = false;
     std::string failure;
 };
+struct RayCopyBundle
+{
+    FSRD::CyberpunkRayAccess::Input input;
+    ComPtr<ID3D12Device> device;
+    ComPtr<IUnknown> listIdentity;
+    FSRD::PrivateRayCopy::Textures sources;
+    std::shared_ptr<FSRD::PrivateRayCopy::Work> work;
+    uintptr_t frameSourceObject = 0;
+    UINT width = 0, height = 0;
+    unsigned dispatchOrdinal = 0;
+    bool originalReturned = false, recorded = false;
+    Json provenance;
+};
 struct Registry
 {
     std::mutex mutex;
@@ -297,6 +312,8 @@ struct Registry
     // CPU descriptor correspondence at original DispatchRays only. These are
     // not retained resource leases, GPU payloads, or a later-lighting frame join.
     std::vector<Json> rayDispatches;
+    std::shared_ptr<RayCopyBundle> rayCopy; // One immutable, privately owned same-list snapshot bundle.
+    Json rayCopyStatus;
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
     std::shared_ptr<EndpointTrace> submissionTrace;
@@ -325,6 +342,7 @@ std::atomic<bool> earlyFatalRecording { false };
 std::atomic<ULONGLONG> earlyRequestedAt { 0 };
 std::atomic<bool> lightingRequested { false }, lightingAttempted { false };
 std::atomic<bool> rayBindingsAuthenticated { false };
+std::atomic<bool> rayCopyAttempted { false };
 std::atomic<ULONGLONG> lightingRequestedAt { 0 };
 std::atomic<bool> endpointActive { false };
 std::atomic<bool> submissionActive { false };
@@ -1609,6 +1627,219 @@ void __fastcall HookBindUavs(uint32_t first, uint32_t count, const uint32_t* han
         if (begun[i]) Metadata([&] { CompleteRayBind(current, i + 1, pending[i], handles); });
 }
 
+bool SameRayCopyScope(const RayCopyBundle& plan) noexcept
+{
+    try
+    {
+        const auto& expected = plan.input.dispatch;
+        if (!rayScope || rayScope->serial != expected.scope.serial || !active.load() ||
+            !captureEnabled.load() || !captureTrackingValid.load() || !rayBindingsAuthenticated.load() ||
+            plan.input.image != authenticatedImage.load() || CurrentRayConstantScope() != expected.scope)
+            return false;
+        uintptr_t object = 0;
+        uint8_t executing = 0;
+        UINT width = 0, height = 0;
+        if (!ReadEarlyAt(expected.scope.graphContext, 0, object) || object != plan.frameSourceObject ||
+            !ReadEarlyAt(expected.scope.graphContext, 0x30, executing) || !(executing & 2) ||
+            !ReadEarlyAt(expected.scope.view, 0x34, width) || width != plan.width ||
+            !ReadEarlyAt(expected.scope.view, 0x38, height) || height != plan.height)
+            return false;
+        for (size_t i = 0; i < rayScope->bindings.size(); ++i)
+            if (!rayScope->bindings[i].valid || rayScope->bindings[i].scope != expected.scope ||
+                rayScope->bindings[i].handle != expected.textures[i].handle)
+                return false;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            const auto found = data.lists.find(plan.listIdentity.Get());
+            if (!originalBeginRenderPass || !originalEndRenderPass || found == data.lists.end() ||
+                !found->second.known || found->second.generation != expected.scope.recordingGeneration ||
+                found->second.predicated || found->second.renderPass || found->second.queryCount)
+                return false;
+        }
+        struct Reader { bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); } } reader;
+        const FSRD::CyberpunkRayBindings::TextureHandles handles {
+            expected.textures[0].handle, expected.textures[1].handle, expected.textures[2].handle };
+        const auto& receipt = rayScope->receipt;
+        if (receipt.phase != FSRD::CyberpunkRayConstants::Phase::Uploaded || receipt.source ||
+            receipt.scope != expected.scope || receipt.cache != expected.cache || receipt.descriptor != expected.b6.descriptor)
+            return false;
+        for (unsigned repeat = 0; repeat < 2; ++repeat)
+        {
+            FSRD::CyberpunkRayBindings::Snapshot current;
+            FSRD::CyberpunkRayBindings::Failure reason {};
+            if (!FSRD::CyberpunkRayBindings::Detail::ReadCurrent(reader, plan.input.image,
+                    expected.list4, expected.scope, receipt, handles, current, reason)) return false;
+            current.callerRva = expected.callerRva;
+            // ReadCurrent requires positive refs. Ignore ONLY their numeric
+            // changes before comparing snapshots: kind3 may legitimately retain.
+            // The metadata-only Observe intentionally compares them more strictly.
+            for (size_t i = 0; i < current.textures.size(); ++i)
+                current.textures[i].refs = expected.textures[i].refs;
+            if (current != expected) return false;
+        }
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+struct RayCopyEngineHost
+{
+    const RayCopyBundle& plan;
+    bool Read(uintptr_t address, void* destination, size_t bytes) noexcept
+    { return ReadExactMemory(address, destination, bytes); }
+    uint32_t ThreadId() noexcept { return GetCurrentThreadId(); }
+    bool ReadTlsSlotZero(uintptr_t& result) noexcept
+    { return ReadEarly(uintptr_t(__readgsqword(0x58)), result) && result; }
+    bool ExactImageAuthenticated(uintptr_t image, uintptr_t size, uint32_t stamp, std::string_view sha) noexcept
+    {
+        return active.load() && captureEnabled.load() && image == authenticatedImage.load() &&
+            image == uintptr_t(GetModuleHandleW(nullptr)) && size == 0x04efc000 && stamp == 0x68af45ea && sha == ExeSha256;
+    }
+    bool LiveCodeMatches(uintptr_t image, const FSRD::CyberpunkEngineAccess::CodeRange& code) noexcept
+    { return MatchLiveCode(image, code); }
+    bool ListIsDirect(uintptr_t list) noexcept
+    { return reinterpret_cast<ID3D12GraphicsCommandList*>(list)->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT; }
+    bool IsAdmittedPostRayScope(const FSRD::CyberpunkRayAccess::Input& input) noexcept
+    {
+        // A later lighting request may finish on another recording thread. That
+        // must not disable mandatory restoration of this still-valid ray scope.
+        return &input == &plan.input && plan.originalReturned && plan.work && plan.sources[0] && plan.sources[1] &&
+            uintptr_t(plan.sources[0].Get()) == input.dispatch.textures[0].native &&
+            uintptr_t(plan.sources[1].Get()) == input.dispatch.textures[2].native && SameRayCopyScope(plan);
+    }
+    bool IsTextureResidencyAdmitted(uintptr_t registry,
+                                    const FSRD::CyberpunkEngineAccess::TextureBorrow& texture) noexcept
+    {
+        try
+        {
+            if (registry != plan.input.dispatch.registry) return false;
+            for (const auto& code : FSRD::CyberpunkLightingSource::Code)
+                if (!MatchLiveCode(plan.input.image, { code.rva, code.bytes, code.sha256 })) return false;
+            for (size_t i : { size_t(0), size_t(2) })
+            {
+                const auto& expected = plan.input.dispatch.textures[i];
+                if (texture.handle != expected.handle || texture.native != expected.native) continue;
+                FSRD::CyberpunkLightingSource::Snapshot source;
+                source.slot = expected.slot; source.native = expected.native;
+                if (!ReadEarlyAt(source.slot, 0x68, source.externalSync)) return false;
+                FSRD::CyberpunkLightingSource::ResidencySnapshot residency;
+                return FSRD::CyberpunkLightingSource::ObserveRegisteredResidency(*this,
+                    plan.input.dispatch.scope.engine, source, residency);
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+    void RequestState(uintptr_t address, uintptr_t engine, uint32_t handle, uint32_t state, uint32_t subresource) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t)>(address)(reinterpret_cast<void*>(engine), handle, state, subresource); }
+    void Flush(uintptr_t address, uintptr_t engine) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*)>(address)(reinterpret_cast<void*>(engine)); }
+};
+
+std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::Snapshot& snapshot,
+                                           const D3D12_DISPATCH_RAYS_DESC& dispatch, unsigned ordinal)
+{
+    if (!lightingRequested.load() || lightingAttempted.load() || rayCopyAttempted.exchange(true)) return {};
+    auto plan = std::make_shared<RayCopyBundle>();
+    plan->input.image = authenticatedImage.load(); plan->input.dispatch = snapshot; plan->dispatchOrdinal = ordinal;
+    plan->provenance = { { "status", "preparing" }, { "original_scene_modified", false },
+        { "scope", snapshot.scope.serial }, { "view", snapshot.scope.view },
+        { "frame_source_cpu", snapshot.scope.frameSource }, { "native_list", snapshot.scope.list },
+        { "recording_generation", snapshot.scope.recordingGeneration }, { "dispatch_ordinal", ordinal },
+        { "native_dispatch_extent", { dispatch.Width, dispatch.Height, dispatch.Depth } },
+        { "stage", "immediately_after_this_original_DispatchRays" },
+        { "hit_units", "not_asserted" }, { "final_writer", "not_asserted" },
+        { "gpu_completion", "requires_submission_fence" } };
+    try
+    {
+        auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(snapshot.scope.list);
+        plan->listIdentity = ListIdentity(list);
+        if (!plan->listIdentity || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT || dispatch.Depth != 1 ||
+            !ReadEarlyAt(snapshot.scope.graphContext, 0, plan->frameSourceObject) || !plan->frameSourceObject ||
+            !ReadEarlyAt(snapshot.scope.view, 0x34, plan->width) || !ReadEarlyAt(snapshot.scope.view, 0x38, plan->height) ||
+            !plan->width || !plan->height || plan->width > 8192 || plan->height > 8192 ||
+            !SameRayCopyScope(*plan))
+            throw std::runtime_error("ray-copy current direct-list/view/dispatch extent refused");
+        // Adaptive rays can dispatch a flattened1D work domain. The copy extent
+        // comes from this exact current view, never DispatchRays Width/Height.
+        ComPtr<IUnknown> list4Identity;
+        if (FAILED(reinterpret_cast<ID3D12GraphicsCommandList4*>(snapshot.list4)->QueryInterface(IID_PPV_ARGS(&list4Identity))) ||
+            list4Identity.Get() != plan->listIdentity.Get() || FAILED(list->GetDevice(IID_PPV_ARGS(&plan->device))))
+            throw std::runtime_error("ray-copy native List/List4/device identity differs");
+        if (snapshot.textures[0].native == snapshot.textures[1].native ||
+            snapshot.textures[2].native == snapshot.textures[1].native)
+            throw std::runtime_error("ray-copy source aliases original radiance UAV");
+        plan->provenance["source_descriptions"] = Json::array();
+        for (size_t i = 0; i < 2; ++i)
+        {
+            // The exact currently bound original ray t4/u8 are valid engine
+            // borrows within this synchronous invocation, before end-use cleanup.
+            // This is not a lookup of an old globally sampled native pointer.
+            plan->sources[i] = reinterpret_cast<ID3D12Resource*>(snapshot.textures[i ? 2 : 0].native);
+            const auto desc = plan->sources[i]->GetDesc();
+            plan->provenance["source_descriptions"].push_back({ { "role", i ? "hit" : "motion" },
+                { "dimension", unsigned(desc.Dimension) }, { "format", unsigned(desc.Format) },
+                { "width", desc.Width }, { "height", desc.Height }, { "depth_or_array_size", desc.DepthOrArraySize },
+                { "mip_levels", desc.MipLevels }, { "sample_count", desc.SampleDesc.Count },
+                { "sample_quality", desc.SampleDesc.Quality }, { "flags", unsigned(desc.Flags) },
+                { "layout", unsigned(desc.Layout) }, { "alignment", desc.Alignment } });
+            if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
+                throw std::runtime_error("ray-copy simultaneous-access source is unsupported");
+        }
+        const char* failure = nullptr;
+        plan->work = FSRD::PrivateRayCopy::Prepare(plan->device.Get(), plan->width, plan->height, plan->sources, &failure);
+        if (!plan->work || !SameRayCopyScope(*plan))
+            throw std::runtime_error(failure && *failure ? failure : "ray-copy source changed during preparation");
+        plan->provenance["frame_source_object"] = plan->frameSourceObject;
+        plan->provenance["extent"] = { plan->width, plan->height };
+        plan->provenance["source_resources"] = { snapshot.textures[0].native, snapshot.textures[2].native };
+        return plan;
+    }
+    catch (const std::exception& error) { plan->provenance["reason"] = error.what(); }
+    catch (...) { plan->provenance["reason"] = "ray-copy preparation threw"; }
+    plan->provenance["status"] = "refused_before_state_requests";
+    auto& data = Data();
+    std::lock_guard lock(data.mutex);
+    data.rayCopyStatus = plan->provenance;
+    return {};
+}
+
+void FinishRayCopy(const std::shared_ptr<RayCopyBundle>& plan)
+{
+    if (!plan) return;
+    plan->originalReturned = true; // Only called after the one original native call returned.
+    RayCopyEngineHost host { *plan };
+    const auto result = FSRD::CyberpunkRayAccess::RecordCopy(host, plan->input, [&] {
+        return plan->work->Record(reinterpret_cast<ID3D12GraphicsCommandList*>(plan->input.dispatch.scope.list));
+    });
+    if (result.outcome == FSRD::CyberpunkRayAccess::Outcome::ScopeLostAfterMutation)
+    {
+        earlyFatalRecording.store(true); // Must precede any fallible diagnostics.
+        try { LOG_ERROR("[FSRRR ray copy] FATAL original scope lost after native state mutation; terminating authenticated Cyberpunk only"); }
+        catch (...) {}
+        if (active.load() && captureEnabled.load() && plan->input.image == authenticatedImage.load() &&
+            plan->input.image == uintptr_t(GetModuleHandleW(nullptr)))
+        {
+            TerminateProcess(GetCurrentProcess(), 0xf51d0001u);
+            RaiseFailFastException(nullptr, nullptr, 0);
+        }
+        return;
+    }
+    plan->recorded = result.outcome == FSRD::CyberpunkRayAccess::Outcome::CopyRecordedRestored &&
+        result.hitRestored && plan->work->Recorded();
+    plan->provenance["status"] = plan->recorded ? "private_raw_copy_recorded_hit_restored" : "private_raw_copy_refused_or_failed";
+    plan->provenance["outcome"] = unsigned(result.outcome);
+    plan->provenance["engine_state_requests"] = result.requestsIssued;
+    plan->provenance["hit_uav_restored"] = result.hitRestored;
+    plan->provenance["private_output_states"] = { 0xc0, 0xc0 };
+    if (!plan->recorded) plan->provenance["reason"] = std::string(plan->work->Error());
+    auto& data = Data();
+    std::lock_guard lock(data.mutex);
+    data.rayCopyStatus = plan->provenance;
+    if (plan->recorded) data.rayCopy = plan; // One-shot: no old owner is released under this lock.
+}
+
 Json DescribeRayBinding(const FSRD::CyberpunkRayBindings::Binding& binding)
 {
     return { { "register", binding.shaderRegister }, { "cpu_descriptor", binding.descriptor },
@@ -1621,6 +1852,7 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
 {
     const auto caller = uintptr_t(_ReturnAddress());
     auto* current = rayScope;
+    std::shared_ptr<RayCopyBundle> rayCopy;
     if (RayBindingsArmed() && current->dispatches < MaxRayDispatches)
     {
         const auto ordinal = ++current->dispatches;
@@ -1630,7 +1862,9 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
                 { "native_list4", uintptr_t(list) }, { "native_caller", caller },
                 { "gpu_payload_proven", false }, { "resource_readiness_proven", false },
                 { "same_frame_pairing", "not_asserted" }, { "resource_ownership", "not_acquired" },
-                { "selected_state_object", "not_observed" }, { "gpu_commands_added", false } };
+                { "selected_state_object", "not_observed" }, { "gpu_commands_added", false },
+                { "observation_scope", "CPU_binding_snapshot_before_original_dispatch_only" },
+                { "optional_private_copy", "reported_separately_in_private_ray_copies" } };
             try
             {
                 D3D12_DISPATCH_RAYS_DESC desc {};
@@ -1712,6 +1946,7 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
                         { "binding", DescribeRayBinding(texture.binding) } });
                 }
                 observation["status"] = "original_dispatch_cpu_binding_correspondence_observed";
+                rayCopy = PrepareRayCopy(snapshot, desc, ordinal);
             }
             catch (const std::exception& error) { observation["reason"] = error.what(); }
             catch (...) { observation["reason"] = "CPU binding observation threw"; }
@@ -1722,6 +1957,7 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
         });
     }
     originalDispatchRays(list, description); // Exactly one original call, including all refusals/exceptions.
+    if (rayCopy) Metadata([&] { FinishRayCopy(rayCopy); });
 }
 
 void WINAPI HookSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
@@ -2192,6 +2428,7 @@ struct LightingCapturePlan
     FSRD::CyberpunkGuidePass::SourceView lightingT8View;
     Json lightingT8Bindings;
     bool lightingT8Prepared = false;
+    std::shared_ptr<RayCopyBundle> rayCopy; // Private copy Work retained by this capture's keepAlive.
 };
 
 struct ExposureMemory
@@ -2859,6 +3096,71 @@ std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsComman
     return plan;
 }
 
+bool RayCopyRecordingMatches(const RayCopyBundle& candidate, const LightingCapturePlan& plan,
+                             uintptr_t object, uint32_t frame, const std::array<uint32_t, 2>& dimensions) noexcept
+{
+    const auto& source = candidate.input.dispatch.scope;
+    return candidate.recorded && candidate.work && candidate.work->Recorded() &&
+        source.list == plan.list && candidate.listIdentity.Get() == plan.listIdentity.Get() &&
+        source.recordingGeneration == plan.drawState.generation && source.view == plan.view &&
+        source.serial < plan.serial && candidate.width == dimensions[0] && candidate.height == dimensions[1] &&
+        candidate.frameSourceObject == object && source.frameSource == frame;
+}
+
+bool AttachRayCopies(LightingCapturePlan& plan, std::array<FSRDFogLayerCapture::Texture, 2>& textures)
+{
+    auto& evidence = plan.provenance["private_ray_copies"];
+    evidence = { { "status", "unavailable" }, { "scene_correction", false },
+        { "same_frame", "requires_exact_CPU_source_and_recording_join" } };
+    std::shared_ptr<RayCopyBundle> candidate;
+    {
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        candidate = data.rayCopy;
+        if (!data.rayCopyStatus.is_null()) evidence["copy_attempt"] = data.rayCopyStatus;
+    }
+    if (!candidate) return false;
+    try
+    {
+        const auto& source = candidate->input.dispatch.scope;
+        const auto& frameRoute = plan.metadata.at("camera_provenance").at("frame_id_virtual_route");
+        const auto& frame = frameRoute.at("explicit_frame_id_source");
+        uintptr_t currentObject = 0;
+        uint32_t currentFrame = 0;
+        const auto dimensions = plan.metadata.at("view_dimensions").get<std::array<uint32_t, 2>>();
+        // The completed bundle must already be published when this exact later
+        // lighting callback records on the SAME native list/Reset. This is an
+        // ordered private-output dependency, not just a matching resource pointer.
+        if (frame.at("status") != "CPU_value_present" || !frame.at("repeated_source_fields_equal").get<bool>() ||
+            !RayCopyRecordingMatches(*candidate, plan, frameRoute.at("object_address").get<uintptr_t>(),
+                                     frame.at("source_value").get<uint32_t>(), dimensions) ||
+            !ReadEarlyAt(plan.context, 0, currentObject) || currentObject != candidate->frameSourceObject ||
+            !ReadEarlyAt(currentObject, 0x1b0, currentFrame) || currentFrame != source.frameSource)
+            throw std::runtime_error("private ray copy is not an earlier same-list/Reset/view/CPU-frame-source snapshot");
+        const auto current = CurrentLightingConstantScope();
+        if (current.serial != plan.serial || current.list != plan.list || current.view != plan.view ||
+            current.recordingGeneration != source.recordingGeneration)
+            throw std::runtime_error("lighting recording changed before private ray readback");
+        for (size_t i = 0; i < textures.size(); ++i)
+        {
+            textures[i].resource = candidate->work->Outputs()[i];
+            textures[i].viewFormat = i ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            textures[i].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+        evidence["status"] = "earlier_same_recording_CPU_frame_source_join";
+        evidence["same_frame"] = "same_exact_current_engine_CPU_source_not_an_observed_SL_token";
+        evidence["copy_scope"] = source.serial;
+        evidence["lighting_scope"] = plan.serial;
+        evidence["original_hit_final_writer"] = "not_asserted";
+        evidence["hit_units"] = "not_asserted";
+        plan.rayCopy = std::move(candidate);
+        return true;
+    }
+    catch (const std::exception& error) { evidence["reason"] = error.what(); }
+    catch (...) { evidence["reason"] = "private ray copy pairing threw"; }
+    return false;
+}
+
 void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<LightingCapturePlan>& plan)
 {
     // Original final lighting DrawInstanced has already returned exactly once.
@@ -2923,8 +3225,11 @@ void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_pt
         lightingT8.state = D3D12_RESOURCE_STATES(FSRD::CyberpunkEngineAccess::LightingCaptureReadState);
         plan->provenance["lighting_t8"]["status"] = "native_read_mask_requested_and_flushed";
     }
+    std::array<FSRDFogLayerCapture::Texture, 2> rayCopies;
+    const bool pairedRayCopies = AttachRayCopies(*plan, rayCopies);
     const bool recorded = FSRDFogLayerCapture::RecordEarlyGuides(plan->device.Get(), list, outputs, plan->provenance.dump(), plan,
-        plan->exposureWork ? &exposure : nullptr, plan->lightingT8Prepared ? &lightingT8 : nullptr);
+        plan->exposureWork ? &exposure : nullptr, plan->lightingT8Prepared ? &lightingT8 : nullptr,
+        pairedRayCopies ? &rayCopies : nullptr);
     LOG_INFO("[FSRRR lighting guides] original draw preserved; private guide readback recorded={} scope={}", recorded, plan->serial);
 }
 

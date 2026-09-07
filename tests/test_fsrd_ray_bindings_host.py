@@ -1,4 +1,4 @@
-"""Original ray binding/DispatchRays host observation is bounded CPU metadata only."""
+"""Original ray binding observation; optional private-copy host is tested separately."""
 import os
 from pathlib import Path
 import shutil
@@ -61,13 +61,18 @@ class RayBindingsHost(unittest.TestCase):
         self.assertLess(late.index("FSRDCyberpunkFogProbe::HookCommandList(probeList)"),
                         late.index("if (s_SetComputeRootSignature.o_lateHook"))
 
-    def test_no_gpu_actions_or_readiness_claims_and_bounded_candidates(self):
+    def test_metadata_no_readiness_claims_and_bounded_candidates(self):
         body = function("HookDispatchRays")
         self.assertIn("current->dispatches < MaxRayDispatches", body)
         self.assertIn("data.rayDispatches.size() == MaxRayDispatches", body)
         self.assertIn("data.rayDispatches.erase(data.rayDispatches.begin())", body)
         self.assertIn("static_assert(sizeof(desc) == 104)", body)
         self.assertLess(body.index("CyberpunkRayBindings::Observe("), body.index("originalDispatchRays("))
+        # The optional private-copy host has its own resource/state admission tests.
+        # This suite keeps the actual binding receipt paths and original-once boundary.
+        self.assertLess(body.index("CyberpunkRayBindings::Observe("), body.index("PrepareRayCopy(snapshot, desc, ordinal)"))
+        self.assertLess(body.index("PrepareRayCopy(snapshot, desc, ordinal)"), body.index("originalDispatchRays("))
+        self.assertLess(body.index("originalDispatchRays("), body.index("FinishRayCopy(rayCopy)"))
         for forbidden in ("AddRef(", "GetDesc(", "ResourceBarrier(", "CopyTextureRegion(",
                           "RequestTextureState(", "SetPipelineState(", "GetGPUVirtualAddress("):
             self.assertNotIn(forbidden, body)
@@ -97,6 +102,7 @@ class RayBindingsHost(unittest.TestCase):
 #include <cassert>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -128,6 +134,10 @@ struct D3D12_DISPATCH_RAYS_DESC {
  AddressRange RayGenerationShaderRecord;AddressTable MissShaderTable,HitGroupTable,CallableShaderTable;
  uint32_t Width=1280,Height=720,Depth=1;
 };
+struct RayCopyBundle {};
+std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::Snapshot&,
+ const D3D12_DISPATCH_RAYS_DESC&,unsigned){return {};}
+void FinishRayCopy(const std::shared_ptr<RayCopyBundle>&){assert(false);}
 uint32_t handle=17; D3D12_DISPATCH_RAYS_DESC description;
 unsigned reads=0,scopeReads=0,textureCalls=0,uavCalls=0,dispatchCalls=0,nodeCalls=0;
 bool throwRead=false,failRead=false,throwScope=false;
