@@ -14,7 +14,11 @@ SOURCE = CPP.read_text()
 class EarlyGuides(unittest.TestCase):
     def test_observation_is_only_in_authenticated_capture_or_explicit_early_request(self):
         probe = (CPP.parent / "FSRDCyberpunkFogProbe.cpp").read_text()
-        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 6)
+        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 8)
+        depth = probe.split("void PrepareFogDepth(", 1)[1].split("void RecordFogDepth(", 1)[0]
+        self.assertEqual(depth.count("FSRDCyberpunkEarlyGuides::Describe("), 2)
+        self.assertIn("!fogDepthAuthenticated.load()", depth)
+        self.assertIn("!scope->depthBindObserved", depth)
         initializer = probe.split("void __fastcall HookGBufferInitializer(", 1)[1].split("void ObserveInitializerClear(", 1)[0]
         self.assertLess(initializer.index("earlyRequested.load() && !earlyAttempted.load() && !inMetadata"),
                         initializer.index("FSRDCyberpunkEarlyGuides::Describe("))

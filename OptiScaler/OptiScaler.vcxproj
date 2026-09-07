@@ -543,6 +543,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayConstants.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayBindings.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayAccess.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogDepth.h" />
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogDenoiseAccess.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkMotionScale.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkResetCamera.h" />
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingConstants.h" />

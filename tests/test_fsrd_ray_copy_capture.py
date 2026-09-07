@@ -148,11 +148,13 @@ namespace FSRDSubmission {
  }
 }
 struct Registry {
- std::mutex mutex;std::atomic<RequestKind> kind{RequestKind::EarlyGuides};
+ std::mutex mutex;
  std::atomic<bool> requested{true};Status status;
  std::shared_ptr<Batch> pending;std::shared_ptr<FSRDSubmission::Ticket> ticket;
 };
-Registry& GetRegistry(){static Registry registry;return registry;}
+Registry& GetRegistry(RequestKind kind=RequestKind::EarlyGuides){
+ static Registry registries[2];return registries[kind==RequestKind::FogLayers?0:1];
+}
 void AllocateReadback(ID3D12Device*,Entry&){++allocations;}
 void RecordCopy(ID3D12GraphicsCommandList*,const Entry& entry){
  assert(GetRegistry().ticket);assert(entry.source.state==0xc0||entry.source.state==0x8c0);++copies;
@@ -160,7 +162,7 @@ void RecordCopy(ID3D12GraphicsCommandList*,const Entry& entry){
 namespace Util {std::filesystem::path ExePath(){return "/not-written/game.exe";}}
 std::string Timestamp(const char*){return "test";}
 UINT GetCurrentProcessId(){return 1;}
-void FinishStatus(bool,const std::string&,bool){}
+void FinishStatus(RequestKind,bool,const std::string&,bool){}
 struct WorkerArgs{HMODULE module=nullptr;std::shared_ptr<Batch> batch;std::shared_ptr<FSRDSubmission::Ticket> ticket;};
 bool GetModuleHandleExW(UINT,LPCWSTR,HMODULE* m){*m=reinterpret_cast<void*>(1);++moduleRefs;return true;}
 void FreeLibrary(HMODULE){assert(moduleRefs);--moduleRefs;}
@@ -182,7 +184,8 @@ int main(){
  Texture exposure,t8;auto owner=std::make_shared<int>(1);
  auto setup=[&](UINT width=1280,UINT height=720){
   allocations=copies=retains=workers=moduleRefs=0;failRetain=false;
-  auto& registry=GetRegistry();registry.kind=RequestKind::EarlyGuides;registry.requested=true;
+  auto& registry=GetRegistry();registry.requested=true;
+  GetRegistry(RequestKind::FogLayers).requested=false;
   registry.pending.reset();registry.ticket.reset();
   for(unsigned i=0;i<7;++i){resources[i].desc={};resources[i].desc.Width=width;
    resources[i].desc.Height=height;resources[i].identity=&resources[i];resources[i].failIdentity=false;}
@@ -229,7 +232,8 @@ int main(){
  assert(!GetRegistry().pending&&!GetRegistry().ticket);
  setup();assert(RecordEarlyGuides(&device,&list,guides,"{}",owner));
  assert(allocations==3&&copies==3&&workers==1&&!GetRegistry().pending->rayCopies);
- setup();GetRegistry().kind=RequestKind::FogLayers;assert(!run()&&GetRegistry().requested&&!copies&&!allocations);
+ setup();GetRegistry().requested=false;GetRegistry(RequestKind::FogLayers).requested=true;
+ assert(!run()&&GetRegistry(RequestKind::FogLayers).requested&&!copies&&!allocations);
  setup();Entry e{.role="forbidden_base_hit",.source=ray[1]};bool refused=false;
  try{PrepareEntry(&device,e);}catch(...){refused=true;}assert(refused);
  for(unsigned conflict=0;conflict<3;++conflict){

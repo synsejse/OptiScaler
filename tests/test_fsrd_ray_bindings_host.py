@@ -72,7 +72,9 @@ class RayBindingsHost(unittest.TestCase):
         # This suite keeps the actual binding receipt paths and original-once boundary.
         self.assertLess(body.index("CyberpunkRayBindings::Observe("), body.index("PrepareRayCopy(snapshot, desc, ordinal)"))
         self.assertLess(body.index("PrepareRayCopy(snapshot, desc, ordinal)"), body.index("originalDispatchRays("))
-        self.assertLess(body.index("originalDispatchRays("), body.index("FinishRayCopy(rayCopy)"))
+        self.assertNotIn("FinishRayCopy(", body)
+        self.assertLess(body.index("originalDispatchRays("), body.index("++pending->completedDispatches"))
+        self.assertIn("current->pendingCopy = rayCopy", body)
         for forbidden in ("AddRef(", "GetDesc(", "ResourceBarrier(", "CopyTextureRegion(",
                           "RequestTextureState(", "SetPipelineState(", "GetGPUVirtualAddress("):
             self.assertNotIn(forbidden, body)
@@ -85,7 +87,8 @@ class RayBindingsHost(unittest.TestCase):
             self.assertIn(exact, body)
         node = function("HookRayNode")
         self.assertIn("InvalidateRayBinding(binding)", node)
-        self.assertNotIn("Metadata(", node)
+        self.assertLess(node.index("originalRayNode(node, context)"), node.index("Metadata("))
+        self.assertIn("parent->pendingCopy->invalidated = true", node)
         self.assertIn('plan->provenance["ray_dispatch_candidates"] = data.rayDispatches;', SOURCE)
 
     def test_compiled_actual_host_receipts_and_refusal_dispatch(self):
@@ -108,6 +111,7 @@ class RayBindingsHost(unittest.TestCase):
 #include <vector>
 #include <json.hpp>
 #include "FSRDCyberpunkRayBindings.h"
+#include "FSRDCyberpunkFogDepth.h"
 #ifndef __fastcall
 #define __fastcall
 #endif
@@ -115,10 +119,13 @@ class RayBindingsHost(unittest.TestCase):
 using Json=nlohmann::json;
 thread_local bool inMetadata=false;
 std::atomic<bool> rayBindingsAuthenticated{true},captureTrackingValid{true},lightingRequested{true},lightingAttempted{false};
+std::atomic<bool> fogDepthAuthenticated{false};
 std::atomic<uintptr_t> authenticatedImage{0x140000000};
 std::atomic<uint64_t> scopes{10};
 uintptr_t fakeCaller=0;
 void* _ReturnAddress(){return reinterpret_cast<void*>(fakeCaller);}
+struct Scope {bool depthBindObserved=false;unsigned depthBindCalls=0;uint32_t depthHandle=0;};
+Scope* scope=nullptr; // This fixture exercises ray binding; Fog has its own host tests.
 struct LightingScope {
  bool t8BindObserved=false; unsigned t8BindCalls=0; uint32_t t8Handle=0,t8BindCount=0;uintptr_t t8BindCaller=0;
 };
@@ -134,7 +141,11 @@ struct D3D12_DISPATCH_RAYS_DESC {
  AddressRange RayGenerationShaderRecord;AddressTable MissShaderTable,HitGroupTable,CallableShaderTable;
  uint32_t Width=1280,Height=720,Depth=1;
 };
-struct RayCopyBundle {};
+struct RayCopyBundle {
+ struct { uintptr_t image=0; struct { uintptr_t list4=0; } dispatch; } input;
+ bool invalidated=false,originalReturned=false; unsigned completedDispatches=0;
+ Json provenance;
+};
 std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::Snapshot&,
  const D3D12_DISPATCH_RAYS_DESC&,unsigned){return {};}
 void FinishRayCopy(const std::shared_ptr<RayCopyBundle>&){assert(false);}
@@ -153,7 +164,7 @@ FSRD::CyberpunkRayConstants::Scope CurrentRayConstantScope(){++scopeReads;if(thr
 struct ListState{bool known=true,predicated=false,renderPass=false;unsigned queryCount=0;uint64_t generation=12;};
 struct Identity{void* value;void* Get()const{return value;}};
 Identity ListIdentity(ID3D12GraphicsCommandList* list){return {list};}
-struct Registry{std::mutex mutex;std::map<void*,ListState> lists;std::vector<Json> rayDispatches;};
+struct Registry{std::mutex mutex;std::map<void*,ListState> lists;std::vector<Json> rayDispatches;Json rayCopyStatus;};
 Registry registry;Registry& Data(){return registry;}
 bool originalBeginRenderPass=true,originalEndRenderPass=true;
 void originalDispatchRays(ID3D12GraphicsCommandList4*,const D3D12_DISPATCH_RAYS_DESC*){++dispatchCalls;}

@@ -72,60 +72,142 @@ class StandaloneGuideCapture(unittest.TestCase):
     def test_wrong_kind_record_cannot_consume_request_or_emit_commands(self):
         for name, kind in (("Record", "FogLayers"), ("RecordEarlyGuides", "EarlyGuides")):
             record = body(name)
-            kind_guard = record.index(f"registry.kind.load(std::memory_order_relaxed) != RequestKind::{kind}")
+            kind_slot = record.index(f"GetRegistry(RequestKind::{kind})")
             consume = record.index("registry.requested.exchange(false")
-            self.assertLess(kind_guard, consume)
-            self.assertIn("||", record[kind_guard:consume])
+            self.assertLess(kind_slot, consume)
+            self.assertNotIn("registry.kind", record)
             self.assertLess(consume, record.index("FSRDSubmission::Retain("))
 
-    def test_compiled_actual_typed_request_lifecycle(self):
+    def test_worker_routes_to_immutable_origin_without_changing_completion_policy(self):
+        writer = body("WriteWhenComplete")
+        thread = body("WriterThread")
+        for code in (writer, thread):
+            self.assertIn("guidesOnly ? RequestKind::EarlyGuides : RequestKind::FogLayers", code)
+            self.assertIn("FinishStatus(kind,", code)
+            self.assertNotIn("GetStatus()", code)
+            self.assertNotIn("GetEarlyGuideStatus()", code)
+            self.assertNotIn("FinishStatus(false", code)
+        self.assertIn("FSRDSubmission::Complete(args.ticket)", writer)
+        self.assertIn("SubmissionFailed(args.ticket)", writer)
+        self.assertIn("CompletionTimeoutMs", writer)
+        self.assertIn("constexpr UINT64 MaxBytes = 256ull * 1024 * 1024;", SOURCE)
+        self.assertIn("new std::array<Registry, 2>", body("GetRegistry"))
+
+    def test_compiled_actual_two_slot_lifecycle_and_retirement(self):
         compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("clang++")
         if not compiler:
             self.skipTest("Set CXX to compile actual typed request functions")
         functions = '\n'.join(signature + body(name) for name, signature in (
+            ("FinishStatus", "void FinishStatus(RequestKind kind, bool complete, const std::string& message, bool releaseStorage)"),
             ("RequestKindCapture", "bool RequestKindCapture(RequestKind kind)"),
             ("CancelKindCapture", "void CancelKindCapture(RequestKind kind)"),
             ("Request", "bool Request()"), ("RequestEarlyGuides", "bool RequestEarlyGuides()"),
             ("CancelRequest", "void CancelRequest()"), ("CancelEarlyGuideRequest", "void CancelEarlyGuideRequest()"),
             ("WantsCapture", "bool WantsCapture()"), ("WantsEarlyGuideCapture", "bool WantsEarlyGuideCapture()"),
-            ("GetStatus", "Status GetStatus()")))
-        status = HEADER[HEADER.index('struct Status'):HEADER.index('// Initially one recorded attempt')]
+            ("GetStatus", "Status GetStatus()"), ("GetEarlyGuideStatus", "Status GetEarlyGuideStatus()")))
+        status = HEADER[HEADER.index('struct Status'):HEADER.index('// One recorded attempt')]
+        registry = SOURCE[SOURCE.index('enum class RequestKind'):SOURCE.index('void Check(')]
+        # Compile the actual admission prefixes of BOTH recording entry points:
+        # the surrounding D3D12 allocation/commands are deliberately not mocked here.
+        fog = body("Record")[1:body("Record").index("HMODULE module")]
+        early = body("RecordEarlyGuides")
+        early = early[early.index("auto& registry"):early.index("if (!device")]
+        claims = 'bool ClaimFog() {' + fog + 'return true;}\n'
+        claims += 'bool ClaimEarly() { bool claimed = false; ' + early + 'return claimed;}\n'
         harness = r'''
+#include <array>
 #include <atomic>
+#include <barrier>
 #include <cassert>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 ''' + status + r'''
-enum class RequestKind { FogLayers, EarlyGuides };
-struct Registry {
-    std::mutex mutex;
-    std::atomic<bool> requested{false};
-    std::atomic<RequestKind> kind{RequestKind::FogLayers};
-    Status status;
+struct Batch {
+    std::function<void()> onRelease;
+    ~Batch() { if (onRelease) onRelease(); }
 };
-Registry& GetRegistry() { static Registry r; return r; }
-''' + functions + r'''
+namespace FSRDSubmission {
+struct Ticket {
+    std::function<void()> onRelease;
+    ~Ticket() { if (onRelease) onRelease(); }
+};
+}
+''' + registry + functions + claims + r'''
 int main() {
+    auto& fog=GetRegistry(RequestKind::FogLayers);
+    auto& early=GetRegistry(RequestKind::EarlyGuides);
+    assert(&fog!=&early);
     assert(!WantsCapture() && !WantsEarlyGuideCapture());
+    assert(!ClaimFog() && !ClaimEarly());
     assert(RequestEarlyGuides());
     assert(WantsEarlyGuideCapture() && !WantsCapture());
-    assert(GetStatus().kind=="early_guides" && GetStatus().queued && GetStatus().busy);
-    assert(!Request() && !RequestEarlyGuides());
+    assert(GetEarlyGuideStatus().kind=="early_guides" && GetEarlyGuideStatus().queued && GetEarlyGuideStatus().busy);
+    assert(GetStatus().kind.empty()); // No implicit latest-kind selection.
+    assert(!ClaimFog() && WantsEarlyGuideCapture());
     CancelRequest(); // wrong kind cannot cancel/consume it
     assert(WantsEarlyGuideCapture());
+    assert(Request() && WantsCapture() && WantsEarlyGuideCapture());
+    assert(!Request() && !RequestEarlyGuides());
     CancelEarlyGuideRequest();
-    assert(!WantsEarlyGuideCapture() && !GetStatus().attempted);
-    assert(Request());
+    assert(!WantsEarlyGuideCapture() && !GetEarlyGuideStatus().attempted);
+    assert(!ClaimEarly() && WantsCapture());
     assert(GetStatus().kind=="fog_layers" && WantsCapture() && !WantsEarlyGuideCapture());
-    CancelEarlyGuideRequest();
-    assert(WantsCapture());
     CancelRequest();
     assert(!WantsCapture());
-    assert(RequestEarlyGuides());
-    auto& r=GetRegistry();
-    { std::lock_guard lock(r.mutex); r.requested.store(false); r.status.attempted=true; }
+
+    // Simultaneous independent requests admit exactly one pending request per slot.
+    std::atomic<unsigned> fogAdmitted=0,earlyAdmitted=0;
+    std::barrier start(17);
+    {
+        std::vector<std::jthread> threads;
+        for(unsigned i=0;i<16;++i) threads.emplace_back([&,i]{
+            start.arrive_and_wait();
+            if(i%2) earlyAdmitted+=RequestEarlyGuides(); else fogAdmitted+=Request();
+        });
+        start.arrive_and_wait();
+    }
+    assert(fogAdmitted==1 && earlyAdmitted==1);
+    assert(ClaimEarly() && !ClaimEarly() && WantsCapture());
+    assert(GetEarlyGuideStatus().attempted && !GetStatus().attempted);
+    CancelEarlyGuideRequest(); // A recorded kind cannot be canceled/rearmed.
+    assert(!RequestEarlyGuides() && WantsCapture());
+    assert(ClaimFog() && !ClaimFog());
     CancelRequest(); CancelEarlyGuideRequest();
-    assert(GetStatus().attempted && !Request() && !RequestEarlyGuides());
+    assert(GetStatus().attempted && GetEarlyGuideStatus().attempted);
+    assert(!Request() && !RequestEarlyGuides());
+
+    // Each worker owns its separate status and pending references. In particular,
+    // completing Fog must not release Early's timed-out GPU storage (or vice versa).
+    unsigned fogReleased=0,earlyReleased=0;
+    auto attach=[&](Registry& slot,unsigned& released){
+        auto checkUnlocked=[&slot,&released]{
+            assert(slot.mutex.try_lock()); slot.mutex.unlock(); ++released;
+        };
+        slot.pending=std::make_shared<Batch>();slot.pending->onRelease=checkUnlocked;
+        slot.ticket=std::make_shared<FSRDSubmission::Ticket>();slot.ticket->onRelease=checkUnlocked;
+    };
+    attach(fog,fogReleased);attach(early,earlyReleased);
+    std::weak_ptr<Batch> fogBatch=fog.pending,earlyBatch=early.pending;
+    std::weak_ptr<FSRDSubmission::Ticket> fogTicket=fog.ticket,earlyTicket=early.ticket;
+    FinishStatus(RequestKind::EarlyGuides,false,"early timeout",false);
+    assert(!GetEarlyGuideStatus().busy && !GetEarlyGuideStatus().complete);
+    assert(GetStatus().busy && GetStatus().message=="Preparing native fog-layer readback.");
+    assert(fogReleased==0 && earlyReleased==0);
+    FinishStatus(RequestKind::FogLayers,true,"fog complete",true);
+    assert(GetStatus().complete && GetStatus().message=="fog complete");
+    assert(GetEarlyGuideStatus().message=="early timeout" && !GetEarlyGuideStatus().complete);
+    assert(fogReleased==2 && earlyReleased==0 && fogBatch.expired() && fogTicket.expired());
+    assert(!earlyBatch.expired() && !earlyTicket.expired());
+    assert(!Request() && !RequestEarlyGuides()); // Completion/failure never resets attempts.
+    // Successful retirement of the remaining slot is tested without pretending
+    // timeout establishes GPU completion (this is a direct CPU policy exercise).
+    FinishStatus(RequestKind::EarlyGuides,true,"early CPU retirement test",true);
+    assert(earlyReleased==2 && earlyBatch.expired() && earlyTicket.expired());
+    assert(GetStatus().message=="fog complete" && !RequestEarlyGuides());
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-guide-request-") as directory:
@@ -133,10 +215,11 @@ int main() {
             source = path / 'request.cpp'
             source.write_text(harness)
             executable = path / 'request'
-            compiled = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-O2', str(source),
-                                       '-o', str(executable)], capture_output=True, text=True)
-            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            subprocess.run([str(executable)], check=True, timeout=30)
+            for flags in (['-O0'], ['-O3', '-ffast-math']):
+                compiled = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-pthread', *flags,
+                                           str(source), '-o', str(executable)], capture_output=True, text=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+                subprocess.run([str(executable)], check=True, timeout=30)
 
 
 if __name__ == '__main__':

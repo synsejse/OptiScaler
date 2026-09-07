@@ -12,6 +12,8 @@
 #include "FSRDCyberpunkRayConstants.h"
 #include "FSRDCyberpunkRayBindings.h"
 #include "FSRDCyberpunkRayAccess.h"
+#include "FSRDCyberpunkFogDepth.h"
+#include "FSRDCyberpunkFogDenoiseAccess.h"
 #include "FSRDPrivateRayCopy.h"
 #include "FSRDCyberpunkResetCamera.h"
 #include "FSRDCyberpunkLightingConstants.h"
@@ -290,10 +292,10 @@ struct RayCopyBundle
     ComPtr<IUnknown> listIdentity;
     FSRD::PrivateRayCopy::Textures sources;
     std::shared_ptr<FSRD::PrivateRayCopy::Work> work;
-    uintptr_t frameSourceObject = 0;
+    uintptr_t frameSourceObject = 0, rayOwner = 0;
     UINT width = 0, height = 0;
-    unsigned dispatchOrdinal = 0;
-    bool originalReturned = false, recorded = false;
+    unsigned dispatchOrdinal = 0, completedDispatches = 0;
+    bool originalReturned = false, cleanupEntered = false, cleanupConsumed = false, invalidated = false, recorded = false;
     Json provenance;
 };
 struct Registry
@@ -314,6 +316,7 @@ struct Registry
     std::vector<Json> rayDispatches;
     std::shared_ptr<RayCopyBundle> rayCopy; // One immutable, privately owned same-list snapshot bundle.
     Json rayCopyStatus;
+    Json lightingCaptureSource; // One completed-recording receipt, never cross-list GPU ordering.
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
     std::shared_ptr<EndpointTrace> submissionTrace;
@@ -342,6 +345,7 @@ std::atomic<bool> earlyFatalRecording { false };
 std::atomic<ULONGLONG> earlyRequestedAt { 0 };
 std::atomic<bool> lightingRequested { false }, lightingAttempted { false };
 std::atomic<bool> rayBindingsAuthenticated { false };
+std::atomic<bool> fogDepthAuthenticated { false };
 std::atomic<bool> rayCopyAttempted { false };
 std::atomic<ULONGLONG> lightingRequestedAt { 0 };
 std::atomic<bool> endpointActive { false };
@@ -356,6 +360,8 @@ using FogNode = void(__fastcall*)(void* node, void* context);
 FogNode originalFogNode = nullptr;
 FogNode originalLightingNode = nullptr;
 FogNode originalRayNode = nullptr;
+using RayCleanup = void(__fastcall*)(void*, uint8_t);
+RayCleanup originalRayCleanup = nullptr;
 using FullscreenHelper = void(__fastcall*)(void*, uint32_t, uint8_t);
 FullscreenHelper originalFullscreenHelper = nullptr;
 using BindTextures = void(__fastcall*)(uint32_t, uint32_t, const uint32_t*, uint8_t);
@@ -434,6 +440,9 @@ struct Scope
     bool hasDsv = false;
     unsigned draws = 0;
     BoundRtv boundRtv;
+    bool fogHelper = false, depthBindObserved = false;
+    unsigned depthBindCalls = 0;
+    uint32_t depthHandle = 0;
 };
 thread_local Scope* scope = nullptr;
 thread_local bool inMetadata = false;
@@ -482,6 +491,8 @@ struct RayScope
     FSRD::CyberpunkRayConstants::Receipt receipt {};
     std::array<RayBindReceipt, 3> bindings {}; // Original t4 SRV, u0 UAV, u8 UAV.
     unsigned dispatches = 0;
+    unsigned nativeDispatchDepth = 0;
+    std::shared_ptr<RayCopyBundle> pendingCopy {}; // Only this original invocation may record it before end-use.
 };
 thread_local RayScope* rayScope = nullptr;
 
@@ -1392,11 +1403,20 @@ void __fastcall HookRayNode(void* node, void* context)
     {
         FSRD::CyberpunkRayConstants::Invalidate(parent->receipt);
         for (auto& binding : parent->bindings) InvalidateRayBinding(binding);
+        if (parent->pendingCopy) parent->pendingCopy->invalidated = true;
     }
     RayScope current { rayScope, scopes.fetch_add(1) + 1, context };
     rayScope = &current;
     struct Restore { RayScope* previous; ~Restore() { rayScope = previous; } } restore { current.previous };
     originalRayNode(node, context); // Original exactly once, never caught/replayed.
+    if (current.pendingCopy)
+        Metadata([&] {
+            current.pendingCopy->provenance["status"] = "refused_before_state_requests";
+            current.pendingCopy->provenance["reason"] = "original ray node returned without the admitted common cleanup endpoint";
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            data.rayCopyStatus = current.pendingCopy->provenance;
+        });
 }
 
 FSRD::CyberpunkRayConstants::Scope CurrentRayConstantScope()
@@ -1551,6 +1571,11 @@ void __fastcall HookUploadLightingConstants(uint32_t bytes, const void* source)
 void __fastcall HookFullscreenHelper(void* renderer, uint32_t shader, uint8_t flag)
 {
     const auto caller = uintptr_t(_ReturnAddress());
+    auto* fog = scope;
+    const bool previousFog = fog && fog->fogHelper;
+    if (fog) fog->fogHelper = !inMetadata && caller == authenticatedImage.load() + FSRD::CyberpunkFogDepth::FullscreenReturnRva;
+    struct RestoreFog { Scope* fog; bool previous; ~RestoreFog() { if (fog) fog->fogHelper = previous; } }
+        restoreFog { fog, previousFog };
     auto* current = lightingScope;
     const bool previous = current && current->finalHelper;
     const bool previousShaderObserved = current && current->shaderArgumentObserved;
@@ -1580,6 +1605,17 @@ void __fastcall HookFullscreenHelper(void* renderer, uint32_t shader, uint8_t fl
 void __fastcall HookBindTextures(uint32_t first, uint32_t count, const uint32_t* handles, uint8_t stage)
 {
     const auto caller = uintptr_t(_ReturnAddress());
+    auto* fog = scope;
+    uint32_t fogDepth = 0;
+    bool fogAdmitted = false;
+    if (fog && !inMetadata && stage == 1 && first == 0 && count && fogDepthAuthenticated.load())
+    {
+        fog->depthBindObserved = false;
+        ++fog->depthBindCalls;
+        fogAdmitted = fog->depthBindCalls == 1 &&
+            FSRD::CyberpunkFogDepth::IsDepthBind(authenticatedImage.load(), caller, first, count, stage) &&
+            ReadExactMemory(uintptr_t(handles), &fogDepth, sizeof(fogDepth));
+    }
     auto* current = lightingScope;
     uint32_t selected = 0;
     bool admitted = false;
@@ -1600,6 +1636,13 @@ void __fastcall HookBindTextures(uint32_t first, uint32_t count, const uint32_t*
             ReadExactMemory(uintptr_t(handles) + 3 * sizeof(uint32_t), &selected, sizeof(selected));
     }
     originalBindTextures(first, count, handles, stage); // Exactly one untouched native call.
+    if (fogAdmitted && fog == scope)
+    {
+        uint32_t repeated = 0;
+        fog->depthBindObserved = ReadExactMemory(uintptr_t(handles), &repeated, sizeof(repeated)) &&
+            fogDepth == repeated && fogDepth && fogDepth <= 0x8000;
+        fog->depthHandle = fogDepth;
+    }
     if (rayBegun)
         Metadata([&] { CompleteRayBind(ray, 0, rayPending, handles); });
     if (admitted && current == lightingScope)
@@ -1632,22 +1675,31 @@ bool SameRayCopyScope(const RayCopyBundle& plan) noexcept
     try
     {
         const auto& expected = plan.input.dispatch;
-        if (!rayScope || rayScope->serial != expected.scope.serial || !active.load() ||
+        if (!rayScope || rayScope->serial != expected.scope.serial || plan.invalidated || !originalRayCleanup || !active.load() ||
             !captureEnabled.load() || !captureTrackingValid.load() || !rayBindingsAuthenticated.load() ||
             plan.input.image != authenticatedImage.load() || CurrentRayConstantScope() != expected.scope)
             return false;
-        uintptr_t object = 0;
+        uintptr_t object = 0, owner = 0;
+        uint32_t hitHandle = 0;
         uint8_t executing = 0;
         UINT width = 0, height = 0;
         if (!ReadEarlyAt(expected.scope.graphContext, 0, object) || object != plan.frameSourceObject ||
             !ReadEarlyAt(expected.scope.graphContext, 0x30, executing) || !(executing & 2) ||
             !ReadEarlyAt(expected.scope.view, 0x34, width) || width != plan.width ||
-            !ReadEarlyAt(expected.scope.view, 0x38, height) || height != plan.height)
+            !ReadEarlyAt(expected.scope.view, 0x38, height) || height != plan.height ||
+            !ReadEarlyAt(expected.scope.view, 0x1d70, owner) || owner != plan.rayOwner ||
+            !ReadEarlyAt(owner, 0x274, hitHandle) || hitHandle != expected.textures[2].handle)
             return false;
         for (size_t i = 0; i < rayScope->bindings.size(); ++i)
+        {
+            // The transparent pass replaces u0 and b6. Our two source handles
+            // remain in use until the authenticated common cleanup; u0 is not
+            // a source and its old descriptor must not be asserted current.
+            if (plan.cleanupEntered && i == 1) continue;
             if (!rayScope->bindings[i].valid || rayScope->bindings[i].scope != expected.scope ||
                 rayScope->bindings[i].handle != expected.textures[i].handle)
                 return false;
+        }
         {
             auto& data = Data();
             std::lock_guard lock(data.mutex);
@@ -1658,6 +1710,31 @@ bool SameRayCopyScope(const RayCopyBundle& plan) noexcept
                 return false;
         }
         struct Reader { bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); } } reader;
+        if (plan.cleanupEntered)
+        {
+            if (rayScope->pendingCopy.get() != &plan || !plan.originalReturned ||
+                !plan.completedDispatches || rayScope->nativeDispatchDepth)
+                return false;
+            // Only current registry source identities are compared here. The
+            // selected root layout and descriptors were allowed to change in
+            // original code between primary use and this pre-cleanup endpoint.
+            uintptr_t registry = 0;
+            if (!ReadEarlyAt(plan.input.image, FSRD::CyberpunkEngineAccess::RegistryRva, registry) ||
+                registry != expected.registry) return false;
+            for (unsigned repeat = 0; repeat < 2; ++repeat)
+                for (size_t i : { size_t(0), size_t(2) })
+                {
+                    const auto& source = expected.textures[i];
+                    FSRD::CyberpunkRayBindings::TextureBinding current;
+                    if (!FSRD::CyberpunkRayBindings::Detail::ReadTexture(reader, registry, source.handle, i == 2, current) ||
+                        current.slot != source.slot || current.native != source.native ||
+                        current.descriptor != source.descriptor || current.compact != source.compact ||
+                        current.requestedSrvState != source.requestedSrvState ||
+                        current.extra != source.extra || current.uavArray != source.uavArray)
+                        return false;
+                }
+            return true;
+        }
         const FSRD::CyberpunkRayBindings::TextureHandles handles {
             expected.textures[0].handle, expected.textures[1].handle, expected.textures[2].handle };
         const auto& receipt = rayScope->receipt;
@@ -1704,7 +1781,8 @@ struct RayCopyEngineHost
     {
         // A later lighting request may finish on another recording thread. That
         // must not disable mandatory restoration of this still-valid ray scope.
-        return &input == &plan.input && plan.originalReturned && plan.work && plan.sources[0] && plan.sources[1] &&
+        return &input == &plan.input && plan.cleanupEntered && plan.originalReturned &&
+            plan.work && plan.sources[0] && plan.sources[1] &&
             uintptr_t(plan.sources[0].Get()) == input.dispatch.textures[0].native &&
             uintptr_t(plan.sources[1].Get()) == input.dispatch.textures[2].native && SameRayCopyScope(plan);
     }
@@ -1740,7 +1818,8 @@ struct RayCopyEngineHost
 std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::Snapshot& snapshot,
                                            const D3D12_DISPATCH_RAYS_DESC& dispatch, unsigned ordinal)
 {
-    if (!lightingRequested.load() || lightingAttempted.load() || rayCopyAttempted.exchange(true)) return {};
+    if (!originalRayCleanup || !rayScope || rayScope->nativeDispatchDepth ||
+        !lightingRequested.load() || lightingAttempted.load() || rayCopyAttempted.exchange(true)) return {};
     auto plan = std::make_shared<RayCopyBundle>();
     plan->input.image = authenticatedImage.load(); plan->input.dispatch = snapshot; plan->dispatchOrdinal = ordinal;
     plan->provenance = { { "status", "preparing" }, { "original_scene_modified", false },
@@ -1748,7 +1827,7 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
         { "frame_source_cpu", snapshot.scope.frameSource }, { "native_list", snapshot.scope.list },
         { "recording_generation", snapshot.scope.recordingGeneration }, { "dispatch_ordinal", ordinal },
         { "native_dispatch_extent", { dispatch.Width, dispatch.Height, dispatch.Depth } },
-        { "stage", "immediately_after_this_original_DispatchRays" },
+        { "stage", "pending_common_ray_node_cleanup_entry_after_all_original_dispatches" },
         { "hit_units", "not_asserted" }, { "final_writer", "not_asserted" },
         { "gpu_completion", "requires_submission_fence" } };
     try
@@ -1757,6 +1836,7 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
         plan->listIdentity = ListIdentity(list);
         if (!plan->listIdentity || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT || dispatch.Depth != 1 ||
             !ReadEarlyAt(snapshot.scope.graphContext, 0, plan->frameSourceObject) || !plan->frameSourceObject ||
+            !ReadEarlyAt(snapshot.scope.view, 0x1d70, plan->rayOwner) || !plan->rayOwner ||
             !ReadEarlyAt(snapshot.scope.view, 0x34, plan->width) || !ReadEarlyAt(snapshot.scope.view, 0x38, plan->height) ||
             !plan->width || !plan->height || plan->width > 8192 || plan->height > 8192 ||
             !SameRayCopyScope(*plan))
@@ -1794,6 +1874,7 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
         plan->provenance["frame_source_object"] = plan->frameSourceObject;
         plan->provenance["extent"] = { plan->width, plan->height };
         plan->provenance["source_resources"] = { snapshot.textures[0].native, snapshot.textures[2].native };
+        plan->provenance["ray_owner"] = plan->rayOwner;
         return plan;
     }
     catch (const std::exception& error) { plan->provenance["reason"] = error.what(); }
@@ -1808,7 +1889,6 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
 void FinishRayCopy(const std::shared_ptr<RayCopyBundle>& plan)
 {
     if (!plan) return;
-    plan->originalReturned = true; // Only called after the one original native call returned.
     RayCopyEngineHost host { *plan };
     const auto result = FSRD::CyberpunkRayAccess::RecordCopy(host, plan->input, [&] {
         return plan->work->Record(reinterpret_cast<ID3D12GraphicsCommandList*>(plan->input.dispatch.scope.list));
@@ -1833,11 +1913,69 @@ void FinishRayCopy(const std::shared_ptr<RayCopyBundle>& plan)
     plan->provenance["engine_state_requests"] = result.requestsIssued;
     plan->provenance["hit_uav_restored"] = result.hitRestored;
     plan->provenance["private_output_states"] = { 0xc0, 0xc0 };
-    if (!plan->recorded) plan->provenance["reason"] = std::string(plan->work->Error());
+    if (!plan->recorded)
+        plan->provenance["reason"] = result.outcome == FSRD::CyberpunkRayAccess::Outcome::Refused
+            ? "native pre-cleanup scope/source/state admission refused" : plan->work->Error();
     auto& data = Data();
     std::lock_guard lock(data.mutex);
     data.rayCopyStatus = plan->provenance;
     if (plan->recorded) data.rayCopy = plan; // One-shot: no old owner is released under this lock.
+}
+
+void __fastcall HookRayCleanup(void* context, uint8_t flags)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = rayScope;
+    const auto plan = current ? current->pendingCopy : std::shared_ptr<RayCopyBundle> {};
+    if (plan)
+    {
+        const bool endpoint = !inMetadata && active.load() && captureEnabled.load() &&
+            rayBindingsAuthenticated.load() && plan->input.image == authenticatedImage.load() &&
+            caller == plan->input.image + FSRD::CyberpunkRayAccess::CleanupReturnRva &&
+            context == current->context && uintptr_t(context) == plan->input.dispatch.scope.graphContext &&
+            flags == 0 && !plan->cleanupConsumed && !plan->invalidated && plan->originalReturned &&
+            plan->completedDispatches && !current->nativeDispatchDepth;
+        plan->cleanupConsumed = true;
+        // Any earlier or unexpected cleanup ends this scoped admission, even if
+        // a later callback happens to reuse the same handles/native addresses.
+        if (!endpoint) plan->invalidated = true;
+        plan->cleanupEntered = endpoint;
+        Metadata([&] {
+            plan->provenance["cleanup_endpoint"] = {
+                { "caller_rva", caller >= plan->input.image ? caller - plan->input.image : 0 },
+                { "context", uintptr_t(context) }, { "flags", flags },
+                { "admitted_entry", endpoint }, { "completed_original_dispatches", plan->completedDispatches },
+                { "primary_dispatch_returned", plan->originalReturned },
+                { "before_original_unbind_and_graph_end_use", endpoint },
+                { "primary_b6_u0_layout_asserted_current", false },
+                { "later_node_writers", "not_asserted" } };
+            if (endpoint)
+            {
+                uintptr_t cache = 0, descriptor = 0, layout = 0;
+                const auto engine = plan->input.dispatch.scope.engine;
+                const bool bindingMetadata = ReadEarlyAt(engine, 0x60, cache) && cache &&
+                    ReadEarlyAt(engine, 0x90, descriptor) && descriptor && ReadEarlyAt(cache, 0x68, layout) && layout;
+                plan->provenance["cleanup_endpoint"]["current_engine_binding_metadata"] = {
+                    { "readable", bindingMetadata }, { "cache", cache }, { "b6_cpu_descriptor_slot", descriptor },
+                    { "layout", layout }, { "actual_root_table_correspondence_asserted", false } };
+                plan->provenance["stage"] = "common_ray_node_cleanup_entry_after_all_original_dispatches";
+                FinishRayCopy(plan); // No original unbind/end-use has run yet.
+            }
+            else
+            {
+                plan->provenance["status"] = "refused_before_state_requests";
+                plan->provenance["reason"] = "common ray cleanup caller/context/order or scoped source lifetime refused";
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                data.rayCopyStatus = plan->provenance;
+            }
+        });
+        plan->cleanupEntered = false;
+    }
+    if (earlyFatalRecording.load())
+        return; // Fatal post-mutation scope loss must not resume original unbinding.
+    originalRayCleanup(context, flags); // Exactly once, only after mandatory hit restoration.
+    if (current && current->pendingCopy == plan) current->pendingCopy.reset();
 }
 
 Json DescribeRayBinding(const FSRD::CyberpunkRayBindings::Binding& binding)
@@ -1956,8 +2094,26 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
             data.rayDispatches.push_back(std::move(observation));
         });
     }
+    if (rayCopy && current && rayScope == current) current->pendingCopy = rayCopy;
+    const auto pending = current ? current->pendingCopy : std::shared_ptr<RayCopyBundle> {};
+    if (pending)
+    {
+        if (current->nativeDispatchDepth || caller != pending->input.image + FSRD::CyberpunkRayBindings::DispatchReturnRva ||
+            uintptr_t(list) != pending->input.dispatch.list4 || pending->completedDispatches >= MaxRayDispatches)
+            pending->invalidated = true;
+        ++current->nativeDispatchDepth;
+    }
     originalDispatchRays(list, description); // Exactly one original call, including all refusals/exceptions.
-    if (rayCopy) Metadata([&] { FinishRayCopy(rayCopy); });
+    if (pending)
+    {
+        --current->nativeDispatchDepth;
+        if (rayScope != current || current->pendingCopy != pending) pending->invalidated = true;
+        if (!pending->invalidated)
+        {
+            ++pending->completedDispatches;
+            if (pending == rayCopy) pending->originalReturned = true;
+        }
+    }
 }
 
 void WINAPI HookSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
@@ -2121,6 +2277,14 @@ struct CapturePlan
     ListState drawState;
     std::shared_ptr<FSRD::CyberpunkGuidePass::Work> earlyWork;
     bool fatalEarlyRecording = false;
+    Json depthMetadata;
+    FSRD::CyberpunkFogDepth::Snapshot depthSnapshot;
+    FSRD::CyberpunkGuidePass::SourceView depthSource;
+    ComPtr<ID3D12Resource> depthOutput;
+    uintptr_t depthFrameObject = 0;
+    uint32_t depthFrame = 0;
+    bool depthPrepared = false;
+    UINT64 retainedTextureBytes = 0;
 };
 
 bool SameEarlyReservation(const Json& earlier, const Json& current, size_t index)
@@ -3230,6 +3394,14 @@ void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_pt
     const bool recorded = FSRDFogLayerCapture::RecordEarlyGuides(plan->device.Get(), list, outputs, plan->provenance.dump(), plan,
         plan->exposureWork ? &exposure : nullptr, plan->lightingT8Prepared ? &lightingT8 : nullptr,
         pairedRayCopies ? &rayCopies : nullptr);
+    if (recorded && pairedRayCopies)
+    {
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        data.lightingCaptureSource = { { "scope", plan->serial }, { "metadata", plan->metadata },
+            { "native_list", plan->list }, { "recording_generation", plan->drawState.generation },
+            { "GPU_completion", "independent lighting capture fence still required" } };
+    }
     LOG_INFO("[FSRRR lighting guides] original draw preserved; private guide readback recorded={} scope={}", recorded, plan->serial);
 }
 
@@ -3315,8 +3487,262 @@ void CopyMain(ID3D12GraphicsCommandList* list, const CapturePlan& plan, ID3D12Re
     list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
 }
 
+bool SameFogDepthSource(const CapturePlan& plan) noexcept
+{
+    try
+    {
+        const auto& d = plan.depthSnapshot;
+        uintptr_t view = 0, object = 0, native = 0, descriptor = 0, bound = 0;
+        uintptr_t tls = 0, engine = 0, list = 0, cache = 0, layout = 0, descriptors = 0, pso = 0;
+        uint8_t initialized = 0, flags = 0;
+        uint32_t frame = 0;
+        int32_t refs = 0;
+        std::array<uint8_t, 12> compact {};
+        if (!scope || !scope->fogHelper || !scope->depthBindObserved || scope->depthBindCalls != 1 ||
+            scope->depthHandle != d.handle || scope->serial != d.scope.serial ||
+            uintptr_t(scope->context) != d.scope.graphContext || scope->hasDsv || scope->rtvCount != 1 ||
+            uintptr_t(scope->psoList) != d.scope.list || uintptr_t(scope->pso) != d.scope.pso ||
+            !captureTrackingValid.load() || !earlyHeapTrackingValid.load() ||
+            !plan.depthSource.resource || !plan.depthSource.heap ||
+            uintptr_t(plan.depthSource.resource.Get()) != d.native || d.native == uintptr_t(plan.main.Get()) ||
+            !ReadEarlyAt(d.scope.graphContext, 0x18, view) || view != d.scope.view ||
+            !ReadEarlyAt(d.scope.graphContext, 0x30, flags) || !(flags & 2) ||
+            !ReadEarly(uintptr_t(__readgsqword(0x58)), tls) || tls != d.scope.tls ||
+            !ReadEarlyAt(tls, 0x14, initialized) || !initialized ||
+            !ReadEarlyAt(tls, 0x188, engine) || engine != d.scope.engine ||
+            !ReadEarlyAt(engine, 0x30, list) || list != d.scope.list ||
+            !ReadEarlyAt(engine, 0x3d0, pso) || pso != d.scope.pso ||
+            !ReadEarlyAt(engine, 0x60, cache) || cache != d.cache ||
+            !ReadEarlyAt(cache, 0x68, layout) || layout != d.layout ||
+            !ReadEarlyAt(cache, 0x28, descriptors) || descriptors != d.descriptorArray ||
+            !ReadEarlyAt(d.scope.graphContext, 0, object) || object != plan.depthFrameObject ||
+            !ReadEarlyAt(object, 0x1b0, frame) || frame != plan.depthFrame ||
+            !ReadEarly(d.slot - 8, refs) || refs <= 0 || !ReadEarly(d.slot, native) || native != d.native ||
+            !ReadEarlyAt(d.slot, 0x30, descriptor) || descriptor != d.descriptor ||
+            !ReadEarlyAt(d.slot, 0x4e, compact) || compact != d.compact ||
+            !ReadEarlyAt(d.descriptorArray, uintptr_t(d.descriptorIndex) * 8, bound) || bound != d.descriptor)
+            return false;
+        // Private native copies do not replace descriptors. Reentry may dirty
+        // ranges, so clean-cache bits are only checked by initial Observe().
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        const auto found = data.lists.find(plan.endpoint->list.Get());
+        return found != data.lists.end() && found->second.known &&
+            found->second.generation == d.scope.recordingGeneration && !found->second.predicated &&
+            !found->second.renderPass && !found->second.queryCount;
+    }
+    catch (...) { return false; }
+}
+
+struct FogDepthEngineHost
+{
+    const CapturePlan& plan;
+    bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); }
+    uint32_t ThreadId() noexcept { return GetCurrentThreadId(); }
+    bool ReadTlsSlotZero(uintptr_t& result) noexcept
+    { return ReadEarly(uintptr_t(__readgsqword(0x58)), result) && result; }
+    bool ExactImageAuthenticated(uintptr_t image, uintptr_t size, uint32_t stamp, std::string_view sha) noexcept
+    {
+        return active.load() && captureEnabled.load() && fogDepthAuthenticated.load() &&
+            image == authenticatedImage.load() && image == uintptr_t(GetModuleHandleW(nullptr)) &&
+            size == 0x04efc000 && stamp == 0x68af45ea && sha == ExeSha256;
+    }
+    bool LiveCodeMatches(uintptr_t image, const FSRD::CyberpunkEngineAccess::CodeRange& code) noexcept
+    { return MatchLiveCode(image, code); }
+    bool IsAdmittedFogDenoiseScope(const FSRD::CyberpunkFogDenoiseAccess::Input& input) noexcept
+    {
+        return input.list == plan.depthSnapshot.scope.list && input.originalPso == plan.depthSnapshot.scope.pso &&
+            input.originalFogScope == plan.depthSnapshot.scope.serial && input.depth.handle == plan.depthSnapshot.handle &&
+            input.depth.native == plan.depthSnapshot.native && SameFogDepthSource(plan);
+    }
+    bool IsTextureResidencyAdmitted(uintptr_t registry, const FSRD::CyberpunkEngineAccess::TextureBorrow& input) noexcept
+    {
+        const auto& d = plan.depthSnapshot;
+        if (registry != d.registry || input.handle != d.handle || input.native != d.native || !SameFogDepthSource(plan)) return false;
+        for (const auto& code : FSRD::CyberpunkLightingSource::Code)
+            if (!MatchLiveCode(authenticatedImage.load(), { code.rva, code.bytes, code.sha256 })) return false;
+        FSRD::CyberpunkLightingSource::Snapshot source;
+        source.slot = d.slot; source.native = d.native; source.externalSync = d.residencyUnderlying;
+        FSRD::CyberpunkLightingSource::ResidencySnapshot observed;
+        return FSRD::CyberpunkLightingSource::ObserveRegisteredResidency(*this, d.scope.engine, source, observed);
+    }
+    bool ListIsDirect(uintptr_t list) noexcept
+    { return reinterpret_cast<ID3D12GraphicsCommandList*>(list)->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT; }
+    uintptr_t CurrentNativeList(uintptr_t p) noexcept { return uintptr_t(reinterpret_cast<void*(__fastcall*)()>(p)()); }
+    void RequestState(uintptr_t p, uintptr_t engine, uint32_t handle, uint32_t state, uint32_t sub) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t)>(p)(reinterpret_cast<void*>(engine), handle, state, sub); }
+    void Flush(uintptr_t p, uintptr_t engine) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*)>(p)(reinterpret_cast<void*>(engine)); }
+    void Reenter(uintptr_t p, uintptr_t list) noexcept
+    { reinterpret_cast<void(__fastcall*)(ID3D12GraphicsCommandList*)>(p)(reinterpret_cast<ID3D12GraphicsCommandList*>(list)); }
+    void RestorePso(uintptr_t list, uintptr_t pso) noexcept
+    { originalSetPso(reinterpret_cast<ID3D12GraphicsCommandList*>(list), reinterpret_cast<ID3D12PipelineState*>(pso)); }
+};
+
+void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
+{
+    auto& evidence = plan.provenance["hardware_depth"];
+    evidence = { { "schema", "optiscaler.fsr_rr.fog_hardware_depth.v1" }, { "status", "refused" },
+        { "pixel_transform", "none; native R32_FLOAT copy" }, { "original_scene_modified", false } };
+    try
+    {
+        if (!fogDepthAuthenticated.load() || !scope || !scope->fogHelper || !scope->depthBindObserved ||
+            scope->depthBindCalls != 1) throw std::runtime_error("exact Fog helper/t0 binder unavailable");
+        if (earlyRequested.load()) throw std::runtime_error("legacy initializer capture and independent Fog depth capture are mutually exclusive");
+        plan.depthMetadata = Json::parse(FSRDCyberpunkEarlyGuides::Describe(scope->context, authenticatedImage.load()));
+        plan.provenance["current_inputs"] = plan.depthMetadata;
+        plan.depthFrame = EarlyFrameSource(plan.depthMetadata);
+        if (!ReadEarlyAt(uintptr_t(scope->context), 0, plan.depthFrameObject) || !plan.depthFrameObject)
+            throw std::runtime_error("current Fog frame source object unavailable");
+        if (plan.depthFrameObject != plan.depthMetadata.at("camera_provenance").at("frame_id_virtual_route").at("object_address").get<uintptr_t>())
+            throw std::runtime_error("Fog frame object changed since metadata observation");
+        const auto& selected = plan.depthMetadata.at("inputs").at(5);
+        const auto& interval = selected.at("logical_interval");
+        if (selected.at("base_key").get<uint32_t>() != FSRD::CyberpunkFogDepth::GraphKey ||
+            selected.at("status") != "handle_present" || selected.at("handle").get<uint32_t>() != scope->depthHandle ||
+            interval.at("status") != "compiler_interval_observed" || !interval.at("repeated_metadata_equal").get<bool>() ||
+            !interval.at("inclusive_contains_position").get<bool>() || interval.at("end_event_relation") != "before" ||
+            interval.at("graph_phase").get<unsigned>() != 2 || interval.at("record_used_flag").get<unsigned>() != 1 ||
+            interval.at("record_handle") != selected.at("handle") ||
+            interval.at("holder_first_use").get<uint64_t>() > interval.at("current_position").get<uint64_t>() ||
+            interval.at("current_position").get<uint64_t>() >= interval.at("holder_end_event_position").get<uint64_t>() ||
+            interval.at("holder_end_event_position").get<uint64_t>() > interval.at("holder_reservation_end").get<uint64_t>())
+            throw std::runtime_error("current original Fog depth graph reservation refused");
+        FSRD::CyberpunkFogDepth::Scope current;
+        current.serial = scope->serial; current.recordingGeneration = plan.drawState.generation;
+        current.graphContext = uintptr_t(scope->context); current.view = plan.depthMetadata.at("view").get<uintptr_t>();
+        current.list = uintptr_t(scope->psoList); current.pso = uintptr_t(scope->pso);
+        if (!ReadEarly(uintptr_t(__readgsqword(0x58)), current.tls) || !ReadEarlyAt(current.tls, 0x188, current.engine))
+            throw std::runtime_error("current Fog TLS unavailable");
+        ExposureMemory memory;
+        FSRD::CyberpunkFogDepth::Failure failure;
+        if (!FSRD::CyberpunkFogDepth::Observe(memory, authenticatedImage.load(), caller, current, scope->depthHandle,
+                                             plan.depthSnapshot, &failure))
+            throw std::runtime_error(std::string(FSRD::CyberpunkFogDepth::FailureName(failure)));
+        const auto& d = plan.depthSnapshot;
+        if (d.native != selected.at("texture_registry").at("borrowed_native_address").get<uintptr_t>() ||
+            d.native == uintptr_t(plan.main.Get())) throw std::runtime_error("Fog depth resource/scene alias refused");
+        // The original Fog draw currently consumes this exact ordinary t0 view.
+        // Acquire ownership here, not from a prior frame's surviving descriptor.
+        plan.depthSource.resource = reinterpret_cast<ID3D12Resource*>(d.native);
+        plan.depthSource.descriptor.ptr = d.descriptor;
+        ComPtr<IUnknown> sourceId, mainId;
+        if (FAILED(plan.depthSource.resource.As(&sourceId)) || FAILED(plan.main.As(&mainId)) || sourceId.Get() == mainId.Get())
+            throw std::runtime_error("canonical Fog depth/scene identity refused");
+        const auto desc = plan.depthSource.resource->GetDesc();
+        evidence["native_description"] = { { "format", UINT(desc.Format) }, { "flags", UINT(desc.Flags) },
+            { "width", desc.Width }, { "height", desc.Height }, { "mips", desc.MipLevels },
+            { "array", desc.DepthOrArraySize }, { "samples", desc.SampleDesc.Count } };
+        const auto color = plan.main->GetDesc();
+        const auto dimensions = plan.depthMetadata.at("view_dimensions").get<std::array<uint32_t, 2>>();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Format != DXGI_FORMAT_R32_FLOAT ||
+            desc.Width != color.Width || desc.Height != color.Height || desc.Width != dimensions[0] ||
+            desc.Height != dimensions[1] || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+            desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality ||
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+            throw std::runtime_error("native Fog depth is not the admitted scalar single-plane copy format");
+        ComPtr<ID3D12Device> device;
+        ComPtr<IUnknown> sourceDeviceId, targetDeviceId;
+        if (FAILED(plan.depthSource.resource->GetDevice(IID_PPV_ARGS(&device))) ||
+            FAILED(device.As(&sourceDeviceId)) || FAILED(plan.device.As(&targetDeviceId)) ||
+            sourceDeviceId.Get() != targetDeviceId.Get())
+            throw std::runtime_error("Fog depth device mismatch");
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            for (const auto& heap : data.cpuSrvHeaps)
+                if (d.descriptor >= heap.start && (d.descriptor - heap.start) % heap.increment == 0 &&
+                    (d.descriptor - heap.start) / heap.increment < heap.count)
+                {
+                    if (plan.depthSource.heap) throw std::runtime_error("ambiguous current depth CPU heap");
+                    plan.depthSource.heap = heap.heap;
+                }
+        }
+        if (!plan.depthSource.heap) throw std::runtime_error("current depth CPU heap not retained");
+        const auto repeated = Json::parse(FSRDCyberpunkEarlyGuides::Describe(scope->context, authenticatedImage.load()));
+        if (repeated.at("inputs").at(5) != selected || repeated.at("camera_provenance") != plan.depthMetadata.at("camera_provenance") ||
+            repeated.at("view") != plan.depthMetadata.at("view") || !SameFogDepthSource(plan))
+            throw std::runtime_error("current Fog graph/camera/depth changed during preparation");
+        auto output = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_FLOAT, desc.Width, desc.Height, 1, 1);
+        const auto sourceBytes = plan.device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        const auto outputBytes = plan.device->GetResourceAllocationInfo(0, 1, &output).SizeInBytes;
+        if (!sourceBytes || !outputBytes || sourceBytes > MaxCaptureTextureBytes || outputBytes > MaxCaptureTextureBytes ||
+            plan.retainedTextureBytes > MaxCaptureTextureBytes - sourceBytes ||
+            outputBytes > MaxCaptureTextureBytes - plan.retainedTextureBytes - sourceBytes)
+            throw std::runtime_error("Fog depth shared retained-allocation budget exceeded");
+        CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
+        if (FAILED(plan.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &output,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&plan.depthOutput))))
+            throw std::runtime_error("private Fog depth allocation failed");
+        plan.depthPrepared = true;
+        plan.retainedTextureBytes += sourceBytes + outputBytes;
+        evidence["status"] = "prepared_at_original_use";
+        evidence["source"] = { { "handle", d.handle }, { "native", d.native }, { "descriptor", d.descriptor },
+            { "pixel_register", 0 }, { "scope", current.serial }, { "list", current.list },
+            { "recording_generation", current.recordingGeneration }, { "view", current.view },
+            { "frame_source_object", plan.depthFrameObject }, { "frame_source_cpu", plan.depthFrame } };
+    }
+    catch (const std::exception& error)
+    {
+        // Preparation has issued no depth commands. Do not retain rejected
+        // sources (especially budget refusals) in the later Fog submission.
+        plan.depthPrepared = false;
+        plan.depthSource = {};
+        plan.depthOutput.Reset();
+        evidence["reason"] = error.what();
+    }
+}
+
+void RecordFogDepth(ID3D12GraphicsCommandList* list, CapturePlan& plan)
+{
+    if (!plan.depthPrepared) return;
+    FogDepthEngineHost host { plan };
+    FSRD::CyberpunkFogDenoiseAccess::Input input;
+    input.image = authenticatedImage.load(); input.list = uintptr_t(list);
+    input.originalPso = uintptr_t(plan.originalPso.Get()); input.originalFogScope = plan.depthSnapshot.scope.serial;
+    input.depth = { plan.depthSnapshot.handle, plan.depthSnapshot.native }; input.copySource = true;
+    const auto result = FSRD::CyberpunkFogDenoiseAccess::RecordPrivateCompute(host, input, [&] {
+        const CD3DX12_TEXTURE_COPY_LOCATION source(plan.depthSource.resource.Get(), 0);
+        const CD3DX12_TEXTURE_COPY_LOCATION target(plan.depthOutput.Get(), 0);
+        list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        Transition(list, plan.depthOutput.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        return true;
+    });
+    if (result.outcome == FSRD::CyberpunkFogDenoiseAccess::Outcome::ScopeLostAfterMutation)
+    {
+        earlyFatalRecording.store(true);
+        plan.fatalEarlyRecording = true;
+        if (active.load() && captureEnabled.load() && input.image == authenticatedImage.load() &&
+            input.image == uintptr_t(GetModuleHandleW(nullptr)))
+        {
+            TerminateProcess(GetCurrentProcess(), 0xf51d0001u);
+            RaiseFailFastException(nullptr, nullptr, 0);
+        }
+        return;
+    }
+    auto& evidence = plan.provenance["hardware_depth"];
+    evidence["state_requests"] = result.requestsIssued;
+    evidence["bindings_restored"] = result.bindingsRestored;
+    if (result.outcome == FSRD::CyberpunkFogDenoiseAccess::Outcome::PrivateRecordedRestored)
+    {
+        plan.layers.hardwareDepth.resource = plan.depthOutput;
+        plan.layers.hardwareDepth.viewFormat = DXGI_FORMAT_R32_FLOAT;
+        plan.layers.hardwareDepth.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        evidence["status"] = "private_copy_recorded";
+        evidence["recording_position"] = "immediately_before_original_Fog_draw_on_its_own_list";
+    }
+    else
+    {
+        evidence["status"] = "native_access_refused";
+        // No successful callback means no copied depth pixels. Keep any recorded
+        // resource references retained by the caller; do not publish a companion.
+        plan.depthPrepared = false;
+    }
+}
+
 std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UINT count, UINT instances,
-                                           UINT start, UINT firstInstance)
+                                           UINT start, UINT firstInstance, uintptr_t nativeCaller)
 {
     if (!captureEnabled.load() || !captureTrackingValid.load() || captureStarted.load() ||
         !FSRDFogLayerCapture::WantsCapture() || !scope)
@@ -3437,6 +3863,22 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         return {};
     }
     Json earlyAvailability;
+    if (lightingRequested.load())
+    {
+        Json source;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            source = data.lightingCaptureSource;
+        }
+        if (source.is_null() && GetTickCount64() - lightingRequestedAt.load() < 10000)
+            return {}; // Wait for recording receipt, never wait for GPU completion here.
+        if (!source.is_null())
+        {
+            source["pairing_authority"] = "candidate metadata only; current frame/camera match not asserted";
+            plan->provenance["lighting_recording_candidate"] = std::move(source);
+        }
+    }
     if (earlyRequested.load())
     {
         earlyAvailability = Json::parse(FSRDCyberpunkEarlyGuides::Describe(s.context, authenticatedImage.load()));
@@ -3532,11 +3974,21 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     plan->provenance["restoration"] = { { "frozen_rtv_handle", plan->frozenOriginalRtv.ptr },
         { "binding", "exact owned original resource/view; original CPU descriptor may have been reused" } };
     PrepareBoundCb12Target(*plan, MaxCaptureTextureBytes - (mainBytes + 2 * copyBytes + authoredBytes));
+    plan->retainedTextureBytes = mainBytes + 2 * copyBytes + authoredBytes;
+    if (plan->layers.boundCb12.resource)
+    {
+        const auto cbDesc = plan->layers.boundCb12.resource->GetDesc();
+        plan->retainedTextureBytes += plan->device->GetResourceAllocationInfo(0, 1, &cbDesc).SizeInBytes;
+    }
+    PrepareFogDepth(*plan, nativeCaller);
 
     // Retain BEFORE the first private-copy command. This independent ticket keeps
     // earlier work alive even if the later readback helper refuses or throws.
-    FSRDSubmission::Retain(plan->device.Get(), list, plan);
+    if (!FSRDSubmission::Retain(plan->device.Get(), list, plan))
+        throw std::runtime_error("Fog capture lifetime retention unavailable");
     CopyMain(list, *plan, plan->layers.before.resource.Get());
+    RecordFogDepth(list, *plan); // Independent private snapshot on Fog's own list, no guide reads.
+    if (plan->fatalEarlyRecording) return plan;
     PrepareAndRecordEarlyGuides(list, *plan); // Optional private outputs; never writes the original scene.
     return plan;
 }
@@ -3678,7 +4130,7 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
     std::shared_ptr<CapturePlan> plan;
     if (captureEnabled.load() && !inMetadata && scope)
         Metadata([&] {
-            try { plan = PrepareCapture(list, count, instances, start, firstInstance); }
+            try { plan = PrepareCapture(list, count, instances, start, firstInstance, nativeCaller); }
             catch (const std::exception& error)
             {
                 captureStarted.store(true);
@@ -4264,6 +4716,11 @@ void Initialize(bool enabled)
             const auto image = entry - FogNodeRva;
             authenticatedImage.store(image);
             const bool captures = Config::Instance()->FfxDenoiserCyberpunkFogCapture.value_or_default();
+            // These bodies include the Fog node and texture binder: authenticate
+            // all of them before this initialization transaction patches either.
+            if (captures && std::all_of(std::begin(FSRD::CyberpunkFogDepth::Code), std::end(FSRD::CyberpunkFogDepth::Code),
+                [&](const auto& code) { return MatchLiveCode(image, code); }))
+                fogDepthAuthenticated.store(true);
             if (captures && std::all_of(std::begin(ProducerCode), std::end(ProducerCode),
                                        [&](const auto& code) { return MatchLiveCode(image, code); }))
                 originalGBufferInitializer = reinterpret_cast<GBufferInitializer>(image + GBufferInitializerRva);
@@ -4290,6 +4747,8 @@ void Initialize(bool enabled)
                 {
                     originalBindUavs = reinterpret_cast<BindUavs>(image + 0x153f94);
                     rayBindingsAuthenticated.store(true);
+                    if (MatchLiveCode(image, FSRD::CyberpunkRayAccess::CleanupCode))
+                        originalRayCleanup = reinterpret_cast<RayCleanup>(image + FSRD::CyberpunkRayAccess::CleanupCode.rva);
                 }
             }
             originalFogNode = reinterpret_cast<FogNode>(entry);
@@ -4315,6 +4774,8 @@ void Initialize(bool enabled)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalRayNode), HookRayNode);
                 if (error == NO_ERROR && originalUploadRayConstants)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalUploadRayConstants), HookUploadRayConstants);
+                if (error == NO_ERROR && originalRayCleanup)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalRayCleanup), HookRayCleanup);
                 if (error == NO_ERROR)
                     error = DetourTransactionCommit();
                 else
@@ -4329,9 +4790,11 @@ void Initialize(bool enabled)
                 originalBindTextures = nullptr;
                 originalBindUavs = nullptr;
                 rayBindingsAuthenticated.store(false);
+                fogDepthAuthenticated.store(false);
                 originalUploadLightingConstants = nullptr;
                 originalRayNode = nullptr;
                 originalUploadRayConstants = nullptr;
+                originalRayCleanup = nullptr;
                 authenticatedImage.store(0);
                 LOG_WARN("[FSRRR fog probe] engine hook failed: {}", error);
                 return;

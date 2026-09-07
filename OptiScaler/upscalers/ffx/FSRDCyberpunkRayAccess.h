@@ -20,6 +20,11 @@ inline constexpr std::array<Engine::CodeRange, 4> Code {
 static_assert(Code[0].rva == 0x1f40dc && Code[1].rva == 0x1f41f8 &&
               Code[2].rva == 0x1f483c && Code[3].rva == 0x1f7164);
 inline constexpr uint32_t CopySource = 0x800, HitUav = 8;
+// Authenticated before the host detours this common pre-end-use cleanup. The
+// state protocol itself never invokes it or hashes an already patched body.
+inline constexpr Engine::CodeRange CleanupCode { 0x1ec70c, 0xe0,
+    "89213d76d38db9e9c56a47ef968f902f11d6a7125690bf709b952e7d7a3e0440" };
+inline constexpr uintptr_t CleanupReturnRva = 0xc6bd0c;
 
 struct Input
 {
@@ -46,6 +51,7 @@ namespace Detail
 struct Saved
 {
     uint32_t thread = 0, kind = 0;
+    uintptr_t cache = 0, descriptor = 0;
 };
 
 inline Engine::TextureBorrow Borrow(const Bindings::TextureBinding& source)
@@ -78,7 +84,7 @@ template<class Host> bool SameScope(Host& host, const Input& input, const Saved&
         return host.ThreadId() == saved.thread && host.IsAdmittedPostRayScope(input) &&
             host.ReadTlsSlotZero(tls) && tls == scope.tls &&
             CyberpunkRayConstants::Detail::Current(host, scope, cache, descriptor) &&
-            cache == dispatch.cache && descriptor == dispatch.b6.descriptor &&
+            cache == saved.cache && descriptor == saved.descriptor &&
             Engine::Detail::Read(host, scope.engine, 0x40, list4) && list4 == dispatch.list4 &&
             Engine::Detail::Read(host, scope.engine, 0x68, kind) && kind == saved.kind &&
             Engine::Detail::Read(host, input.image, Engine::RegistryRva, registry) && registry == dispatch.registry &&
@@ -109,6 +115,7 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
             if (!host.LiveCodeMatches(input.image, code)) return false;
         saved.thread = host.ThreadId();
         if (!saved.thread || !Engine::Detail::Read(host, dispatch.scope.engine, 0x68, saved.kind) ||
+            !CyberpunkRayConstants::Detail::Current(host, dispatch.scope, saved.cache, saved.descriptor) ||
             !SameScope(host, input, saved) || !host.ListIsDirect(dispatch.scope.list))
             return false;
         return SameScope(host, input, saved);
@@ -120,13 +127,18 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
 // Host contract, deliberately not installed here:
 // - ExactImageAuthenticated and LiveCodeMatches supply full installed-image and
 //   exact live body evidence. Read is bounded RPM, never unchecked pointer access.
-// - IsAdmittedPostRayScope proves the original selected DispatchRays has returned
-//   exactly once and this synchronous thread is still in that exact original ray
-//   invocation, same graph/view/frame-source/List/List4/Reset generation. It also
-//   revalidates original bind receipts/current descriptor use and actual owning
-//   resource borrows, supported native formats/extent, no aliases, no predication,
+// - IsAdmittedPostRayScope proves the accepted primary DispatchRays has returned
+//   exactly once and this thread is at the authenticated common cleanup ENTRY,
+//   before original unbinding/end-use, after all this node's ray dispatches.
+//   The original-use borrows have remained owned in that same non-nested ray
+//   invocation, same graph/view/frame-source/List/List4/Reset generation. It
+//   revalidates original t4/u8 source receipts/handles and owning resource borrows,
+//   supported native formats/extent, no aliases, no predication,
 //   query, render-pass/bundle ambiguity, and retained recording owners. A sampled
 //   native pointer, positive refcount, or CPU b6 receipt alone cannot satisfy it.
+//   The optional transparent pass intentionally replaces b6/u0/root layout;
+//   those old binding values MUST NOT be claimed current. Cache/b6 identity is
+//   sampled anew at this endpoint and checked only through our critical section.
 // - ReadTlsSlotZero is bounded; no engine getter is invoked here.
 // - Optional IsTextureResidencyAdmitted(registry, TextureBorrow) is reused by
 //   EngineAccess::ReadTexture for nonzero slot+68. It must authenticate the native
@@ -142,8 +154,8 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
 // - This function does not forward the original dispatch or resume game code.
 //   The host MUST examine ScopeLostAfterMutation and latch an unusable recording;
 //   it is not permission to continue without verified hit restoration.
-// A primary-dispatch copy is not automatically the final authored hit version;
-// shader/encoding/later-writer proof is separate from safe raw copying.
+// This snapshots the node's completed recording prefix, not GPU completion or
+// absence of later-node writers. Shader/encoding proof remains separate.
 template<class Host, class PrivateCopy>
 Result RecordCopy(Host& host, const Input& input, PrivateCopy&& privateCopy) noexcept
 {

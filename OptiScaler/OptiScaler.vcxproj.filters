@@ -854,6 +854,12 @@
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayAccess.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogDepth.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkFogDenoiseAccess.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingConstants.h">
       <Filter>Header Files</Filter>
     </ClInclude>

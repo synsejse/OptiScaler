@@ -19,7 +19,10 @@ class RayConstants(unittest.TestCase):
         self.assertEqual(node.count("originalRayNode(node, context);"), 1)
         self.assertIn("Invalidate(parent->receipt)", node)
         self.assertIn("~Restore() { rayScope = previous; }", node)
-        self.assertNotIn("Metadata(", node)
+        # Optional missing-copy-endpoint diagnostics are after the original,
+        # never a wrapper that could swallow or replay the game callback.
+        self.assertLess(node.index("originalRayNode(node, context);"), node.index("Metadata("))
+        self.assertNotIn("catch", node)
         upload = text.split("void __fastcall HookUploadRayConstants(", 1)[1].split(
             "FSRD::CyberpunkLightingConstants::Scope CurrentLightingConstantScope()", 1)[0]
         self.assertEqual(upload.count("originalUploadRayConstants(bytes, source);"), 1)

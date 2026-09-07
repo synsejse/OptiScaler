@@ -30,6 +30,10 @@ struct Layers
     // diffuse RGBA8_UNORM, specular RGBA8_UNORM, normal/roughness RGBA16F.
     // Caller must establish their early dispatch/input provenance independently.
     std::array<Texture, 3> earlyGuides;
+    // Optional private raw hardware-depth snapshot from this original Fog scope.
+    // Exact typed R32_FLOAT, mip0/slice0, single-mip/array/sample, scene extent,
+    // state0xc0. This is not a linearized distance or the material stencil plane.
+    Texture hardwareDepth;
 };
 
 struct Status
@@ -43,19 +47,21 @@ struct Status
     std::string kind; // "fog_layers" or "early_guides" when a request has been admitted.
 };
 
-// Initially one recorded attempt per process, including failed attempts. A queued
-// request may be cancelled and requested again, but recorded work cannot be cancelled.
+// One recorded attempt of EACH kind per process, including failed attempts. A
+// queued request may be cancelled/requeued; recorded work cannot be cancelled or
+// retried. Each batch keeps the 256 MiB readback cap (512 MiB for both fixed slots).
+// The slots do not establish a pair/frame relation; caller provenance must do that.
 bool Request();
 void CancelRequest();
 bool WantsCapture();
-Status GetStatus();
+Status GetStatus(); // Fog only, never the latest/other kind's status.
 
-// Independent request KIND, sharing the same bounded one-attempt registry/worker.
-// A fog request cannot consume/cancel a guide request, or vice versa. Only one
-// recorded kind is allowed per process; no second 256 MiB batch is introduced.
+// Independent early-guide slot. Both kinds may be queued/recorded/completed in
+// either order; neither consumes, cancels, retries or retires the other's work.
 bool RequestEarlyGuides();
 void CancelEarlyGuideRequest();
 bool WantsEarlyGuideCapture();
+Status GetEarlyGuideStatus();
 
 // Standalone native guide readback; no fog draw or scene snapshots are required.
 // guides = u0 diffuse RGBA8_UNORM, u1 specular RGBA8_UNORM, u2 normal/roughness
@@ -69,7 +75,7 @@ bool WantsEarlyGuideCapture();
 // earlier dispatch references must already be retained even if this call refuses.
 // Copies are retained before recording on this exact list. Callback return is NOT
 // submission/completion: the existing actual-list queue observer/fence and worker
-// still determine GetStatus().complete. A false return can mean refused setup;
+// still determine GetEarlyGuideStatus().complete. A false return can mean refused setup;
 // true only means copies recorded (worker startup/disk failure is separate status).
 // Optional exposureWords is a fourth distinct private immutable 2x1 RGBA32_UINT
 // mip0/slice0, single-mip/array/sample texture in the same 0xc0 state. Row-major
@@ -139,6 +145,15 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 // matching scene dimensions and the exact typed formats above. None may alias
 // another layer/companion. Stored as separate native companions under the same
 // completion fence; their pixels are not substituted into any scene layer.
+// Optional hardwareDepth is a distinct PRIVATE typed R32_FLOAT snapshot from the
+// current Fog depth plane, matching scene extent, mip0/slice0, one mip/array/sample,
+// in exact state0xc0. It must not alias any layer/companion, including through a
+// different COM interface. keepAlive is required when supplied and must retain
+// its producer's recording owners; earlier references must already be retained.
+// Stored as hardware_depth.r32f with unchanged native R float32 bits. The caller
+// proves original graph/plane/binding, snapshot order and hardware-depth encoding;
+// no linearization, camera reconstruction, depth convention or same-frame relation
+// to a SEPARATE capture is inferred here. Shares the existing budget/fence/worker.
 // provenanceJson must be a JSON object; it is saved as caller-supplied evidence,
 // not treated as proof that the above draw constraints were satisfied.
 //

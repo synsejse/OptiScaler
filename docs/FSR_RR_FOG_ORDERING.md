@@ -161,7 +161,8 @@ changed u0 and constants; the observer correctly refused to reuse its earlier
 receipts. This is not a claim that the first dispatch is the final hit writer.
 
 The optional next-stage raw copy inserts copy-only commands synchronously
-after the admitted original dispatch, before its end-use cleanup. It uses
+at the ray node's authenticated common pre-cleanup entry, after its original
+dispatches and before its first end-use cleanup. It uses
 the authenticated engine state-request/flush helpers and restores hit UAV
 state before returning. Only private native-format copies may cross to the
 lighting capture, with an exact same-list/reset/view/CPU-source join. Original
@@ -174,3 +175,25 @@ Windows build, but is not yet invoked by the live host. RESET avoids borrowing
 late history for this first diagnostic; it does not excuse missing current
 motion, hit distance, camera, or resource ordering. No extra exposure or raw
 ray ×64 decoding is applied to already-composed main color.
+
+## Independently fenced native-input replay
+
+The `b62d51d7` live test saved all seven guide/ray/lighting inputs successfully.
+Nearby Fog draws used a different native command list. Recording proximity is
+not a dependency or a same-frame proof, so no cross-list guide reads are added.
+
+The next diagnostic permits one lighting capture and one Fog capture per
+process (256 MiB readback each, 512 MiB combined ceiling). Each retains its own
+submission ticket and completes on its actual GPU fence. Fog optionally captures
+the currently bound pixel-t0 hardware depth into a private native R32_FLOAT
+texture, beside its existing exact pre/post color and authored fog snapshots.
+No depth linearization, resampling, or shader arithmetic occurs during capture.
+The authenticated native state helper handles the source; only the private
+output gets an explicit transition. Original fog executes once, unchanged.
+
+The Fog manifest records current source-object/frame/view/camera observations
+and an explicitly unpaired lighting-recording candidate. Offline replay must
+match these against the separately completed lighting manifest, not choose the
+latest directory or reuse mutable original resources after fence completion.
+This diagnostic is still not a real-time image correction or temporal-quality
+validation. Its direct copy contract follows [D3D12 CopyTextureRegion](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-copytextureregion).

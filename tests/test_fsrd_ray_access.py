@@ -1,4 +1,4 @@
-"""Trusted native post-ray copy state protocol, without a second state tracker."""
+"""Trusted native pre-cleanup copy protocol, without a second state tracker."""
 import os
 from pathlib import Path
 import shutil
@@ -24,6 +24,12 @@ class RayAccess(unittest.TestCase):
             self.assertIn(required, text)
         self.assertEqual(text.count('host.RequestState(input.image'), 3)
         self.assertEqual(text.count('host.Flush(input.image'), 2)
+        self.assertIn('CleanupReturnRva = 0xc6bd0c', text)
+        self.assertIn('CleanupCode { 0x1ec70c, 0xe0,', text)
+        self.assertIn('89213d76d38db9e9c56a47ef968f902f11d6a7125690bf709b952e7d7a3e0440', text)
+        self.assertIn('cache == saved.cache && descriptor == saved.descriptor', text)
+        self.assertNotIn('cache == dispatch.cache', text)
+        self.assertNotIn('descriptor == dispatch.b6.descriptor', text)
 
     def test_actual_protocol_O0_O3_fast_failures_and_mandatory_restore(self):
         compiler = os.environ.get('CXX') or shutil.which('c++')
@@ -124,7 +130,7 @@ int main(){
   assert((h.events==std::vector<char>{'m','h','f','c','u','f'}));
  }
  // Every original-use/scope/state-skip refusal must precede any mutation.
- for(unsigned bad=0;bad<22;++bad){
+ for(unsigned bad=0;bad<24;++bad){
   input=Setup(h);auto& d=input.dispatch;auto& m=d.textures[0];auto& t=d.textures[2];
   switch(bad){
   case 0:input.image=0;break;case 1:d.callerRva++;break;case 2:d.list4=0;break;
@@ -137,6 +143,7 @@ int main(){
   case 18:h.Put(t.slot+0x68,t.native);break;
   case 19:h.Put(Engine+0x68,uint32_t(4));h.Put(Registry+0x1a8e988,uint8_t(1));break;
   case 20:m.native=t.native;break;case 21:t.binding.descriptor++;break;
+  case 22:h.Put(Engine+0x60,uintptr_t(0));break;case 23:h.Put(Engine+0x90,uintptr_t(0));break;
   }
   result=R::RecordCopy(h,input,copy);assert(result.outcome==R::Outcome::Refused&&!result.requestsIssued&&!result.callbackEntered&&!result.hitRestored&&h.events.empty());
  }
@@ -151,6 +158,10 @@ int main(){
  input=Setup(h);input.dispatch.textures[0].requestedSrvState=0x40;
  h.Put(input.dispatch.textures[0].slot+0x48,uint32_t(0x40));
  result=R::RecordCopy(h,input,copy);assert(result.hitRestored&&h.states[0]==0x840);
+ // Original transparent work may replace b6/cache/root layout before cleanup.
+ // Save current endpoint identity, never require the primary binding still set.
+ input=Setup(h);h.Put(Engine+0x60,uintptr_t(0x6600));h.Put(Engine+0x90,uintptr_t(0x7700));
+ result=R::RecordCopy(h,input,copy);assert(result.outcome==R::Outcome::CopyRecordedRestored);
  // Scope loss after EACH state call/flush/callback stops further engine calls.
  for(unsigned step=1;step<=6;++step){
   input=Setup(h);h.loseAfter=step;result=R::RecordCopy(h,input,copy);
@@ -159,12 +170,12 @@ int main(){
  }
  // Resource admission and thread/TLS/cache/view identity are rechecked after a
  // partial private callback too. No restore against an unverified reused scope.
- for(unsigned bad=0;bad<8;++bad){
+ for(unsigned bad=0;bad<9;++bad){
   input=Setup(h);result=R::RecordCopy(h,input,[&]{
    switch(bad){case 0:h.scope=false;break;case 1:++h.thread;break;case 2:++h.currentTls;break;
    case 3:h.Put(Engine+0x68,uint32_t(2));break;case 4:h.Put(Graph+0x18,uintptr_t(9));break;
    case 5:h.Put(Engine+0x90,uintptr_t(9));break;case 6:h.Put(input.dispatch.textures[2].slot,uintptr_t(9));break;
-   case 7:h.throwRead=true;break;}return true;});
+   case 7:h.throwRead=true;break;case 8:h.Put(Engine+0x60,uintptr_t(9));break;}return true;});
   assert(result.outcome==R::Outcome::ScopeLostAfterMutation&&!result.hitRestored&&result.requestsIssued==2);
  }
 }

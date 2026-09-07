@@ -27,13 +27,16 @@ class RayCopyHost(unittest.TestCase):
         self.assertEqual(hook.count(original), 1)
         self.assertLess(hook.index('CyberpunkRayBindings::Observe('), hook.index('PrepareRayCopy('))
         self.assertLess(hook.index('PrepareRayCopy('), hook.index(original))
-        self.assertLess(hook.index(original), hook.index('FinishRayCopy('))
+        self.assertNotIn('FinishRayCopy(', hook)
+        self.assertLess(hook.index('current->pendingCopy = rayCopy'), hook.index(original))
+        self.assertLess(hook.index(original), hook.index('pending->originalReturned = true'))
+        self.assertIn('++pending->completedDispatches', hook)
         prepare = function('PrepareRayCopy')
-        for required in ('rayCopyAttempted.exchange(true)', 'snapshot.scope.view, 0x34',
+        for required in ('!originalRayCleanup', 'rayCopyAttempted.exchange(true)', 'snapshot.scope.view, 0x34',
                          'snapshot.scope.view, 0x38', 'SameRayCopyScope(*plan)',
                          'list4Identity.Get() != plan->listIdentity.Get()',
                          'snapshot.textures[i ? 2 : 0].native', 'PrivateRayCopy::Prepare(',
-                         'D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS'):
+                         'D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS', 'snapshot.scope.view, 0x1d70'):
             self.assertIn(required, prepare)
         self.assertLess(prepare.index('SameRayCopyScope(*plan)'), prepare.index('plan->sources[i] ='))
         for forbidden in ('dispatch.Width !=', 'dispatch.Height !=', 'width = dispatch.Width',
@@ -49,6 +52,17 @@ class RayCopyHost(unittest.TestCase):
                          'CyberpunkRayBindings::Detail::ReadCurrent(',
                          'current.textures[i].refs = expected.textures[i].refs', 'current != expected'):
             self.assertIn(required, same)
+        endpoint = same.split('if (plan.cleanupEntered)\n', 1)[1].split('const FSRD::CyberpunkRayBindings::TextureHandles', 1)[0]
+        for required in ('rayScope->pendingCopy.get() != &plan', '!plan.originalReturned',
+                         '!plan.completedDispatches', 'rayScope->nativeDispatchDepth',
+                         'Detail::ReadTexture(', 'current.native != source.native',
+                         'current.descriptor != source.descriptor', 'current.compact != source.compact'):
+            self.assertIn(required, endpoint)
+        for forbidden in ('ReadCurrent(', 'receipt.', 'expected.b6', 'expected.layout', 'expected.cache'):
+            self.assertNotIn(forbidden, endpoint)
+        self.assertIn('if (plan.cleanupEntered && i == 1) continue;', same)
+        self.assertIn('owner != plan.rayOwner', same)
+        self.assertIn('hitHandle != expected.textures[2].handle', same)
         self.assertNotIn('CyberpunkRayBindings::Observe(', same)
         self.assertNotIn('lightingAttempted.load()', same)
         host = SOURCE.split('struct RayCopyEngineHost\n', 1)[1].split('std::shared_ptr<RayCopyBundle> PrepareRayCopy', 1)[0]
@@ -57,6 +71,118 @@ class RayCopyHost(unittest.TestCase):
             self.assertIn(required, host)
         for forbidden in ('0x538', '0x528', 'Reenter(', 'RestorePso(', 'GetGPUVirtualAddress('):
             self.assertNotIn(forbidden, host)
+
+    def test_exact_cleanup_entry_and_authentication_before_detour(self):
+        cleanup = function('HookRayCleanup')
+        original = 'originalRayCleanup(context, flags);'
+        self.assertEqual(cleanup.count(original), 1)
+        self.assertLess(cleanup.index('FinishRayCopy(plan)'), cleanup.index(original))
+        self.assertLess(cleanup.index('earlyFatalRecording.load()'), cleanup.index(original))
+        self.assertLess(cleanup.index(original), cleanup.index('current->pendingCopy.reset()'))
+        for required in ('CyberpunkRayAccess::CleanupReturnRva', 'context == current->context',
+                         'flags == 0', '!plan->cleanupConsumed', '!plan->invalidated',
+                         'plan->originalReturned', '!current->nativeDispatchDepth',
+                         'plan->cleanupConsumed = true', 'plan->cleanupEntered = false',
+                         '"primary_b6_u0_layout_asserted_current", false'):
+            self.assertIn(required, cleanup)
+        init = function('Initialize')
+        self.assertLess(init.index('MatchLiveCode(image, FSRD::CyberpunkRayAccess::CleanupCode)'),
+                        init.index('DetourTransactionBegin()'))
+        self.assertIn('DetourAttach(reinterpret_cast<PVOID*>(&originalRayCleanup), HookRayCleanup)', init)
+        self.assertIn('originalRayCleanup = nullptr;', init.split('if (error != NO_ERROR)', 1)[1])
+        node = function('HookRayNode')
+        self.assertIn('parent->pendingCopy->invalidated = true', node)
+        self.assertIn('original ray node returned without the admitted common cleanup endpoint', node)
+
+    def test_actual_cleanup_hook_original_once_refusal_and_order(self):
+        compiler = os.environ.get('CXX') or shutil.which('c++')
+        if not compiler:
+            self.skipTest('Set CXX to compile actual cleanup hook')
+        harness = r'''
+#include <atomic>
+#include <cassert>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <vector>
+#include <json.hpp>
+#include "FSRDCyberpunkRayAccess.h"
+#define __fastcall
+using Json=nlohmann::json;
+constexpr uintptr_t Image=0x140000000,Context=0x2000;
+thread_local bool inMetadata=false;
+std::atomic<bool> active{true},captureEnabled{true},rayBindingsAuthenticated{true};
+std::atomic<bool> earlyFatalRecording{false};
+std::atomic<uintptr_t> authenticatedImage{Image};
+uintptr_t fakeCaller=Image+FSRD::CyberpunkRayAccess::CleanupReturnRva;
+void* _ReturnAddress(){return reinterpret_cast<void*>(fakeCaller);}
+struct RayCopyBundle {
+ FSRD::CyberpunkRayAccess::Input input;
+ bool originalReturned=true,cleanupEntered=false,cleanupConsumed=false,invalidated=false;
+ unsigned completedDispatches=2;
+ Json provenance;
+};
+struct RayScope {void* context=reinterpret_cast<void*>(Context);unsigned nativeDispatchDepth=0;
+ std::shared_ptr<RayCopyBundle> pendingCopy;};
+RayScope* rayScope=nullptr;
+struct Registry {std::mutex mutex;Json rayCopyStatus;};
+Registry registry;Registry& Data(){return registry;}
+std::vector<char> events;bool skipMetadata=false,throwOriginal=false,fatalOnFinish=false;
+template<class T>bool ReadEarlyAt(uintptr_t,uintptr_t,T& value){value=1;return true;}
+template<class F>void Metadata(F&& f)noexcept{if(skipMetadata)return;try{f();}catch(...){}}
+void FinishRayCopy(const std::shared_ptr<RayCopyBundle>& p){
+ assert(p->cleanupEntered&&p->cleanupConsumed&&p->originalReturned&&!p->invalidated);
+ assert(rayScope->pendingCopy==p);events.push_back('f');
+ if(fatalOnFinish)earlyFatalRecording=true;
+}
+void originalRayCleanup(void*,uint8_t){events.push_back('o');if(throwOriginal)throw std::runtime_error("original");}
+'''
+        harness += function('HookRayCleanup')
+        harness += r'''
+int main(){
+ for(unsigned bad=0;bad<16;++bad){
+  events.clear();active=true;captureEnabled=true;rayBindingsAuthenticated=true;authenticatedImage=Image;
+  fakeCaller=Image+FSRD::CyberpunkRayAccess::CleanupReturnRva;inMetadata=false;skipMetadata=false;
+  RayScope s;rayScope=&s;s.pendingCopy=std::make_shared<RayCopyBundle>();auto p=s.pendingCopy;
+  p->input.image=Image;p->input.dispatch.scope.graphContext=Context;
+  void* context=s.context;uint8_t flags=0;
+  switch(bad){case 0:break;case 1:++fakeCaller;break;case 2:context=nullptr;break;case 3:flags=1;break;
+   case 4:p->invalidated=true;break;case 5:p->originalReturned=false;break;case 6:p->completedDispatches=0;break;
+   case 7:s.nativeDispatchDepth=1;break;case 8:active=false;break;case 9:captureEnabled=false;break;
+   case 10:rayBindingsAuthenticated=false;break;case 11:authenticatedImage=Image+1;break;
+   case 12:inMetadata=true;break;case 13:p->cleanupConsumed=true;break;
+   case 14:skipMetadata=true;break;case 15:p->input.dispatch.scope.graphContext++;break;}
+  HookRayCleanup(context,flags);
+  assert((events==(bad==0?std::vector<char>{'f','o'}:std::vector<char>{'o'})));
+  assert(!s.pendingCopy&&!p->cleanupEntered&&p->cleanupConsumed);
+  // A repeated callback cannot record a second copy from a completed receipt.
+  HookRayCleanup(context,flags);assert(events.back()=='o');
+ }
+ // If guarded process termination cannot complete, do not resume native cleanup
+ // with an unverified hit restoration. This is not an ordinary refusal.
+ events.clear();active=true;captureEnabled=true;rayBindingsAuthenticated=true;authenticatedImage=Image;
+ fakeCaller=Image+FSRD::CyberpunkRayAccess::CleanupReturnRva;inMetadata=false;skipMetadata=false;
+ RayScope s;rayScope=&s;s.pendingCopy=std::make_shared<RayCopyBundle>();
+ s.pendingCopy->input.image=Image;s.pendingCopy->input.dispatch.scope.graphContext=Context;
+ fatalOnFinish=true;HookRayCleanup(s.context,0);
+ assert((events==std::vector<char>{'f'})&&s.pendingCopy&&!s.pendingCopy->cleanupEntered);
+ fatalOnFinish=false;earlyFatalRecording=false;
+ // Original exceptions are not swallowed/replayed by the diagnostic wrapper.
+ events.clear();rayScope=nullptr;throwOriginal=true;bool caught=false;
+ try{HookRayCleanup(reinterpret_cast<void*>(Context),0);}catch(...){caught=true;}
+ assert(caught&&(events==std::vector<char>{'o'}));
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='fsrd-ray-cleanup-host-') as tmp:
+            source = Path(tmp) / 'test.cpp'
+            source.write_text(harness)
+            for flags in (['-O0'], ['-O3', '-ffast-math']):
+                binary = Path(tmp) / 'test'
+                subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-Werror', *flags,
+                                '-I', str(ROOT / 'OptiScaler/upscalers/ffx'),
+                                '-I', str(ROOT / 'external/nlohmann'),
+                                str(source), '-o', str(binary)], check=True)
+                subprocess.run([str(binary)], check=True)
 
     def test_restore_fatal_guard_and_private_companion_ownership(self):
         finish = function('FinishRayCopy')

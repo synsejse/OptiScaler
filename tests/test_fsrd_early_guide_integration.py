@@ -128,7 +128,7 @@ class EarlyGuideIntegration(unittest.TestCase):
         self.assertIn("image == uintptr_t(GetModuleHandleW(nullptr))", fatal)
         self.assertIn("TerminateProcess(GetCurrentProcess(), 0xf51d0001u)", fatal)
         self.assertEqual(prepare.count("TerminateProcess("), 1)
-        self.assertEqual(SOURCE.count("TerminateProcess("), 3) # Authenticated early-guide, lighting and ray-copy fatal paths.
+        self.assertEqual(SOURCE.count("TerminateProcess("), 4) # Authenticated early-guide, lighting, ray-copy and Fog-depth fatal paths.
         draw = function("HookDraw")
         self.assertLess(draw.index("earlyFatalRecording.load()"), draw.index("originalDraw("))
 
