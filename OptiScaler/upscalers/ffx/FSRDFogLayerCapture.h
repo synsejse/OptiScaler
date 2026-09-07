@@ -22,6 +22,9 @@ struct Layers
     Texture before;   // Private snapshot of the scene immediately before the authenticated fog draw.
     Texture after;    // Private snapshot immediately after that same original draw.
     Texture authored; // Unblended RGBA from a separately captured instance of that fog draw.
+    // Optional, independently validated companion; never part of the three matching layers.
+    // Exactly 5x1 RGBA32_UINT, texels = raw cb12 registers 21,22,23,24,27 in that order.
+    Texture boundCb12;
 };
 
 struct Status
@@ -60,6 +63,10 @@ Status GetStatus();
 // adds target quantization before any offline blend-equation check; prefer RGBA32F
 // to avoid this additional loss. No shader/format/exposure/alpha transformation or
 // inferred fog equation is performed by this helper.
+// Optional boundCb12 must be a fourth distinct private immutable 5x1, mip0/slice0,
+// single-sample typed RGBA32_UINT texture. It is copied as 80 native uint32 bytes
+// into companions, not converted or admitted through the floating-layer checks.
+// The shared 256 MiB readback budget includes this companion when present.
 // provenanceJson must be a JSON object; it is saved as caller-supplied evidence,
 // not treated as proof that the above draw constraints were satisfied.
 //

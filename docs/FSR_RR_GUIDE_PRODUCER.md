@@ -630,3 +630,41 @@ handles and authored settings; it neither calls engine getters nor accesses GPU
 contents. A handle's presence does not establish initialized pixels, resource
 state, or permission to dispatch early. Shared-view constants, motion/depth and
 ray-distance availability still require corresponding producer/consumer checks.
+
+### Early live observation and bound-constant probe
+
+Build `75c8dd2d` completed native capture `fog-20260907-014608-188Z-324`.
+At the authenticated High fog draw the four material inputs resolved to fixed
+handles 22470, 22469, 22467 and 22483. The current view extent was 1280×720,
+namespace zero, graph selector 71/position 4653175; NoV mode was -1 and optional
+extra-specular feature 0x35 was disabled. The read-only lookup used 36 bounded
+memory reads / 338 bytes. This proves CPU lookup availability for that scope,
+not resource initialization, GPU state or equality with later guide inputs.
+
+The next capture includes the exact *bound* High-fog cb12 registers 21, 22, 23,
+24 and 27: a private 5×1 RGBA32_UINT target receives raw uint4 loads using the
+unchanged original vertex shader, root signature and root bindings. It reads
+only constants the authenticated original High shader already accesses. The
+probe restores the original PSO, frozen RTV and exact viewport/scissor arrays;
+it does not call an engine constant uploader, inspect a guessed GPU address, or
+use a global “latest camera” pointer. Its 80-byte companion uses the existing
+capture submission/fence and is not mixed with the three native float layers.
+
+Additional CPU metadata records the authored depth key, motion fallback/owner
+precedence, specular-hit-distance owner, and view-derived camera candidates.
+These candidates remain explicitly distinct from final NGX constants/reset.
+No early denoiser dispatch is enabled by this instrumentation.
+
+The correction still needs dedicated graphics/compute state preservation before
+an early compute insertion. A different command list cannot simply be inserted
+in the middle of an existing recorded list. Graphics and compute roots are
+independent, but changing descriptor heaps invalidates descriptor-table state;
+both are relevant to a safe scoped insertion. See Microsoft's
+[root-signature semantics](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-a-root-signature)
+and [descriptor-heap semantics](https://learn.microsoft.com/en-us/windows/win32/direct3d12/setting-descriptor-heaps).
+
+Signal coverage also remains limited: the replay skips exactly the captured
+hardware-depth-zero pixels (20.3861% in frame 10122), preserving their pre-fog
+RGB. The good sky result is therefore not proof of successful AMD sky denoising.
+Primary emission has not been separated from valid-surface pre-fog RGB; a bright
+pixel threshold would not establish that semantic and is not used as a fix.

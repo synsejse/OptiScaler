@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -40,6 +41,7 @@ struct Entry
 struct Batch
 {
     std::array<Entry, 3> entries;
+    std::optional<Entry> boundCb12;
     std::shared_ptr<void> keepAlive;
     Json metadata;
     std::filesystem::path directory;
@@ -106,13 +108,26 @@ void CheckSameDevice(ID3D12Device* device, ID3D12DeviceChild* child)
         throw std::runtime_error("fog capture resources/list must belong to the supplied device");
 }
 
-void PrepareEntry(ID3D12Device* device, Entry& entry)
+void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false)
 {
     if (!entry.source.resource)
         throw std::runtime_error("fog capture requires all three immutable textures");
     CheckSameDevice(device, entry.source.resource.Get());
     const auto desc = entry.source.resource->GetDesc();
-    if (entry.source.viewFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+    if (boundCb12)
+    {
+        // A companion must not broaden the accepted formats/extents of any of
+        // the original three floating-point layers.
+        if (entry.source.viewFormat != DXGI_FORMAT_R32G32B32A32_UINT ||
+            desc.Format != DXGI_FORMAT_R32G32B32A32_UINT || desc.Width != 5 || desc.Height != 1 ||
+            desc.MipLevels != 1 || desc.DepthOrArraySize != 1 || desc.SampleDesc.Quality != 0 ||
+            entry.source.subresource != 0)
+            throw std::runtime_error("bound cb12 companion requires exact private 5x1 mip0 RGBA32_UINT");
+        entry.componentType = "uint32";
+        entry.pixelBytes = 16;
+        entry.filename = std::string(entry.role) + ".rgba32u";
+    }
+    else if (entry.source.viewFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
         (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS))
     {
         entry.componentType = "float16";
@@ -301,6 +316,8 @@ void WriteWhenComplete(const WorkerArgs& args)
         WriteManifest(batch); // Explicitly incomplete until all three files are closed successfully.
         for (const auto& entry : batch.entries)
             WriteEntry(batch, entry);
+        if (batch.boundCb12)
+            WriteEntry(batch, *batch.boundCb12);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
         FinishStatus(true, "Fog capture saved: three native floating-point RGBA layers and provenance.", true);
@@ -433,6 +450,18 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
         }
         for (auto& entry : batch->entries)
             AllocateReadback(device, entry);
+        if (layers.boundCb12.resource)
+        {
+            for (const auto& entry : batch->entries)
+                if (entry.source.resource.Get() == layers.boundCb12.resource.Get())
+                    throw std::runtime_error("bound cb12 companion must be distinct from all scene layers");
+            batch->boundCb12 = Entry { .role = "bound_cb12_words", .source = layers.boundCb12 };
+            PrepareEntry(device, *batch->boundCb12, true);
+            totalBytes += batch->boundCb12->bytes;
+            if (totalBytes > MaxBytes)
+                throw std::runtime_error("fog capture including bound cb12 exceeds the 256 MiB readback limit");
+            AllocateReadback(device, *batch->boundCb12);
+        }
         batch->directory = Util::ExePath().parent_path() / "FSRRR-fog-captures" / Timestamp();
         batch->metadata = { { "schema", "optiscaler.fsr_rr.fog_layers.v1" },
                             { "complete", false },
@@ -442,9 +471,19 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                             { "value_transform", "none; native float16/float32 RGBA including unmodified alpha" },
                             { "provenance_authority", "caller_supplied; draw authenticity not verified by readback helper" },
                             { "provenance", provenance },
-                            { "layers", Json::array() } };
+                            { "layers", Json::array() }, { "companions", Json::array() } };
         for (const auto& entry : batch->entries)
             batch->metadata["layers"].push_back(Describe(entry));
+        if (batch->boundCb12)
+        {
+            auto companion = Describe(*batch->boundCb12);
+            companion["schema"] = "optiscaler.fsr_rr.bound_cb12_words.v1";
+            companion["cb_register"] = 12;
+            companion["register_space"] = 0;
+            companion["register_indices"] = { 21, 22, 23, 24, 27 };
+            companion["value_transform"] = "none; raw uint32 constant bits, no floating-point conversion";
+            batch->metadata["companions"].push_back(std::move(companion));
+        }
 
         auto args = std::make_unique<WorkerArgs>();
         args->batch = batch;
@@ -467,6 +506,8 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
         }
         for (const auto& entry : batch->entries)
             RecordCopy(list, entry);
+        if (batch->boundCb12)
+            RecordCopy(list, *batch->boundCb12);
         recorded = true;
 
         const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);

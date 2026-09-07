@@ -37,7 +37,8 @@ class EarlyGuides(unittest.TestCase):
                          "uint64_t(i) * 24 + 8", "i ? i - 1 : 0", "boundary >= context.position",
                          "keys[1] == key && keys[2] == key", "context.nameSpace << 24",
                          "0x63bcf380", "0x64bcf513", "0x65bcf6a6", "0x61f178d4",
-                         "0x1d70", "0x2e8", "0x17d0", ">> 0x35"):
+                         "0x1d70", "0x2e8", "0x17d0", "features.Test(0x35)",
+                         "0xdebf0c27", "0x15eab19c", "0x268", "0x274"):
             self.assertIn(expected, SOURCE)
         for bound in ("MaxReadCalls = 4096", "MaxReadBytes = 128 * 1024", "MaxChain = 256",
                       "MaxVersions = 256", "MaxTableElements = 1024 * 1024", "MaxStride = 256"):
@@ -55,6 +56,17 @@ class EarlyGuides(unittest.TestCase):
         self.assertIn('"current view feature unavailable"', SOURCE)
         self.assertIn("std::isfinite(scale)", SOURCE)
         self.assertIn('"extra_specular_scale_bits"', SOURCE)
+
+    def test_observational_camera_and_exact_motion_precedence(self):
+        for evidence in ('"streamline_producer_observed", false', '"frame_token", "not_observed"',
+                         '"matrix_payload", "not_captured"', '"effective_ngx_reset", "not_established"',
+                         '"final_ngx_constants", "not_established"', "0x3e4, 0x80000000u",
+                         "value == 0", "if (overrideHandle)", "SetHandle(result, overrideHandle)",
+                         "features.Test(0x5a)", "features.Test(0x37)", "features.Test(0x46)"):
+            self.assertIn(evidence, SOURCE)
+        self.assertNotIn("overrideHandle <= INT32_MAX", SOURCE)
+        self.assertIn("bit / 64", SOURCE)
+        self.assertIn("bit & 63", SOURCE)
 
     def test_project_contains_standalone_files(self):
         for project in ("OptiScaler.vcxproj", "OptiScaler.vcxproj.filters"):
@@ -99,7 +111,7 @@ PRODUCTION_INCLUDE
 using namespace FSRDCyberpunkEarlyGuides;
 constexpr uintptr_t context = 0x10000, view = 0x20000, graph = 0x40000;
 constexpr uintptr_t buckets = 0x800000, entries = 0x900000, image = 0x10000000;
-constexpr uint32_t keys[] = {0x63bcf380,0x64bcf513,0x65bcf6a6,0x61f178d4};
+constexpr uint32_t keys[] = {0x63bcf380,0x64bcf513,0x65bcf6a6,0x61f178d4,0xdebf0c27,0x15eab19c};
 void setup()
 {
     memory.clear(); partial = false;
@@ -109,9 +121,16 @@ void setup()
     put<uint32_t>(graph + 0x40, 12);
     put<uint32_t>(view + 0x34, 1280); put<uint32_t>(view + 0x38, 720);
     put<uint64_t>(view + 0x17d0, 0);
-    put<TableHeader>(graph + 0x51b848, {buckets, 4, 13, entries, 0, 0x40});
+    put<uint64_t>(view + 0x17d8, 0);
+    put<uintptr_t>(view + 0x1d70, 0xc00000);
+    put<uint32_t>(0xc00268, 0); put<uint32_t>(0xc00274, 0);
+    put<float>(view + 0xb0, .1f); put<float>(view + 0xb4, 1000.f);
+    put<float>(view + 0x90, 1.2f); put<float>(view + 0x98, 1.777f);
+    put<float>(view + 0x3e0, .25f); put<float>(view + 0x3e4, -.125f);
+    put<uint8_t>(view + 0xef0, 1);
+    put<TableHeader>(graph + 0x51b848, {buckets, 6, 13, entries, 0, 0x40});
     std::array<uint32_t,13> heads; heads.fill(UINT32_MAX);
-    for (uint32_t i = 0; i < 4; ++i)
+    for (uint32_t i = 0; i < 6; ++i)
     {
         const auto key = keys[i] ^ (3u << 24), bucket = key % 13;
         put<std::array<uint32_t,3>>(entries + i * 0x40, {heads[bucket], key, key});
@@ -133,6 +152,50 @@ int main()
     assert(result["guide_settings"]["extra_specular_enabled"] == 0);
     assert(result["graph_position"] == 11 && result["namespace"] == 3);
     assert(result["read_calls"].get<size_t>() < MaxReadCalls);
+    assert(result["inputs"].size() == 8);
+    assert(result["inputs"][5]["handle"] == 104 && result["inputs"][5]["streamline_tag"] == 0);
+    assert(result["inputs"][6]["handle"] == 0 && result["inputs"][6]["status"] == "unavailable");
+    assert(result["inputs"][7]["status"] == "not_enabled_by_current_view");
+    assert(result["camera_provenance"]["jitter_y"]["producer_candidate"] == .125);
+    assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == false);
+    put<uint8_t>(view + 0xef0, 0); put<uint32_t>(view + 0x3e4, 0);
+    result = describe();
+    assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == true);
+    assert(result["camera_provenance"]["jitter_y"]["producer_candidate_bits"] == 0x80000000u);
+    put<uint32_t>(view + 0x90, 0x7fc01234u); result = describe();
+    assert(result["camera_provenance"]["fov_radians"]["source_bits"] == 0x7fc01234u);
+    assert(result["camera_provenance"]["fov_radians"]["producer_candidate"].is_null());
+    memory.erase(view + 0xef0); memory.erase(view + 0xb0); result = describe();
+    assert(!result.contains("read_failure"));
+    assert(result["camera_provenance"]["history"]["status"] == "unavailable");
+    assert(result["camera_provenance"]["near_plane"]["status"] == "unavailable");
+    setup(); put<uint64_t>(view + 0x17d8, uint64_t(1) << (0x5a & 63));
+    result = describe(); assert(result["inputs"][6]["handle"] == 105);
+    put<uint64_t>(view + 0x17d0, uint64_t(1) << 0x37);
+    put<uint32_t>(0xc00268, 901); result = describe();
+    assert(result["inputs"][6]["handle"] == 901);
+    assert(result["inputs"][6]["selected_source"] == "current_view_owner_0x268");
+    put<uint32_t>(0xc00268, 0xffffffffu); result = describe();
+    assert(result["inputs"][6]["handle"] == 0xffffffffu);
+    assert(result["inputs"][6]["status"] == "unavailable"); // Must not use valid fallback.
+    put<uint32_t>(0xc00268, 0); result = describe();
+    assert(result["inputs"][6]["handle"] == 105);
+    memory.erase(0xc00268); result = describe();
+    assert(!result["inputs"][6].contains("handle")); // Unknown override is not zero.
+    put<uint32_t>(0xc00268, 902); memory.erase(view + 0x17d8); result = describe();
+    assert(result["inputs"][6]["handle"] == 902); // Nonzero override can prove final source.
+    assert(!result["inputs"][6].contains("feature_0x5a"));
+    put<uint32_t>(0xc00268, 0); result = describe();
+    assert(!result["inputs"][6].contains("handle"));
+    setup(); put<uint64_t>(view + 0x17d8, uint64_t(1) << (0x46 & 63));
+    put<uint32_t>(0xc00274, 903); result = describe();
+    assert(result["inputs"][7]["handle"] == 903 && result["inputs"][7]["streamline_tag"] == 42);
+    put<uint32_t>(0xc00274, 0x80000001u); result = describe();
+    assert(result["inputs"][7]["status"] == "unavailable");
+    memory.erase(view + 0x17d8); result = describe();
+    assert(result["inputs"][7]["status"] == "unavailable");
+    assert(!result["inputs"][7].contains("feature_0x46"));
+    setup();
     put<uint64_t>(view + 0x17d0, uint64_t(1) << 0x35);
     put<uintptr_t>(view + 0x1d70, 0xc00000); put<uint32_t>(0xc002e8, 900);
     put<uint8_t>(image + ExtraSpecularEnableRva, 1);
