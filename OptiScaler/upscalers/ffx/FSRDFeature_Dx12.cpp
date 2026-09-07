@@ -281,7 +281,7 @@ constexpr auto kDebugModes = std::to_array<ModeNamePair>({
 
 FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InParameters)
     : FFXFeatureDx12(InHandleId, InParameters), IFeature(InHandleId, SetParameters(InParameters)),
-      _pDenoiserCtx(nullptr), _denoiserCtxDesc({}), _denoiserSettings({}), _convDesc({}), _isInReset(false),
+      _denoiserCtxDesc({}), _convDesc({}), _isInReset(false),
       _lastCamPos(0.0f, 0.0f, 0.0f), _invViewMatrix(XMMatrixIdentity()), _viewMatrix(XMMatrixIdentity()),
       _prevViewMatrix(XMMatrixIdentity()), _projMatrix(XMMatrixIdentity()), _prevProjMatrix(XMMatrixIdentity()),
       _upscaleColorOverride(nullptr),
@@ -299,7 +299,10 @@ FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InPar
 FSRDFeatureDx12::~FSRDFeatureDx12()
 {
     if (State::Instance().isShuttingDown)
+    {
+        _denoiser.AbandonOnProcessShutdown();
         return;
+    }
 
     DestroyDenoiserContext();
 }
@@ -386,7 +389,7 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
     // Create the denoiser context
     {
         ScopedSkipHeapCapture skipHeapCapture {};
-        auto ret = FfxApiProxy::D3D12_CreateContext(&_pDenoiserCtx, &_denoiserCtxDesc.header, NULL);
+        auto ret = _denoiser.Create(_denoiserCtxDesc);
 
         if (ret != FFX_API_RETURN_OK)
         {
@@ -402,18 +405,19 @@ bool FSRDFeatureDx12::CreateDenoiserContext()
     }
 
     // Keep "auto" tied to the selected RR 1.1 provider rather than pinning RR 1.0 defaults.
+    const auto& settings = _denoiser.Settings();
     const auto ApplyProviderDefault = [](CustomOptional<float>& option, float value)
     {
         if (!option.value_for_config().has_value())
             option.set_volatile_value(value);
     };
 
-    ApplyProviderDefault(cfg.FfxDenoiserCrossBlNormStr, _denoiserSettings.crossBilateralNormalStrength);
-    ApplyProviderDefault(cfg.FfxDenoiserStabilityBias, _denoiserSettings.stabilityBias);
-    ApplyProviderDefault(cfg.FfxDenoiserMaxRadiance, _denoiserSettings.maxRadiance);
-    ApplyProviderDefault(cfg.FfxDenoiserRadianceClip, _denoiserSettings.radianceClipStdK);
-    ApplyProviderDefault(cfg.FfxDenoiserGaussKernRelax, _denoiserSettings.gaussianKernelRelaxation);
-    ApplyProviderDefault(cfg.FfxDenoiserDisocclusionThreshold, _denoiserSettings.disocclusionThreshold);
+    ApplyProviderDefault(cfg.FfxDenoiserCrossBlNormStr, settings.crossBilateralNormalStrength);
+    ApplyProviderDefault(cfg.FfxDenoiserStabilityBias, settings.stabilityBias);
+    ApplyProviderDefault(cfg.FfxDenoiserMaxRadiance, settings.maxRadiance);
+    ApplyProviderDefault(cfg.FfxDenoiserRadianceClip, settings.radianceClipStdK);
+    ApplyProviderDefault(cfg.FfxDenoiserGaussKernRelax, settings.gaussianKernelRelaxation);
+    ApplyProviderDefault(cfg.FfxDenoiserDisocclusionThreshold, settings.disocclusionThreshold);
 
     // Create DLSS-RR to FSR-RR input converter
     FSRDConvShader = std::make_unique<FSRDPreprocessor_Dx12>("FSRD Converter", Device);
@@ -556,46 +560,19 @@ bool FSRDFeatureDx12::QueryDenoiserVersions()
 
 bool FSRDFeatureDx12::QueryDefaultDenoiserSettings()
 {
-    const auto QueryDefault = [this](FfxApiConfigureDenoiserKey key, float& value)
+    const auto result = _denoiser.QueryDefaults();
+    if (result.code != FFX_API_RETURN_OK)
     {
-        ffxQueryDescDenoiserGetDefaultKeyValue queryDesc = {
-            .header = { .type = FFX_API_QUERY_DESC_TYPE_DENOISER_GET_DEFAULT_KEYVALUE },
-            .key = static_cast<uint64_t>(key),
-            .count = 1,
-            .data = &value
-        };
-
-        const auto result = FfxApiProxy::D3D12_Query(&_pDenoiserCtx, &queryDesc.header);
-
-        if (result != FFX_API_RETURN_OK)
-        {
-            LOG_ERROR("Failed to query FSR-RR setting {}: {}", static_cast<uint64_t>(key),
-                      FfxApiProxy::ReturnCodeToString(result));
-            return false;
-        }
-
-        return true;
-    };
-
-    return QueryDefault(FFX_API_CONFIGURE_DENOISER_KEY_CROSS_BILATERAL_NORMAL_STRENGTH,
-                        _denoiserSettings.crossBilateralNormalStrength) &&
-           QueryDefault(FFX_API_CONFIGURE_DENOISER_KEY_STABILITY_BIAS, _denoiserSettings.stabilityBias) &&
-           QueryDefault(FFX_API_CONFIGURE_DENOISER_KEY_MAX_RADIANCE, _denoiserSettings.maxRadiance) &&
-           QueryDefault(FFX_API_CONFIGURE_DENOISER_KEY_RADIANCE_CLIP_STD_K,
-                        _denoiserSettings.radianceClipStdK) &&
-           QueryDefault(FFX_API_CONFIGURE_DENOISER_KEY_GAUSSIAN_KERNEL_RELAXATION,
-                        _denoiserSettings.gaussianKernelRelaxation) &&
-           QueryDefault(FFX_API_CONFIGURE_DENOISER_KEY_DISOCCLUSION_THRESHOLD,
-                        _denoiserSettings.disocclusionThreshold);
+        LOG_ERROR("Failed to query FSR-RR setting {}: {}", result.key,
+                  FfxApiProxy::ReturnCodeToString(result.code));
+        return false;
+    }
+    return true;
 }
 
 void FSRDFeatureDx12::DestroyDenoiserContext()
 {
-    if (_pDenoiserCtx != nullptr)
-    {
-        FfxApiProxy::D3D12_DestroyContext(&_pDenoiserCtx, nullptr);
-        _pDenoiserCtx = nullptr;
-    }
+    _denoiser.Destroy();
 }
 
 bool FSRDFeatureDx12::UpdateSize(const NVSDK_NGX_Parameter* parameters)
@@ -799,6 +776,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         };
         XMFLOAT4X4 previousProjection;
         XMStoreFloat4x4(&previousProjection, XMMatrixTranspose(_prevProjMatrix));
+        const auto& settings = _denoiser.Settings();
         nlohmann::json metadata = {
             {"render_size", {RenderWidth(), RenderHeight()}},
             {"display_size", {DisplayWidth(), DisplayHeight()}},
@@ -856,9 +834,9 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
                 {"camera_fov_vertical", denoiserDesc.cameraFovAngleVertical}
             }},
             {"amd_settings", {
-                {"1", _denoiserSettings.crossBilateralNormalStrength}, {"2", _denoiserSettings.stabilityBias},
-                {"3", _denoiserSettings.maxRadiance}, {"4", _denoiserSettings.radianceClipStdK},
-                {"5", _denoiserSettings.gaussianKernelRelaxation}, {"6", _denoiserSettings.disocclusionThreshold}
+                {"1", settings.crossBilateralNormalStrength}, {"2", settings.stabilityBias},
+                {"3", settings.maxRadiance}, {"4", settings.radianceClipStdK},
+                {"5", settings.gaussianKernelRelaxation}, {"6", settings.disocclusionThreshold}
             }},
             {"amd_provider_id", _denoiserProviderId},
             {"amd_provider_version", _denoiserProviderName},
@@ -1504,49 +1482,21 @@ bool FSRDFeatureDx12::ConvertDenoiserBuffers(ID3D12GraphicsCommandList* InComman
 bool FSRDFeatureDx12::ConfigureDenoiser()
 {
     const auto& cfg = *Config::Instance();
-
-    const auto Configure = [this](const CustomOptional<float>& cfgValue, float& currentValue,
-                                  FfxApiConfigureDenoiserKey key)
-    {
-        const float requestedValue = cfgValue.value_or_default();
-
-        if (requestedValue == currentValue)
-            return true;
-
-        ffxConfigureDescDenoiserKeyValue cfgDesc = {
-            .header = { .type = FFX_API_CONFIGURE_DESC_TYPE_DENOISER_KEYVALUE },
-            .key = static_cast<uint64_t>(key),
-            .count = 1,
-            .data = &requestedValue
-        };
-
-        const auto result = FfxApiProxy::D3D12_Configure(&_pDenoiserCtx, &cfgDesc.header);
-
-        if (result != FFX_API_RETURN_OK)
-        {
-            LOG_ERROR("Failed to configure FSR-RR setting {}: {}", static_cast<uint64_t>(key),
-                      FfxApiProxy::ReturnCodeToString(result));
-            return false;
-        }
-
-        currentValue = requestedValue;
-        return true;
+    const FSRD::DenoiserSettings requested = {
+        .crossBilateralNormalStrength = cfg.FfxDenoiserCrossBlNormStr.value_or_default(),
+        .stabilityBias = cfg.FfxDenoiserStabilityBias.value_or_default(),
+        .maxRadiance = cfg.FfxDenoiserMaxRadiance.value_or_default(),
+        .radianceClipStdK = cfg.FfxDenoiserRadianceClip.value_or_default(),
+        .gaussianKernelRelaxation = cfg.FfxDenoiserGaussKernRelax.value_or_default(),
+        .disocclusionThreshold = cfg.FfxDenoiserDisocclusionThreshold.value_or_default()
     };
-
-    if (!Configure(cfg.FfxDenoiserCrossBlNormStr, _denoiserSettings.crossBilateralNormalStrength,
-                   FFX_API_CONFIGURE_DENOISER_KEY_CROSS_BILATERAL_NORMAL_STRENGTH) ||
-        !Configure(cfg.FfxDenoiserStabilityBias, _denoiserSettings.stabilityBias,
-                   FFX_API_CONFIGURE_DENOISER_KEY_STABILITY_BIAS) ||
-        !Configure(cfg.FfxDenoiserMaxRadiance, _denoiserSettings.maxRadiance,
-                   FFX_API_CONFIGURE_DENOISER_KEY_MAX_RADIANCE) ||
-        !Configure(cfg.FfxDenoiserRadianceClip, _denoiserSettings.radianceClipStdK,
-                   FFX_API_CONFIGURE_DENOISER_KEY_RADIANCE_CLIP_STD_K) ||
-        !Configure(cfg.FfxDenoiserGaussKernRelax, _denoiserSettings.gaussianKernelRelaxation,
-                   FFX_API_CONFIGURE_DENOISER_KEY_GAUSSIAN_KERNEL_RELAXATION) ||
-        !Configure(cfg.FfxDenoiserDisocclusionThreshold, _denoiserSettings.disocclusionThreshold,
-                   FFX_API_CONFIGURE_DENOISER_KEY_DISOCCLUSION_THRESHOLD))
+    const auto result = _denoiser.Configure(requested);
+    if (result.code != FFX_API_RETURN_OK)
+    {
+        LOG_ERROR("Failed to configure FSR-RR setting {}: {}", result.key,
+                  FfxApiProxy::ReturnCodeToString(result.code));
         return false;
-
+    }
     return true;
 }
 
@@ -1555,7 +1505,7 @@ bool FSRDFeatureDx12::DispatchDenoiser(ID3D12GraphicsCommandList* InCommandList,
 {
     auto& state = State::Instance();
     LOG_DEBUG("Dispatching FSR-RR...");
-    const ffxReturnCode_t result = FfxApiProxy::D3D12_Dispatch(&_pDenoiserCtx, &dispatchDesc.header);
+    const ffxReturnCode_t result = _denoiser.Dispatch(dispatchDesc);
 
     if (result != FFX_API_RETURN_OK)
     {

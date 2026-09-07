@@ -3,6 +3,7 @@
 #include "shaders/fsrd_preprocess/FSRDPreprocessor_Dx12.h"
 #include "fsr-rr/ffx_denoiser.h"
 #include "FSRDDiagnostics.h"
+#include "FSRDDenoiserCore.h"
 #include <DirectXMath.h>
 
 /**
@@ -31,20 +32,9 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     FSRD::Diagnostics* GetFsrRRDiagnostics() override { return &_diagnostics; }
 
   private:
-    struct DenoiserSettings
-    {
-        float crossBilateralNormalStrength {};
-        float stabilityBias {};
-        float maxRadiance {};
-        float radianceClipStdK {};
-        float gaussianKernelRelaxation {};
-        float disocclusionThreshold {};
-    };
-
-    ffxContext _pDenoiserCtx;
+    FSRD::DenoiserCore<FfxApiProxy> _denoiser;
     feature_version _denoiserVersion {};
     ffxCreateContextDescDenoiser _denoiserCtxDesc;
-    DenoiserSettings _denoiserSettings;
     uint64_t _denoiserProviderId = 0;
     std::string _denoiserProviderName;
     bool _isInReset;

@@ -137,7 +137,8 @@ class Diagnostics(unittest.TestCase):
             self.assertIn(f'{{"{field}"', evaluate)
         for key, name in enumerate(("crossBilateralNormalStrength", "stabilityBias", "maxRadiance",
                                     "radianceClipStdK", "gaussianKernelRelaxation", "disocclusionThreshold"), 1):
-            self.assertIn(f'{{"{key}", _denoiserSettings.{name}}}', evaluate)
+            self.assertIn(f'{{"{key}", settings.{name}}}', evaluate)
+        self.assertIn("const auto& settings = _denoiser.Settings();", evaluate)
 
 
 if __name__ == "__main__":
