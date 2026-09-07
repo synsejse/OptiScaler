@@ -307,6 +307,28 @@ int main(){
   assert(FSRDSubmission::pending && FSRDSubmission::pending->owners.size()==1);
   FSRDSubmission::pending.reset();assert(Fake::liveResources==0);
  }
+ // Production's same-list ticket also owns a lighting plan which owns this
+ // Work. The completion observer must not form Ticket -> Plan -> Work -> Ticket.
+ {Fixture f;auto w=f.prepare();assert(w->Record(f.list.Get()));
+  struct LightingPlan{std::shared_ptr<Work> rays;};
+  auto lighting=std::make_shared<LightingPlan>();lighting->rays=w;
+  auto ticket=w->CompletionTicket();assert(ticket==FSRDSubmission::pending);
+  ticket->owners.push_back(lighting);
+  std::weak_ptr<Work> observedWork=w;
+  std::weak_ptr<LightingPlan> observedPlan=lighting;
+  std::weak_ptr<FSRDSubmission::Ticket> observedTicket=ticket;
+  f.sources={};lighting.reset();w.reset();ticket.reset();
+  assert(!observedWork.expired()&&!observedPlan.expired()&&Fake::liveResources==4);
+  FSRDSubmission::pending.reset(); // Mock the registry's successful-fence retirement.
+  assert(observedTicket.expired()&&observedPlan.expired()&&observedWork.expired());
+  assert(Fake::liveResources==0);
+ }
+ // A controller-held receipt still retains the producer after registry retirement.
+ {Fixture f;auto w=f.prepare();assert(!w->CompletionTicket());assert(w->Record(f.list.Get()));
+  auto controllerReceipt=w->CompletionTicket();assert(controllerReceipt);
+  f.sources={};w.reset();FSRDSubmission::pending.reset();assert(Fake::liveResources==4);
+  controllerReceipt.reset();assert(Fake::liveResources==0);
+ }
  for(unsigned badList=0;badList<4;++badList){Fixture f;auto w=f.prepare();
   ComPtr<ID3D12Device> other=new ID3D12Device;
   ComPtr<ID3D12GraphicsCommandList> foreign=new ID3D12GraphicsCommandList(other.Get());

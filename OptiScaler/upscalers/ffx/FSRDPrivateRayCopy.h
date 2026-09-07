@@ -56,6 +56,9 @@ class Work
     bool Recorded() const noexcept;
     std::string_view Error() const noexcept;
     const Textures& Outputs() const noexcept;
+    // Weak observation only. The non-GPU-retained controller must obtain its
+    // strong receipt before sealing/submitting the producer. Expiry is NOT an
+    // independent GPU-completion attestation.
     std::shared_ptr<FSRDSubmission::Ticket> CompletionTicket() const noexcept;
 
   private:

@@ -448,6 +448,7 @@ struct PrivateResetPacket
     WindowPolicy::FrameKey temporalKey {};
     std::shared_ptr<TemporalCharge> charge;
     std::shared_ptr<RayCopyBundle> rayCopy;
+    std::shared_ptr<FSRDSubmission::Ticket> producerTicket;
     std::shared_ptr<FSRDSubmission::Ticket> finalTicket;
     std::optional<ResetSource::TemporalSource> timedSource;
     double fogTimestamp = 0, previousFogTimestamp = 0;
@@ -2350,7 +2351,15 @@ void FinishRayCopy(const std::shared_ptr<RayCopyBundle>& plan)
     if (plan->packet && plan->packet->temporal)
     {
         std::lock_guard lock(plan->packet->mutex);
-        if (plan->recorded) plan->packet->rayCopy = plan; // One immutable bundle per selected frame.
+        if (plan->recorded)
+        {
+            // Only the non-GPU-retained packet owns this receipt. Lighting's
+            // same-list ticket may own plan/Work, so Work keeps a weak link.
+            plan->packet->producerTicket = plan->work->CompletionTicket();
+            if (!plan->packet->producerTicket)
+                throw std::runtime_error("ray producer completion receipt lost before seal");
+            plan->packet->rayCopy = plan; // One immutable bundle per selected frame.
+        }
     }
     else
     {
@@ -5968,7 +5977,7 @@ bool RetireUnrecordedTemporalFrame(TemporalWindow& window, const std::shared_ptr
     auto& slot = window.frames[frame->temporalKey.index % window.frames.size()];
     if (slot.get() != frame.get() || slot.use_count() != 2 || !window.policy ||
         window.returnEvidencePending || frame->producer.list || frame->consumer.list ||
-        frame->rayTerminal || frame->guideBegin || frame->rayCopy || frame->finalTicket || frame->denoise ||
+        frame->rayTerminal || frame->guideBegin || frame->rayCopy || frame->producerTicket || frame->finalTicket || frame->denoise ||
         frame->sceneRecorded || frame->consumerSealed || frame->returned || frame->retired ||
         !window.policy->RetireUnrecordedFrame(frame->temporalKey, true)) return false;
     std::erase(window.liveFrames, frame.get());
@@ -6018,8 +6027,7 @@ void MaintainTemporalWindow(TemporalWindow& window)
             std::lock_guard lock(frame->mutex);
             if (frame->retired || (!frame->returned && !unusedProducer)) continue;
             ticket = frame->finalTicket;
-            if (unusedProducer && frame->rayCopy && frame->rayCopy->work)
-                producerTicket = frame->rayCopy->work->CompletionTicket();
+            producerTicket = frame->producerTicket;
         }
         if (unusedProducer)
         {
@@ -6037,6 +6045,7 @@ void MaintainTemporalWindow(TemporalWindow& window)
             frame->unusedProducer = unusedProducer;
             targets = { std::move(frame->guides), std::move(frame->rays), std::move(frame->charge) };
             work = std::move(frame->denoise); rays = std::move(frame->rayCopy);
+            frame->producerTicket.reset(); // producerTicket local keeps COM owners outside this lock.
             frame->finalTicket.reset(); // ticket local keeps COM-backed storage out of this lock.
         }
         // Locals release here, outside controller/frame locks. A ticket-owned

@@ -62,7 +62,7 @@ class VisualTest(unittest.TestCase):
         compiler = os.environ.get('CXX') or shutil.which('c++')
         if not compiler:
             self.skipTest('Set CXX for actual visual host retirement checks')
-        function = section('void RetireVisualWatch(', 'void MaintainTemporalWindow(')
+        function = section('void RetireVisualWatch(', 'bool RetireUnrecordedTemporalFrame(')
         mocks = r'''
 #include "FSRDCyberpunkTemporalWindowPolicy.h"
 #include <atomic>

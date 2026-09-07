@@ -86,7 +86,7 @@ struct PrivateResetPacket{
  std::mutex mutex;bool retired=false,returned=true,unusedProducer=false;
  bool sceneRecorded=false,consumerSealed=false;
  uint64_t rayTerminal=0,guideBegin=0;
- std::shared_ptr<int> rayCopy,finalTicket,denoise;
+ std::shared_ptr<int> rayCopy,producerTicket,finalTicket,denoise;
  ResetPolicy::Recording producer{},consumer{};WindowPolicy::FrameKey temporalKey{};
 };
 struct TemporalWindow{
@@ -175,7 +175,7 @@ int main(){
   *value=1;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));*value=0;}
  for(auto* recording:{&abandoned->producer,&abandoned->consumer}){
   *recording={100,1};assert(!RetireUnrecordedTemporalFrame(empty,abandoned));*recording={};}
- for(auto* owner:{&abandoned->rayCopy,&abandoned->finalTicket,&abandoned->denoise}){
+ for(auto* owner:{&abandoned->rayCopy,&abandoned->producerTicket,&abandoned->finalTicket,&abandoned->denoise}){
   *owner=std::make_shared<int>(0);assert(!RetireUnrecordedTemporalFrame(empty,abandoned));owner->reset();}
  empty.returnEvidencePending=1;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));empty.returnEvidencePending=0;
  empty.continuous=false;assert(!RetireUnrecordedTemporalFrame(empty,abandoned));empty.continuous=true;

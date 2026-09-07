@@ -109,7 +109,9 @@ std::shared_ptr<Targets> AllocateTargets(ID3D12Device* device, UINT width, UINT 
 
 struct Work::Impl
 {
-    std::shared_ptr<FSRDSubmission::Ticket> ticket;
+    // The same submission ticket can also retain a lighting plan owning this
+    // Work. A strong back-edge here would keep all those GPU buffers forever.
+    std::weak_ptr<FSRDSubmission::Ticket> ticket;
     std::shared_ptr<Lease> lease;
     UINT width = 0, height = 0;
     const char* error = "";
@@ -122,7 +124,7 @@ Work::~Work() = default;
 bool Work::Recorded() const noexcept { return _impl->recorded; }
 std::string_view Work::Error() const noexcept { return _impl->error; }
 const Textures& Work::Outputs() const noexcept { return _impl->lease->outputs; }
-std::shared_ptr<FSRDSubmission::Ticket> Work::CompletionTicket() const noexcept { return _impl->ticket; }
+std::shared_ptr<FSRDSubmission::Ticket> Work::CompletionTicket() const noexcept { return _impl->ticket.lock(); }
 
 std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
                               const Textures& sources, const char** error) noexcept
