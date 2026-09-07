@@ -4810,8 +4810,12 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
                 authenticatedImage.load() != uintptr_t(GetModuleHandleW(nullptr)) || std::filesystem::file_size(path) > 4096)
                 throw std::runtime_error("private RESET requires an unused authenticated capture session");
             Json controls;
-            std::ifstream file(path, std::ios::binary);
-            file >> controls;
+            {
+                // Windows file streams do not share DELETE access. Close the
+                // reader before consuming this request with DeleteFileW below.
+                std::ifstream file(path, std::ios::binary);
+                file >> controls;
+            }
             if (controls.at("mode") != "private_reset_only" ||
                 controls.at("delta_source") != "explicit_reset_control_not_captured_duration")
                 throw std::runtime_error("private RESET requires explicit private-only experiment controls");
@@ -4855,8 +4859,9 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
             }
             if (!DeleteFileW(path.c_str()))
             {
+                const auto error = GetLastError();
                 FSRDFogLayerCapture::CancelEarlyGuideRequest(); FSRDFogLayerCapture::CancelRequest();
-                throw std::runtime_error("private RESET marker could not be consumed");
+                throw std::runtime_error(std::format("private RESET marker could not be consumed (Win32 {})", error));
             }
             privateResetPacket.store(packet.release(), std::memory_order_release);
             lightingRequestedAt.store(GetTickCount64());

@@ -77,6 +77,16 @@ class PrivateResetHost(unittest.TestCase):
         feature = (BASE / 'FSRDFeature_Dx12.cpp').read_text()
         self.assertRegex(feature, r'if \(_denoiser.IsCreated\(\)\)\s*FSRDCyberpunkFogProbe::ArmPrivateReset\(')
 
+    def test_request_reader_lifetime_ends_before_windows_delete(self):
+        arm = body(HOST, 'void ArmPrivateReset(', 'uint64_t AdmitPrivateResetSubmission(')
+        # CRT ifstream does not share DELETE access on Windows. Preserve the
+        # actual lexical reader lifetime; successful JSON parsing alone cannot
+        # make DeleteFileW succeed while that stream remains alive.
+        reader = re.search(r'\{\s*(?://[^\n]*\n\s*)*std::ifstream file\(path, std::ios::binary\);\s*file >> controls;\s*\}', arm)
+        self.assertIsNotNone(reader)
+        self.assertLess(reader.end(), arm.index('DeleteFileW(path.c_str())'))
+        self.assertIn('const auto error = GetLastError();', arm)
+
     def test_producer_and_consumer_are_sealed_only_after_restored_readbacks(self):
         lighting = body(HOST, 'void FinishLightingCapture(', 'bool HasBoundCb12Psos(')
         self.assertLess(lighting.index('FSRDSubmission::Retain('), lighting.index('RecordPrivateCompute('))
