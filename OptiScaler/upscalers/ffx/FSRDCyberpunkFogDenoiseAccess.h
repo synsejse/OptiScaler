@@ -9,13 +9,18 @@ namespace FSRD::CyberpunkFogDenoiseAccess
 {
 namespace Engine = CyberpunkEngineAccess;
 
-// Reuse the exact native scope/getter/state/flush/reentry bodies. The transition
-// queue helper is authenticated too; this does not authenticate every transitive
-// driver/allocator target or protect against concurrent code patching.
-inline constexpr std::array<Engine::CodeRange, 12> Code {
+inline constexpr uintptr_t FlushGraphicsTablesRva = 0x1f22e4;
+// Reuse the exact native scope/getter/state/flush/reentry bodies, plus the
+// graphics dynamic-table flush and all of its directly branched cold chunks.
+// This does not authenticate every transitive driver/allocator target or protect
+// against concurrent code patching. Native descriptor-ring allocation remains
+// owned by the engine, just as in its ordinary graphics draw preparation.
+inline constexpr std::array<Engine::CodeRange, 14> Code {
     Engine::Code[0], Engine::Code[1], Engine::Code[2], Engine::Code[3],
     Engine::Code[4], Engine::Code[5], Engine::Code[6], Engine::Code[7],
-    Engine::Code[8], Engine::Code[9], Engine::Code[10], Engine::BufferCode[1] };
+    Engine::Code[8], Engine::Code[9], Engine::Code[10], Engine::BufferCode[1],
+    { FlushGraphicsTablesRva, 0x4dc, "f4a5782e0cead125409e02ce0ff209aa5468564dc286cd1403798a1bb18f8bfc" },
+    { 0x1e3d3ae, 0xd3, "d3e50b16ded932a6705c42e857498792ca5f92b31694cc70699ed9049b160c35" } };
 static_assert(Code[3].rva == Engine::RequestStateRva && Code[5].rva == Engine::FlushRva &&
               Code[9].rva == Engine::ReenterRva && Code[11].rva == 0x1f483c);
 inline constexpr uint32_t CopySourceState = 0x800;
@@ -123,13 +128,19 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
 // - That host gate repeats ORIGINAL-use receipts/current identities, not a claim
 //   that the original native bindings remain installed during private compute.
 //   Reentry legitimately dirties engine binding caches; do not require clean range
-//   flags after it. The original engine context/cache/PSO identities remain fixed.
+//   flags until the final graphics-table flush. The original engine context/cache/
+//   layout/CPU descriptor identities remain fixed; native descriptor-ring growth,
+//   heap selection and cursor changes during the flush are legitimate.
 // - Optional IsTextureResidencyAdmitted must re-prove existing current membership
 //   through the authenticated residency path; unknown/nonregistered paths refuse.
 // - Native ABI adapters are noexcept: CurrentNativeList is void*(), RequestState
 //   is void(context*,uint32 handle,uint32 state,uint32 subresource), Flush is
-//   void(context*), Reenter is void(list*). RestorePso calls the real original
-//   list SetPipelineState; it does not merely change an engine cache pointer.
+//   void(context*), Reenter is void(list*), FlushGraphicsTables invokes
+//   void(cache*,context*,false), exactly as the original graphics preamble does.
+//   RestorePso calls the real original list SetPipelineState; it does not merely
+//   change an engine cache pointer. OriginalFogDepthTableRestored additionally
+//   verifies the saved pixel-t0 range/current CPU descriptor and clean range bits;
+//   it is a postcondition, not a replacement for the complete native table flush.
 // - privateWork is synchronous and PRIVATE-output-only, may change native compute
 //   roots/heaps/PSO, and retains every recording owner before first use. It does
 //   not change OM/RS, original resource states, engine memory/TLS/cache or call game
@@ -147,6 +158,8 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
     static_assert(noexcept(host.Flush(uintptr_t {}, uintptr_t {})));
     static_assert(noexcept(host.Reenter(uintptr_t {}, uintptr_t {})));
     static_assert(noexcept(host.RestorePso(uintptr_t {}, uintptr_t {})));
+    static_assert(noexcept(host.FlushGraphicsTables(uintptr_t {}, uintptr_t {}, uintptr_t {})));
+    static_assert(noexcept(host.OriginalFogDepthTableRestored(uintptr_t {}, uintptr_t {})));
     Result result;
     Detail::Saved saved;
     if (!Detail::Prepare(host, input, saved)) return result;
@@ -177,8 +190,12 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;
     }
-    // Reentry restores roots/heaps/tables, but not PSO and not cached PSO identity.
-    // Check the original scope again before/after each step, including false/throw.
+    // Reentry restores roots/heaps/GLOBAL tables, but only dirties dynamic tables.
+    // Changing descriptor heaps invalidates native graphics descriptor-table state.
+    // This scope is AFTER original draw preparation, so no later engine preparation
+    // will repair those tables before the raw original Fog draw resumes. Restore
+    // the original PSO and run the exact native graphics dynamic-table flush too.
+    // Check the original scope before/after each step, including false/throw.
     host.Reenter(input.image + Engine::ReenterRva, input.list);
     if (!Detail::SameScope(host, input, saved))
     {
@@ -187,6 +204,13 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
     }
     host.RestorePso(input.list, input.originalPso);
     if (!Detail::SameScope(host, input, saved))
+    {
+        result.outcome = Outcome::ScopeLostAfterMutation;
+        return result;
+    }
+    host.FlushGraphicsTables(input.image + FlushGraphicsTablesRva, saved.cache, saved.context);
+    if (!Detail::SameScope(host, input, saved) ||
+        !host.OriginalFogDepthTableRestored(saved.cache, saved.context))
     {
         result.outcome = Outcome::ScopeLostAfterMutation;
         return result;

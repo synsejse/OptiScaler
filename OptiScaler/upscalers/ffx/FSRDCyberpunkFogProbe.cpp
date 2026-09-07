@@ -3730,6 +3730,23 @@ struct FogDepthEngineHost
     { reinterpret_cast<void(__fastcall*)(ID3D12GraphicsCommandList*)>(p)(reinterpret_cast<ID3D12GraphicsCommandList*>(list)); }
     void RestorePso(uintptr_t list, uintptr_t pso) noexcept
     { originalSetPso(reinterpret_cast<ID3D12GraphicsCommandList*>(list), reinterpret_cast<ID3D12PipelineState*>(pso)); }
+    void FlushGraphicsTables(uintptr_t p, uintptr_t cache, uintptr_t engine) noexcept
+    {
+        reinterpret_cast<void(__fastcall*)(void*, void*, bool)>(p)(
+            reinterpret_cast<void*>(cache), reinterpret_cast<void*>(engine), false);
+    }
+    bool OriginalFogDepthTableRestored(uintptr_t cache, uintptr_t engine) noexcept
+    {
+        const auto& d = plan.depthSnapshot;
+        uint8_t rangeIndex = 0;
+        std::array<uint8_t, 16> range {};
+        uint64_t dirty70 = 0, dirty78 = 0;
+        return cache == d.cache && engine == d.scope.engine && d.rangeIndex < 64 &&
+            SameFogDepthSource(plan) && ReadEarlyAt(d.layout, 0x5c3, rangeIndex) && rangeIndex == d.rangeIndex &&
+            ReadEarlyAt(d.layout, 0x38 + uintptr_t(d.rangeIndex) * 16, range) && range == d.range &&
+            ReadEarlyAt(cache, 0x70, dirty70) && ReadEarlyAt(cache, 0x78, dirty78) &&
+            !((dirty70 | dirty78) & (uint64_t(1) << d.rangeIndex));
+    }
 };
 
 void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)

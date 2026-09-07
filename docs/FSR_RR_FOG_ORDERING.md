@@ -90,6 +90,20 @@ remain unchanged. The private context resets once with explicit experimental
 duration; no late temporal history is borrowed. Continuous history and the
 early-RR/late-SR handoff remain separate work before a live image correction.
 
+The first `269a1f93` build was deliberately **not armed** after review found a
+pre-Fog binding-restoration gap. Private compute switches descriptor heaps;
+Cyberpunk's SDK re-entry restores heaps, roots and global tables but only marks
+dynamic tables dirty. Resuming the already-prepared raw Fog draw also requires
+the engine's authenticated dynamic resource/sampler table flush. The repair calls
+that native flush with the unchanged current cache/context and graphics selector,
+authenticates its hot/cold bodies before mutation, and verifies the original t0
+range is clean and still names the captured source. Failure after mutation is
+fatal to the diagnostic recording. Merely resetting the original PSO is
+insufficient under the [D3D12 descriptor heap contract](https://learn.microsoft.com/en-us/windows/win32/direct3d12/setting-descriptor-heaps).
+Earlier copy-only Fog/depth captures did not switch descriptor heaps, and the
+post-lighting compute path resumed normal engine draw preparation later. This
+distinction must be covered before accepting the private pre-Fog GPU result.
+
 ### Earlier exploratory controls
 
 The exact installed executable and shader-cache identities are recorded in

@@ -28,11 +28,13 @@ class FogDenoiseAccess(unittest.TestCase):
         self.assertEqual(text.count('host.Flush(input.image'), 1)
         self.assertEqual(text.count('host.Reenter(input.image'), 1)
         self.assertEqual(text.count('host.RestorePso(input.list'), 1)
+        self.assertEqual(text.count('host.FlushGraphicsTables(input.image'), 1)
         record = text.split('Result RecordPrivateCompute', 1)[1]
         self.assertLess(record.index('Detail::Prepare'), record.index('host.RequestState(input.image'))
         self.assertLess(record.index('catch (...)'), record.index('host.Reenter(input.image'))
         self.assertLess(record.index('host.Reenter(input.image'), record.index('host.RestorePso(input.list'))
-        self.assertLess(record.index('host.RestorePso(input.list'), record.index('result.bindingsRestored = true'))
+        self.assertLess(record.index('host.RestorePso(input.list'), record.index('host.FlushGraphicsTables(input.image'))
+        self.assertLess(record.index('host.FlushGraphicsTables(input.image'), record.index('result.bindingsRestored = true'))
 
     def test_actual_protocol_O0_O3_fast_refusals_restoration_and_scope_loss(self):
         compiler = os.environ.get('CXX') or shutil.which('c++')
@@ -58,7 +60,7 @@ struct Host {
  uint32_t expectedReadState=0xc0;
  bool image=true,scope=true,direct=true,readable=true,throwRead=false,resident=false;
  bool actualDepth=true,bundle=true,camera=true,reset=true,noAliases=true,noPredicate=true;
- bool retainKind3=false,loseOnGetter=false,cacheDirty=false;
+ bool retainKind3=false,loseOnGetter=false,cacheDirty=false,repairTables=true,originalTableReceipt=true;
  unsigned codeChecks=0,badCode=99,operations=0,loseAfter=0,getters=0,residencyChecks=0;
  template<class T>void Put(uintptr_t a,const T& value){
   auto& bytes=memory[a];bytes.resize(sizeof(value));std::memcpy(bytes.data(),&value,sizeof(value));
@@ -107,6 +109,13 @@ struct Host {
  void RestorePso(uintptr_t list,uintptr_t pso)noexcept{
   assert(list==List&&pso==Pso);events.push_back('p');nativePso=pso;Step();
  }
+ void FlushGraphicsTables(uintptr_t entry,uintptr_t cache,uintptr_t context)noexcept{
+  assert(entry==Image+0x1f22e4&&cache==Cache&&context==Engine);
+  assert(cacheDirty&&nativePso==Pso);events.push_back('g');if(repairTables)cacheDirty=false;Step();
+ }
+ bool OriginalFogDepthTableRestored(uintptr_t cache,uintptr_t context)noexcept{
+  assert(cache==Cache&&context==Engine);return originalTableReceipt&&!cacheDirty;
+ }
 };
 F::Input Setup(Host& h){
  h=Host{};F::Input input{Image,List,Pso,77,{1,Depth}};
@@ -133,6 +142,8 @@ struct LegacyHost {
  void Flush(uintptr_t a,uintptr_t c)noexcept{h.Flush(a,c);}
  void Reenter(uintptr_t a,uintptr_t l)noexcept{h.Reenter(a,l);}
  void RestorePso(uintptr_t l,uintptr_t p)noexcept{h.RestorePso(l,p);}
+ void FlushGraphicsTables(uintptr_t a,uintptr_t c,uintptr_t e)noexcept{h.FlushGraphicsTables(a,c,e);}
+ bool OriginalFogDepthTableRestored(uintptr_t c,uintptr_t e)noexcept{return h.OriginalFogDepthTableRestored(c,e);}
 };
 int main(){
  assert(!F::Input{}.copySource);
@@ -143,13 +154,22 @@ int main(){
  auto work=[&]{h.events.push_back('c');h.nativePso=0xabcd;h.Step();return true;};
  auto r=F::RecordPrivateCompute(h,input,work);
  assert(r.outcome==F::Outcome::PrivateRecordedRestored&&r.requestsIssued==1&&r.callbackEntered&&r.bindingsRestored);
- assert(h.getters==1&&h.codeChecks==12&&h.nativePso==Pso&&h.cacheDirty);
- assert((h.events==std::vector<char>{'d','f','c','r','p'}));
+ assert(h.getters==1&&h.codeChecks==14&&h.nativePso==Pso&&!h.cacheDirty);
+ assert((h.events==std::vector<char>{'d','f','c','r','p','g'}));
  for(bool throws:{false,true}){
   input=Setup(h);r=F::RecordPrivateCompute(h,input,[&]()->bool{
    h.events.push_back('c');h.nativePso=0xabcd;if(throws)throw std::runtime_error("partial");return false;});
   assert(r.outcome==F::Outcome::PrivateFailedRestored&&r.callbackEntered&&r.bindingsRestored&&h.nativePso==Pso);
-  assert((h.events==std::vector<char>{'d','f','c','r','p'}));
+  assert(!h.cacheDirty);
+  assert((h.events==std::vector<char>{'d','f','c','r','p','g'}));
+ }
+ // A native call returning is not a binding receipt. Reject both missing
+ // dynamic-table repair and a changed original pixel-t0 descriptor receipt.
+ for(bool missingRepair:{false,true}){
+  input=Setup(h);h.repairTables=!missingRepair;h.originalTableReceipt=missingRepair;
+  r=F::RecordPrivateCompute(h,input,work);
+  assert(r.outcome==F::Outcome::ScopeLostAfterMutation&&!r.bindingsRestored&&r.callbackEntered);
+  assert((h.events==std::vector<char>{'d','f','c','r','p','g'}));
  }
  for(unsigned bad=0;bad<34;++bad){
   input=Setup(h);
@@ -183,9 +203,9 @@ int main(){
  input=Setup(h);{LegacyHost legacy{h};r=F::RecordPrivateCompute(legacy,input,work);assert(r.bindingsRestored);}
  input=Setup(h);h.Put(Slot+0x68,Depth);{LegacyHost legacy{h};r=F::RecordPrivateCompute(legacy,input,work);
   assert(r.outcome==F::Outcome::Refused&&h.events.empty());}
- // Scope loss after EACH request/flush/private/reentry/PSO operation is fatal,
+ // Scope loss after EACH request/flush/private/reentry/PSO/table operation is fatal,
  // with no later restore calls aimed at an unverified replacement context.
- for(unsigned step=1;step<=5;++step){input=Setup(h);h.loseAfter=step;
+ for(unsigned step=1;step<=6;++step){input=Setup(h);h.loseAfter=step;
   r=F::RecordPrivateCompute(h,input,work);
   assert(r.outcome==F::Outcome::ScopeLostAfterMutation&&!r.bindingsRestored&&r.requestsIssued==1);
   assert(h.events.size()==step&&r.callbackEntered==(step>=3));}
