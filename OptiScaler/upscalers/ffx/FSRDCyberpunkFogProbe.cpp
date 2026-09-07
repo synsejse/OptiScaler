@@ -6,6 +6,7 @@
 #include <Util.h>
 #include <resource_tracking/FSRDSubmission.h>
 #include <hooks/Hook_Utils.h>
+#include <hooks/StreamlineEvaluationProvenance.h>
 #include <detours/detours.h>
 #include <include/d3dx/d3dx12.h>
 #include <json.hpp>
@@ -1699,11 +1700,32 @@ CaptureCandidate ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource
 {
     if (!endpointActive.load(std::memory_order_acquire))
         return {}; // No COM calls, allocation, file polling or locks on the inactive path.
+    const auto slEvaluation = FSRD::SlEvaluationProvenance::Current();
     CaptureCandidate result;
     Metadata([&] {
         std::shared_ptr<EndpointTrace> trace;
         try
         {
+            // The real public SL token is useful only when this NGX call is
+            // synchronously nested in that invocation. No global-last fallback,
+            // pointer canonicalization claim, or Fog frame association follows.
+            const Json slProvenance = {
+                { "schema", "optiscaler.fsr_rr.sl_evaluation_scope.v1" },
+                { "observed", slEvaluation.observed },
+                { "frame_index", slEvaluation.observed ? Json(slEvaluation.frameIndex) : Json(nullptr) },
+                { "feature", slEvaluation.observed ? Json(slEvaluation.feature) : Json(nullptr) },
+                { "scope_depth", slEvaluation.depth },
+                { "viewport_status", FSRD::SlEvaluationProvenance::ViewportStatusName(slEvaluation.viewportStatus) },
+                { "viewport", slEvaluation.observed && slEvaluation.viewportStatus ==
+                    FSRD::SlEvaluationProvenance::ViewportStatus::Observed ? Json(slEvaluation.viewport) : Json(nullptr) },
+                { "command_buffer_address", slEvaluation.observed ?
+                    Json(std::format("{:x}", slEvaluation.commandBuffer)) : Json(nullptr) },
+                { "raw_command_buffer_equals_ngx_list", slEvaluation.observed ?
+                    Json(slEvaluation.commandBuffer == uintptr_t(list)) : Json(nullptr) },
+                { "command_buffer_canonical_identity", "not_established" },
+                { "fog_frame_association", "not_established" },
+                { "gpu_execution_order", "not_established" }
+            };
             const auto identity = EndpointListIdentity(list);
             Json record;
             auto& data = Data();
@@ -1726,6 +1748,7 @@ CaptureCandidate ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource
                     { "schema", "optiscaler.fsr_rr.fog_ngx_endpoint.v1" },
                     { "endpoint_index", index }, { "fog_origin", trace->fog },
                     { "feature_id", featureId }, { "rr_frame_index", frameIndex },
+                    { "sl_evaluation_scope", slProvenance },
                     { "render_extent", { renderWidth, renderHeight } },
                     { "command_list_address", std::format("{:x}", uintptr_t(list)) },
                     { "command_list_identity", std::format("{:x}", uintptr_t(identity.Get())) },
@@ -1750,6 +1773,7 @@ CaptureCandidate ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource
                         { "status", "unvalidated_candidate" }, { "session_key", trace->sessionKey },
                         { "process_id", GetCurrentProcessId() }, { "fog_scope_serial", trace->fog["scope_serial"] },
                         { "candidate_index", candidateIndex }, { "rr_feature", featureId }, { "rr_frame", frameIndex },
+                        { "sl_evaluation_scope", slProvenance },
                         { "fog_origin", trace->fog }, { "rr_command_list_identity", record["command_list_identity"] },
                         { "rr_recording_generation", generation }, { "rr_endpoint_ordinal", ordinal },
                         { "owned_resource_identity", record["color"]["canonical_identity"] },

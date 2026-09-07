@@ -19,6 +19,22 @@ def function(name):
 
 
 class FogProbe(unittest.TestCase):
+    def test_sl_token_is_only_nested_call_metadata_not_fog_frame_proof(self):
+        observer = function("ObserveNgxInput")
+        self.assertLess(observer.index("if (!endpointActive.load"),
+                        observer.index("SlEvaluationProvenance::Current()"))
+        self.assertEqual(observer.count("SlEvaluationProvenance::Current()"), 1)
+        self.assertEqual(observer.count('{ "sl_evaluation_scope", slProvenance }'), 2)
+        for field in ('"optiscaler.fsr_rr.sl_evaluation_scope.v1"',
+                      '"command_buffer_canonical_identity", "not_established"',
+                      '"fog_frame_association", "not_established"',
+                      '"raw_command_buffer_equals_ngx_list"'):
+            self.assertIn(field, observer)
+        self.assertIn('slEvaluation.observed ? Json(slEvaluation.frameIndex) : Json(nullptr)', observer)
+        # Token metadata must not turn a candidate into an accepted frame.
+        admission = observer.split("if (trace->candidates.size()", 1)[1].split("{", 1)[0]
+        self.assertNotIn("slEvaluation", admission)
+
     def test_opt_in_precedes_initialization_and_hooks_need_authentication(self):
         init = function("Initialize")
         self.assertLess(init.index("if (!enabled)"), init.index("std::call_once"))

@@ -57,6 +57,45 @@ struct Reader
     }
 };
 
+// Relative to the native-pointer slot (registry+0x2f1d8+index*0xb0).
+// 0x1f3a6c uses +0x30; t4's special 0x774be0 uses +0x38 instead.
+// Factory 0x2221f4 reads the compact descriptor at +0x4e. These are CPU
+// descriptor-handle integers/raw engine fields, not readable descriptors.
+Json DescriptorSources(Reader& read, uintptr_t nativeSlot)
+{
+    Json result = { { "status", "unavailable" }, { "descriptor_handles_dereferenced", false },
+        { "descriptor_contents", "not_observed" }, { "usable_srv", "not_established" },
+        { "native_view_format", "not_observed" }, { "resource_state", "not_observed" },
+        { "snapshot_atomic", false } };
+    try
+    {
+        const auto descriptors = read.Read<std::array<uintptr_t, 2>>(Address(nativeSlot, 0x30));
+        const auto requestedState = read.Read<uint32_t>(Address(nativeSlot, 0x48));
+        const auto compact = read.Read<std::array<uint8_t, 12>>(Address(nativeSlot, 0x4e));
+        const bool unchanged = descriptors == read.Read<std::array<uintptr_t, 2>>(Address(nativeSlot, 0x30)) &&
+            requestedState == read.Read<uint32_t>(Address(nativeSlot, 0x48)) &&
+            compact == read.Read<std::array<uint8_t, 12>>(Address(nativeSlot, 0x4e));
+        result["repeated_source_fields_equal"] = unchanged;
+        if (!unchanged)
+            throw std::runtime_error("texture descriptor-source fields changed during reads");
+        result["ordinary_cpu_srv_handle"] = descriptors[0];
+        result["alternate_cpu_srv_handle"] = descriptors[1];
+        result["requested_srv_state_mask"] = requestedState;
+        result["requested_state_semantics"] = "engine_SRV_request_mask_not_current_state";
+        result["raw_compact_descriptor_bytes"] = compact;
+        result["raw_array_size"] = uint32_t(compact[4]) | (uint32_t(compact[5]) << 8);
+        result["raw_dimension_mip_bits"] = compact[6];
+        result["raw_format_sample_bits"] = compact[7];
+        result["raw_flags_bits"] = uint32_t(compact[8]) | (uint32_t(compact[9]) << 8) |
+            (uint32_t(compact[10]) << 16) | (uint32_t(compact[11]) << 24);
+        // Zero, reserved bits and unsupported formats remain raw evidence.
+        // Do not turn creation-branch conditions into a live view claim.
+        result["status"] = "cpu_descriptor_sources_observed";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
 // RVA 0x20d268 only borrows a native address. RVA 0x21f980 establishes
 // the actual 32768-slot bound; 0x21c960/0x1fa164 increment/decrement the
 // signed slot refcount. Zero can already be queued for retirement. This
@@ -82,14 +121,16 @@ Json RegistryMapping(Reader& read, uintptr_t image, uint32_t handle)
         if (refs <= 0)
             throw std::runtime_error("texture slot has no observed positive reference count");
         const auto native = read.Read<uintptr_t>(nativeAddress);
+        if (!native)
+            throw std::runtime_error("native resource address unavailable");
+        auto descriptors = DescriptorSources(read, nativeAddress);
         const auto refsAfter = read.Read<int32_t>(refsAddress);
         result["ref_status_after"] = refsAfter;
         if (refs != refsAfter || native != read.Read<uintptr_t>(nativeAddress) ||
             registry != read.Read<uintptr_t>(Address(image, TextureRegistryRva)))
             throw std::runtime_error("texture registry changed during metadata reads");
-        if (!native)
-            throw std::runtime_error("native resource address unavailable");
         result["borrowed_native_address"] = native;
+        result["descriptor_sources"] = std::move(descriptors);
         result["status"] = "borrowed_address_observed";
     }
     catch (const std::exception& error) { result["reason"] = error.what(); }
@@ -547,9 +588,47 @@ template <typename T> Json UnsignedField(Reader& read, uintptr_t view, uintptr_t
     return result;
 }
 
-// RVA 0x1d4fdc0 obtains an explicit frame ID through context[0]'s virtual
-// slot +0x20, then returnedObject+0x1a0. Observe the route only: no virtual
-// call, no guessed returned object, and no inferred frame ID/token.
+// Observed virtual getter RVA 0x18ec810 is exactly:
+// 48 8d 41 10 c3 = lea rax,[rcx+0x10]; ret.
+// ApplyDLSS 0x1d4fe38 calls this slot and reads returnedObject+0x1a0 at
+// 0x1d4fe41. Reproduce only that bounded scalar source read, never the call.
+Json ExplicitFrameIdSource(Reader& read, const GraphContext& context, uintptr_t image,
+                           uintptr_t object, uintptr_t vtable, uintptr_t target)
+{
+    constexpr uintptr_t GetterRva = 0x18ec810, FrameIdObjectOffset = 0x1b0;
+    constexpr std::array<uint8_t, 5> GetterBytes = { 0x48, 0x8d, 0x41, 0x10, 0xc3 };
+    Json result = { { "status", "unavailable" }, { "getter_rva", GetterRva },
+        { "source_object_offset", FrameIdObjectOffset }, { "byte_size", 4 },
+        { "semantics", "CPU_source_for_later_explicit_Streamline_frame_ID" },
+        { "virtual_call_performed", false }, { "value_passed_to_streamline", "not_observed" },
+        { "frame_token", "not_observed" }, { "snapshot_atomic", false } };
+    try
+    {
+        if (target != Address(image, GetterRva))
+            throw std::runtime_error("frame-ID getter route not authenticated for scalar read");
+        const auto code = read.Read<std::array<uint8_t, 5>>(target);
+        if (code != GetterBytes)
+            throw std::runtime_error("frame-ID getter bytes differ from authenticated leaf");
+        const auto sourceAddress = Address(object, FrameIdObjectOffset);
+        const auto value = read.Read<uint32_t>(sourceAddress);
+        const bool unchanged = value == read.Read<uint32_t>(sourceAddress) &&
+            object == read.Read<uintptr_t>(Address(context.context, 0)) &&
+            vtable == read.Read<uintptr_t>(Address(object, 0)) &&
+            target == read.Read<uintptr_t>(Address(vtable, 0x20)) &&
+            code == read.Read<std::array<uint8_t, 5>>(target);
+        result["repeated_source_fields_equal"] = unchanged;
+        if (!unchanged)
+            throw std::runtime_error("frame-ID source or getter route changed during reads");
+        result["source_address"] = sourceAddress;
+        result["source_value"] = value;
+        result["status"] = "CPU_value_present";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
+// Observe any image-local virtual target, but expose an explicit frame-ID
+// source only through the exact authenticated leaf above. No virtual call.
 Json FrameIdVirtualRoute(Reader& read, const GraphContext& context, uintptr_t image)
 {
     Json result = { { "status", "unavailable" }, { "context_object_offset", 0 },
@@ -569,6 +648,7 @@ Json FrameIdVirtualRoute(Reader& read, const GraphContext& context, uintptr_t im
         result["target_address"] = target;
         result["target_rva"] = target - image;
         result["status"] = "image_local_target_observed";
+        result["explicit_frame_id_source"] = ExplicitFrameIdSource(read, context, image, object, vtable, target);
     }
     catch (const std::exception& error) { result["reason"] = error.what(); }
     return result;
@@ -669,7 +749,7 @@ std::string Describe(const void* context, uintptr_t authenticatedImageBase) noex
             inputs.push_back(Resolve(read, graph, 0x63bcf380, "t0_gbuffer0"));
             inputs.push_back(Resolve(read, graph, 0x64bcf513, "t1_gbuffer1"));
             inputs.push_back(Resolve(read, graph, 0x65bcf6a6, "t2_gbuffer2"));
-            inputs.push_back(Resolve(read, graph, 0x61f178d4, "t4_material_uint2"));
+            inputs.push_back(Resolve(read, graph, 0x61f178d4, "t4_material_class_stencil_view"));
             const auto extra = ExtraSpecular(read, graph, features);
             inputs.push_back(extra);
             auto depth = Resolve(read, graph, 0xdebf0c27, "depth");

@@ -686,6 +686,18 @@ is in degrees; the earlier `fov_radians` diagnostic label was incorrect. The
 production AMD dispatch still derives its FOV from projection coefficients,
 so correcting the label does not change that dispatch.
 
+Live build `582a149a`, capture `fog-20260907-050934-789Z-324`, verifies that
+recipe against the actual bound GPU words: all 16 matrix components and all
+four dimension/reciprocal components match **bit-for-bit**. The comparison uses
+the current callback's raw view-owned source rows, the authenticated separate
+float32 multiply/add order, and no fitted transform or previous-frame camera.
+This result validates this captured producer recipe; it does not by itself
+validate the camera-position binding, the early guide pixels, or a same-frame
+join with either subsequent NGX capture. All six selected graph-backed inputs
+also lie within their observed compiler reservation intervals and before the
+original end event. Compiler reservation is not GPU initialization, resource
+state, or full alias-lifetime proof.
+
 The metadata also records borrowed native resource addresses from the exact
 32,768-slot engine texture registry, bounded by the authenticated slot layout.
 Positive reference counts and repeated reads are required to emit an address,
@@ -706,3 +718,38 @@ hardware-depth-zero pixels (20.3861% in frame 10122), preserving their pre-fog
 RGB. The good sky result is therefore not proof of successful AMD sky denoising.
 Primary emission has not been separated from valid-surface pre-fog RGB; a bright
 pixel threshold would not establish that semantic and is not used as a fix.
+
+### Early guide descriptor and frame-provenance requirements
+
+The shader's `Texture2D<uint2>` declaration for t4 does not imply a native
+`R32G32_UINT` texture. ApplyDLSS uses special binding helper RVA `0x774be0`
+for graph key `0x61f178d4`, selecting the alternate CPU SRV stored at texture
+registry `+0x2f210+(handle-1)*0xb0`; ordinary SRVs use `+0x2f208`.
+The authenticated descriptor factory's relevant branch creates a stencil-plane
+view: format tag 18 selects DXGI 47 (`X24_TYPELESS_G8_UINT`), and tag 19
+selects DXGI 22 (`X32_TYPELESS_G8X24_UINT`). It uses mip zero, one mip,
+plane one and component mapping `0x1688`. Format values and the plane field
+are defined in Microsoft's [DXGI format enum](https://learn.microsoft.com/en-us/windows/win32/api/dxgiformat/ne-dxgiformat-dxgi_format)
+and [2D SRV structure](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_tex2d_srv).
+Selecting the exact resource with its default view would not preserve the
+authored guide input. New metadata observes descriptor-source integers and raw
+engine format flags; it does not dereference a CPU descriptor handle or claim
+the actual descriptor contents are already authenticated.
+
+An opt-in thread-local observer around the original `slEvaluateFeature` call
+records its real token, feature, viewport and command-buffer address only while
+that call is active. Synchronously nested NGX candidates can inherit this
+metadata; asynchronous/out-of-scope callbacks remain unavailable. Nested calls
+mask and restore the outer scope. The token is not a Fog-frame join, and the
+raw SL command-buffer pointer is not claimed to be a canonical native identity.
+Late/early routing must not depend on whichever CPU callback happens first.
+
+The live virtual frame getter resolves to RVA `0x18ec810`, whose complete leaf
+is `lea rax,[rcx+0x10]; ret` (`48 8d 41 10 c3`). ApplyDLSS reads DWORD
+`returnedObject+0x1a0` and passes that explicit frame ID to `slGetNewFrameToken`.
+The bounded early observation therefore reads `context[0]+0x1b0` only after
+matching this exact live target and code, and repeats the route/value reads.
+It never invokes the virtual function. This records the early CPU source value;
+only a subsequent token observation can establish whether that value was used
+by a particular SL evaluation. Repeated reads are not an atomic snapshot or GPU
+execution guarantee.

@@ -77,6 +77,17 @@ class EarlyGuides(unittest.TestCase):
                          "phase != 2 || !context.counter || used != 1"):
             self.assertIn(evidence, SOURCE)
 
+    def test_descriptor_sources_are_raw_and_not_a_usable_srv_claim(self):
+        for evidence in ('"ordinary_cpu_srv_handle"', '"alternate_cpu_srv_handle"',
+                         '"raw_dimension_mip_bits"', '"raw_format_sample_bits"', '"raw_array_size"',
+                         '"raw_flags_bits"', '"descriptor_handles_dereferenced", false',
+                         '"native_view_format", "not_observed"', '"usable_srv", "not_established"',
+                         '"engine_SRV_request_mask_not_current_state"',
+                         '"t4_material_class_stencil_view"', "Address(nativeSlot, 0x30)",
+                         "Address(nativeSlot, 0x48)", "Address(nativeSlot, 0x4e)"):
+            self.assertIn(evidence, SOURCE)
+        self.assertNotIn("t4_material_uint2", SOURCE)
+
     def test_observational_camera_and_exact_motion_precedence(self):
         for evidence in ('"streamline_producer_observed", false', '"frame_token", "not_observed"',
                          '"matrix_payload", "current_view_CPU_source_rows_only"',
@@ -116,6 +127,17 @@ class EarlyGuides(unittest.TestCase):
             self.assertIn(evidence, route)
         for forbidden in ("reinterpret_cast", "std::function", "GetProcAddress", "Address(object, 0x1a0)"):
             self.assertNotIn(forbidden, route)
+
+    def test_explicit_frame_id_requires_exact_leaf_and_repeated_source(self):
+        source = SOURCE.split("Json ExplicitFrameIdSource(", 1)[1].split("Json FrameIdVirtualRoute(", 1)[0]
+        for evidence in ("GetterRva = 0x18ec810", "FrameIdObjectOffset = 0x1b0",
+                         "0x48, 0x8d, 0x41, 0x10, 0xc3", "target != Address(image, GetterRva)",
+                         "code != GetterBytes", "value == read.Read<uint32_t>(sourceAddress)",
+                         '"CPU_source_for_later_explicit_Streamline_frame_ID"',
+                         '"value_passed_to_streamline", "not_observed"', '"frame_token", "not_observed"'):
+            self.assertIn(evidence, source)
+        for forbidden in ("reinterpret_cast", "std::function", "GetProcAddress"):
+            self.assertNotIn(forbidden, source)
 
     def test_project_contains_standalone_files(self):
         for project in ("OptiScaler.vcxproj", "OptiScaler.vcxproj.filters"):
@@ -226,6 +248,13 @@ void setup()
         // The native address is intentionally NOT readable in mock memory.
         put<uintptr_t>(registry + TextureNativeOffset + (handle - 1) * TextureSlotStride,
                        0x30000000 + handle * 0x1000);
+        const auto nativeSlot = registry + TextureNativeOffset + (handle - 1) * TextureSlotStride;
+        // Descriptor addresses are also deliberately not readable in mock memory.
+        put<std::array<uintptr_t,2>>(nativeSlot + 0x30,
+            {0x40000000 + handle * 0x1000, 0x50000000 + handle * 0x1000});
+        put<uint32_t>(nativeSlot + 0x48, 0xe0);
+        put<std::array<uint8_t,12>>(nativeSlot + 0x4e,
+            {0x00,0x05,0xd0,0x02,0x01,0x00,0x10,0x19,0x05,0x00,0x00,0x00});
     }
 }
 Json describe() { return Json::parse(Describe(reinterpret_cast<void*>(context), image)); }
@@ -233,6 +262,13 @@ Json intervalOnly(uintptr_t selectedHolder = holders)
 {
     Reader read;
     return LogicalInterval(read, ReadContext(read, context), selectedHolder, 0xb00000, 100);
+}
+void setupFrameId()
+{
+    setup();
+    put<uintptr_t>(0xf00020, image + 0x18ec810);
+    put<std::array<uint8_t,5>>(image + 0x18ec810, {0x48,0x8d,0x41,0x10,0xc3});
+    put<uint32_t>(0xe001b0, 12345);
 }
 int main()
 {
@@ -247,6 +283,16 @@ int main()
         assert(mapping["ref_status"] == 1 && mapping["ref_status_after"] == 1);
         assert(mapping["lifetime"] == "not_established");
         assert(mapping["gpu_initialized"] == "not_established");
+        const auto& descriptors = mapping["descriptor_sources"];
+        assert(descriptors["status"] == "cpu_descriptor_sources_observed");
+        assert(descriptors["ordinary_cpu_srv_handle"] == 0x40000000 + (i + 100) * 0x1000);
+        assert(descriptors["alternate_cpu_srv_handle"] == 0x50000000 + (i + 100) * 0x1000);
+        assert(descriptors["requested_srv_state_mask"] == 0xe0);
+        assert(descriptors["raw_array_size"] == 1 && descriptors["raw_dimension_mip_bits"] == 0x10);
+        assert(descriptors["raw_format_sample_bits"] == 0x19 && descriptors["raw_flags_bits"] == 5);
+        assert(descriptors["raw_compact_descriptor_bytes"].size() == 12);
+        assert(descriptors["native_view_format"] == "not_observed");
+        assert(descriptors["usable_srv"] == "not_established" && descriptors["resource_state"] == "not_observed");
         const auto& interval = result["inputs"][i]["logical_interval"];
         assert(interval["status"] == "compiler_interval_observed");
         assert(interval["holder_index"] == i && interval["holder_capacity"] == 320);
@@ -355,6 +401,7 @@ int main()
     assert(camera["frame_id_virtual_route"]["target_rva"] == 0x123450);
     assert(camera["frame_id_virtual_route"]["virtual_call_performed"] == false);
     assert(camera["frame_id_virtual_route"]["returned_object"] == "not_observed");
+    assert(camera["frame_id_virtual_route"]["explicit_frame_id_source"]["status"] == "unavailable");
     const auto& matrices = camera["matrices"];
     assert(matrices.size() == 5);
     for (const auto& matrix : matrices)
@@ -442,6 +489,49 @@ int main()
     assert(result["camera_provenance"]["frame_id_virtual_route"]["status"] == "unavailable");
     setup(); put<uintptr_t>(0xe00000, UINTPTR_MAX); result = describe();
     assert(result["camera_provenance"]["frame_id_virtual_route"]["reason"] == "null or overflowing address");
+    for (const uint32_t value : {0u, 1u, 12345u, uint32_t(INT32_MAX), UINT32_MAX})
+    {
+        setupFrameId(); put<uint32_t>(0xe001b0, value); result = describe();
+        const auto& frame = result["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"];
+        assert(frame["status"] == "CPU_value_present" && frame["source_value"] == value);
+        assert(frame["source_object_offset"] == 0x1b0 && frame["source_address"] == 0xe001b0);
+        assert(frame["repeated_source_fields_equal"] == true && frame["virtual_call_performed"] == false);
+        assert(frame["value_passed_to_streamline"] == "not_observed" && frame["frame_token"] == "not_observed");
+        assert(result["camera_provenance"]["streamline_producer_observed"] == false);
+    }
+    for (unsigned offset = 0; offset < 5; ++offset)
+    {
+        setupFrameId(); memory[image + 0x18ec810 + offset] ^= 1; result = describe();
+        const auto& frame = result["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"];
+        assert(frame["reason"] == "frame-ID getter bytes differ from authenticated leaf");
+        assert(!frame.contains("source_value"));
+    }
+    for (const auto address : {context, uintptr_t(0xe00000), uintptr_t(0xf00020),
+                               uintptr_t(0xe001b0), image + 0x18ec810})
+    {
+        setupFrameId(); mutateAfterRead = address; result = describe();
+        const auto& frame = result["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"];
+        assert(frame["repeated_source_fields_equal"] == false && !frame.contains("source_value"));
+    }
+    for (const auto address : {image + 0x18ec814, uintptr_t(0xe001b3)})
+    {
+        setupFrameId(); memory.erase(address); result = describe();
+        const auto& frame = result["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"];
+        assert(frame["status"] == "unavailable" && !frame.contains("source_value"));
+    }
+    setupFrameId(); put<uintptr_t>(0xf00020, image + 0x18ec811); result = describe();
+    assert(result["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"]["reason"] ==
+           "frame-ID getter route not authenticated for scalar read");
+    Reader frameRead; GraphContext frameContext; frameContext.context = context;
+    setupFrameId();
+    assert(ExplicitFrameIdSource(frameRead, frameContext, image, UINTPTR_MAX - 0x100,
+                                0xf00000, image + 0x18ec810)["reason"] == "null or overflowing address");
+    partial = true;
+    assert(ExplicitFrameIdSource(frameRead, frameContext, image, 0xe00000,
+                                0xf00000, image + 0x18ec810)["status"] == "unavailable");
+    partial = false; frameRead.calls = MaxReadCalls;
+    assert(ExplicitFrameIdSource(frameRead, frameContext, image, 0xe00000,
+                                0xf00000, image + 0x18ec810)["reason"] == "CPU metadata read budget exhausted");
     setup(); put<uint64_t>(view + 0x17d8, uint64_t(1) << (0x5a & 63));
     result = describe(); assert(result["inputs"][6]["handle"] == 105);
     put<uint64_t>(view + 0x17d0, uint64_t(1) << 0x37);
@@ -505,6 +595,41 @@ int main()
     assert(!result["guide_settings"].contains("extra_specular_enabled"));
     setup(); const auto refAddress = registry + TextureRefOffset + 99 * TextureSlotStride;
     const auto nativeAddress = registry + TextureNativeOffset + 99 * TextureSlotStride;
+    for (const uint8_t format : {0x18, 0x19, 0xff})
+    {
+        setup(); put<uint8_t>(nativeAddress + 0x55, format); result = describe();
+        const auto& descriptors = result["inputs"][0]["texture_registry"]["descriptor_sources"];
+        assert(descriptors["raw_format_sample_bits"] == format);
+        assert(descriptors["native_view_format"] == "not_observed");
+    }
+    setup(); put<uint16_t>(nativeAddress + 0x52, 0xabcd);
+    put<uint8_t>(nativeAddress + 0x54, 0xff); put<uint32_t>(nativeAddress + 0x56, 0x80000005u);
+    put<std::array<uintptr_t,2>>(nativeAddress + 0x30, {0, UINTPTR_MAX}); result = describe();
+    auto descriptors = result["inputs"][0]["texture_registry"]["descriptor_sources"];
+    assert(descriptors["status"] == "cpu_descriptor_sources_observed");
+    assert(descriptors["ordinary_cpu_srv_handle"] == 0 && descriptors["alternate_cpu_srv_handle"] == UINTPTR_MAX);
+    assert(descriptors["raw_array_size"] == 0xabcd && descriptors["raw_dimension_mip_bits"] == 0xff);
+    assert(descriptors["raw_flags_bits"] == 0x80000005u);
+    assert(descriptors["usable_srv"] == "not_established");
+    for (const auto offset : {0x30u, 0x48u, 0x4eu})
+    {
+        setup(); mutateAfterRead = nativeAddress + offset; result = describe();
+        const auto& mapping = result["inputs"][0]["texture_registry"];
+        assert(mapping["status"] == "borrowed_address_observed");
+        assert(mapping["descriptor_sources"]["status"] == "unavailable");
+        assert(mapping["descriptor_sources"]["repeated_source_fields_equal"] == false);
+        assert(!mapping["descriptor_sources"].contains("ordinary_cpu_srv_handle"));
+    }
+    setup(); memory.erase(nativeAddress + 0x4e + 11); result = describe();
+    assert(result["inputs"][0]["texture_registry"]["status"] == "borrowed_address_observed");
+    assert(result["inputs"][0]["texture_registry"]["descriptor_sources"]["status"] == "unavailable");
+    Reader descriptorRead;
+    assert(DescriptorSources(descriptorRead, UINTPTR_MAX - 0x30)["status"] == "unavailable");
+    descriptorRead.calls = MaxReadCalls;
+    assert(DescriptorSources(descriptorRead, nativeAddress)["reason"] == "CPU metadata read budget exhausted");
+    setup(); partial = true; descriptorRead.calls = 0;
+    assert(DescriptorSources(descriptorRead, nativeAddress)["status"] == "unavailable");
+    setup();
     for (const auto status : {0, -1, INT32_MIN})
     {
         put<int32_t>(refAddress, status); result = describe();
@@ -537,7 +662,8 @@ int main()
         put<uintptr_t>(registry + TextureNativeOffset + (handle - 1) * TextureSlotStride, 0x12345678);
         Reader bounded; const auto mapping = RegistryMapping(bounded, image, handle);
         assert(mapping["status"] == "borrowed_address_observed");
-        assert(mapping["slot_index"] == handle - 1 && bounded.calls == 6);
+        assert(mapping["slot_index"] == handle - 1 && bounded.calls == 7);
+        assert(mapping["descriptor_sources"]["status"] == "unavailable"); // Optional fields absent.
     }
     setup(); put<uintptr_t>(image + TextureRegistryRva, 0); result = describe();
     assert(result["inputs"][0]["texture_registry"]["status"] == "unavailable");
