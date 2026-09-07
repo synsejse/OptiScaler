@@ -109,5 +109,23 @@ This avoids claiming that earlier CPU callbacks establish GPU ordering. The
 capture is still diagnostic: it neither denoises scene color nor proves that
 depth, motion, hit distance and temporal scalars are ready for early RR.
 
+The first lighting capture on `35ec0b4e` completed successfully on the actual
+GPU. All three native guide textures passed coverage/finite-value checks, and
+the original game continued rendering after its bindings were restored. Native
+FP16 output rounding must be accounted for when checking the 0.04 roughness
+floor. This verifies the tested private guide path, not exact late-guide parity
+or a finished scene/temporal correction.
+
+The same opt-in diagnostic can also capture the seven raw words from the
+original lighting shader's exposure buffer. It requires the exact observed
+lighting VS/PS and selector, current matching VS/PS t37 descriptors, an
+authenticated structured-buffer factory route, and repeated source identity.
+The private integer copy performs no normalization; its optional fourth file
+is a 2x1 RGBA32_UINT texture with seven original words and one zero pad. A
+refusal leaves the three-guide diagnostic available. The late CPU exposure
+readback getter is not called. This is needed because the main lighting target
+and secondary target do not apply identical final exposure scaling; neither a
+guessed reciprocal nor late scalar is promoted into current GPU evidence.
+
 No fitted haze, inferred diffuse/specular split, raw/denoised blend, history
 reset trick, or permanent removal of the game's authored fog is proposed.

@@ -92,7 +92,9 @@ class FogProbe(unittest.TestCase):
         self.assertIn("MaxPsoLogs = 16", SOURCE)
 
     def test_pso_authentication_uses_full_hash_and_fails_closed(self):
-        pso = function("RecordPso")
+        # Lighting identities have their own bounded registry/hash tests. These
+        # assertions concern the unchanged fog-specific admission loop.
+        pso = function("RecordPso").split("for (const auto& identity : FogShaders)", 1)[1]
         self.assertLess(pso.index("desc.PS.BytecodeLength != identity.bytes"), pso.index("hash.Add("))
         self.assertLess(pso.index("hash.Finish() != identity.sha256"), pso.index("data.tagged.push_back"))
         for digest in ("a7a57220b8f5c1abddd8205d626ece403df647152d9a7afe147d5c285bc6589a",

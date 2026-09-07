@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -44,6 +45,7 @@ struct Batch
     std::array<Entry, 3> entries;
     std::optional<Entry> boundCb12;
     std::optional<std::array<Entry, 3>> earlyGuides;
+    std::optional<Entry> exposureWords; // Standalone guide batches only; never a floating fog layer.
     std::shared_ptr<void> keepAlive;
     Json metadata;
     std::filesystem::path directory;
@@ -113,13 +115,34 @@ void CheckSameDevice(ID3D12Device* device, ID3D12DeviceChild* child)
         throw std::runtime_error("fog capture resources/list must belong to the supplied device");
 }
 
-void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false, bool guideAlbedo = false)
+bool IsExposureWordsTexture(const D3D12_RESOURCE_DESC& desc, DXGI_FORMAT viewFormat,
+                            UINT subresource, D3D12_RESOURCE_STATES state) noexcept
+{
+    constexpr D3D12_RESOURCE_STATES RequiredState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    return viewFormat == DXGI_FORMAT_R32G32B32A32_UINT && desc.Format == viewFormat &&
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Width == 2 && desc.Height == 1 &&
+        desc.MipLevels == 1 && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 &&
+        desc.SampleDesc.Quality == 0 && subresource == 0 && state == RequiredState;
+}
+
+void PrepareEntry(ID3D12Device* device, Entry& entry, bool boundCb12 = false, bool guideAlbedo = false,
+                  bool exposureWords = false)
 {
     if (!entry.source.resource)
         throw std::runtime_error("fog capture requires all three immutable textures");
     CheckSameDevice(device, entry.source.resource.Get());
     const auto desc = entry.source.resource->GetDesc();
-    if (boundCb12)
+    if (exposureWords)
+    {
+        if (boundCb12 || guideAlbedo ||
+            !IsExposureWordsTexture(desc, entry.source.viewFormat, entry.source.subresource, entry.source.state))
+            throw std::runtime_error("exposure words require exact private 2x1 mip0 RGBA32_UINT in state0xc0");
+        entry.componentType = "uint32";
+        entry.pixelBytes = 16;
+        entry.filename = std::string(entry.role) + ".rgba32u";
+    }
+    else if (boundCb12)
     {
         // A companion must not broaden the accepted formats/extents of any of
         // the original three floating-point layers.
@@ -251,7 +274,15 @@ void WriteManifest(const Batch& batch)
     file.close();
 }
 
-void WriteEntry(const Batch& batch, const Entry& entry)
+bool HasZeroExposurePadding(const void* pixels, UINT64 rowBytes, UINT rows) noexcept
+{
+    if (!pixels || rowBytes != 32 || rows != 1) return false;
+    uint32_t padding = 0;
+    std::memcpy(&padding, static_cast<const char*>(pixels) + 28, sizeof(padding));
+    return padding == 0;
+}
+
+void WriteEntry(const Batch& batch, const Entry& entry, bool exposureWords = false)
 {
     struct Mapping
     {
@@ -270,13 +301,15 @@ void WriteEntry(const Batch& batch, const Entry& entry)
     Check(entry.readback->Map(0, &range, &mapping.data), "fog capture readback map failed");
     if (!mapping.data)
         throw std::runtime_error("fog capture readback map returned null");
+    const auto* pixels = static_cast<const char*>(mapping.data) + entry.footprint.Offset;
+    if (exposureWords && !HasZeroExposurePadding(pixels, entry.rowBytes, entry.rows))
+        throw std::runtime_error("exposure-word companion has invalid zero padding; native words not modified");
 
     const auto path = batch.directory / entry.filename;
     auto temporary = path;
     temporary += ".part";
     std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
     file.exceptions(std::ios::badbit | std::ios::failbit);
-    const auto* pixels = static_cast<const char*>(mapping.data) + entry.footprint.Offset;
     for (UINT y = 0; y < entry.rows; ++y)
     {
         const auto* row = pixels + UINT64(y) * entry.footprint.Footprint.RowPitch;
@@ -335,10 +368,14 @@ void WriteWhenComplete(const WorkerArgs& args)
         if (batch.earlyGuides)
             for (const auto& entry : *batch.earlyGuides)
                 WriteEntry(batch, entry);
+        if (batch.exposureWords)
+            WriteEntry(batch, *batch.exposureWords, true);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
-        FinishStatus(true, batch.guidesOnly ? "Early guide capture saved: three native guide companions and provenance." :
-                                            "Fog capture saved: three native floating-point RGBA layers and provenance.", true);
+        FinishStatus(true, batch.guidesOnly ? (batch.exposureWords ?
+                         "Early guide capture saved: three native guides, raw exposure words and provenance." :
+                         "Early guide capture saved: three native guide companions and provenance.") :
+                         "Fog capture saved: three native floating-point RGBA layers and provenance.", true);
     }
     catch (const std::exception& error)
     {
@@ -618,7 +655,7 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
 
 bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                        const std::array<Texture, 3>& guides, const std::string& provenanceJson,
-                       const std::shared_ptr<void>& keepAlive) noexcept
+                       const std::shared_ptr<void>& keepAlive, const Texture* exposureWords) noexcept
 {
     HMODULE module = nullptr;
     bool recorded = false;
@@ -679,8 +716,26 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                 throw std::runtime_error("standalone early guide readback exceeds the shared 256 MiB limit");
             totalBytes += entry.bytes;
         }
+        if (exposureWords)
+        {
+            if (!exposureWords->resource)
+                throw std::runtime_error("supplied exposure-word companion must contain a private resource");
+            ComPtr<IUnknown> exposureIdentity;
+            Check(exposureWords->resource->QueryInterface(IID_PPV_ARGS(&exposureIdentity)),
+                  "exposure-word resource identity unavailable");
+            for (const auto& identity : identities)
+                if (exposureIdentity.Get() == identity.Get())
+                    throw std::runtime_error("exposure words must be distinct from all three native guides");
+            batch->exposureWords = Entry { .role = "exposure_words", .source = *exposureWords };
+            PrepareEntry(device, *batch->exposureWords, false, false, true);
+            if (batch->exposureWords->bytes > MaxBytes - totalBytes)
+                throw std::runtime_error("guides and exposure words exceed the shared256MiB readback limit");
+            totalBytes += batch->exposureWords->bytes;
+        }
         for (auto& entry : batch->entries)
             AllocateReadback(device, entry);
+        if (batch->exposureWords)
+            AllocateReadback(device, *batch->exposureWords);
 
         batch->directory = Util::ExePath().parent_path() / "FSRRR-early-guide-captures" / Timestamp("early-guides");
         const auto& extent = batch->entries.front().footprint.Footprint;
@@ -700,6 +755,19 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
             companion["register_space"] = 0;
             companion["value_transform"] = "none; native authored guide output bytes";
             companion["input_provenance"] = "caller_supplied; not authenticated by readback helper";
+            batch->metadata["companions"].push_back(std::move(companion));
+        }
+        if (batch->exposureWords)
+        {
+            auto companion = Describe(*batch->exposureWords);
+            companion["schema"] = "optiscaler.fsr_rr.exposure_words.v1";
+            companion["word_layout"] = "row-major RGBA uint32 words0..6 then one zero pad";
+            companion["source_word_byte_offsets"] = { 0, 4, 8, 12, 16, 20, 24 };
+            companion["source_word_count"] = 7;
+            companion["padding_word_index"] = 7;
+            companion["padding_word_value"] = 0;
+            companion["value_transform"] = "none; raw uint32 bits, no float conversion or exposure normalization";
+            companion["input_provenance"] = "caller_supplied; actual GPU-word producer and binding not authenticated by readback helper";
             batch->metadata["companions"].push_back(std::move(companion));
         }
 
@@ -722,6 +790,8 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
         }
         for (const auto& entry : batch->entries)
             RecordCopy(list, entry);
+        if (batch->exposureWords)
+            RecordCopy(list, *batch->exposureWords);
         recorded = true;
 
         const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);

@@ -821,6 +821,15 @@
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkGuidePass.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkExposurePass.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkExposureSource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingShaders.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\ffx\FSRDFogLayerCapture.h">
       <Filter>Header Files</Filter>
     </ClInclude>

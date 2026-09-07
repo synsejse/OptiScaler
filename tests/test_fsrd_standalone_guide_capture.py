@@ -39,7 +39,7 @@ class StandaloneGuideCapture(unittest.TestCase):
         self.assertIn("batch->keepAlive = keepAlive", record)
         self.assertIn("CheckSameDevice(device, list)", record)
 
-    def test_standalone_manifest_has_only_native_guide_companions(self):
+    def test_standalone_manifest_has_three_native_guides_without_fake_fog_layers(self):
         record = body("RecordEarlyGuides")
         self.assertIn('"optiscaler.fsr_rr.early_guide_capture.v1"', record)
         self.assertIn('{ "render_extent", { extent.Width, extent.Height } }', record)

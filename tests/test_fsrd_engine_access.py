@@ -37,7 +37,7 @@ class EngineAccess(unittest.TestCase):
         functions = {start: end for start, end, _ in struct.iter_unpack("<III", read(pdata_rva, pdata_size))}
         leaf_ends = {0x1f719c: 0x1f71c9, 0x911bdc: 0x911c2e}
         ranges = re.findall(r'\{ (0x[0-9a-f]+), (0x[0-9a-f]+), "([0-9a-f]{64})" \}', HEADER.read_text())
-        self.assertEqual(len(ranges), 11)
+        self.assertEqual(len(ranges), 13)  # 11 existing bodies + 2 optional buffer bodies.
         relocation_rva, relocation_size = struct.unpack_from("<II", data, optional + 112 + 5 * 8)
         relocations = []
         offset = 0
@@ -81,6 +81,8 @@ struct Host
     bool loseOnFlush=false;
     bool readonlyDepth=false;
     unsigned readonlyChecks=0;
+    bool exposureAdmitted=false;
+    unsigned exposureChecks=0;
     template<class T> void Put(uintptr_t address,T value)
     { auto& bytes=memory[address]; bytes.resize(sizeof(T)); std::memcpy(bytes.data(),&value,sizeof(T)); }
     bool Read(uintptr_t address,void* output,size_t bytes) noexcept
@@ -93,7 +95,8 @@ struct Host
     { assert(image==Image&&size==E::ImageBytes&&stamp==E::ImageTimestamp&&sha==E::ExeSha256);return imageOk; }
     bool LiveCodeMatches(uintptr_t image,const E::CodeRange& code) noexcept
     {
-        assert(image==Image&&code.rva==E::Code[codeCount].rva&&code.sha256.size()==64);
+        const auto& expected=codeCount<11?E::Code[codeCount]:E::BufferCode[codeCount-11];
+        assert(image==Image&&code.rva==expected.rva&&code.sha256.size()==64);
         return codeCount++!=codeFailure;
     }
     bool IsAdmittedFogScope(uint64_t scope,uintptr_t list,uintptr_t pso,
@@ -101,6 +104,8 @@ struct Host
     { return scopeOk&&scope==42&&list==List&&pso==Pso; }
     bool IsReadOnlyDepthAliasAdmitted(const E::TextureBorrow& texture) noexcept
     { ++readonlyChecks;return readonlyDepth&&texture.handle==4&&texture.native==0x703000; }
+    bool IsExposureBufferAdmitted(const E::BufferBorrow& buffer) noexcept
+    { ++exposureChecks;return exposureAdmitted&&buffer.handle==10&&buffer.native==0x810000; }
     uint32_t ThreadId() noexcept { return thread; }
     bool ReadTlsSlotZero(uintptr_t& result) noexcept { result=tls;return tlsOk; }
     bool ListIsDirect(uintptr_t list) noexcept { assert(list==List);return direct; }
@@ -118,6 +123,11 @@ struct Host
     { assert(address==Image+E::ReenterRva&&list==List);calls.push_back("reentry"); }
     void RestorePso(uintptr_t list,uintptr_t pso) noexcept
     { assert(list==List&&pso==Pso);actualPso=pso;calls.push_back("pso"); }
+    void RequestBufferState(uintptr_t address,uintptr_t context,uint32_t handle,uint32_t state) noexcept
+    {
+        assert(address==Image+E::RequestBufferStateRva&&context==Context&&handle==10&&state==0xc0);
+        states.push_back(state);calls.push_back("buffer10");
+    }
 };
 E::Input Setup(Host& h)
 {
@@ -135,6 +145,22 @@ E::Input Setup(Host& h)
     }
     return in;
 }
+constexpr uintptr_t ExposureSlot=Registry+0x5c0af0+9*0xb0;
+void AddExposure(Host& h,E::Input& in)
+{
+    in.exposure={10,0x810000};h.exposureAdmitted=true;
+    h.Put<int32_t>(ExposureSlot,2);
+    h.Put<uintptr_t>(ExposureSlot+0x18,in.exposure.native);
+    h.Put<uint8_t>(ExposureSlot+0xe,0x38);
+    h.Put<uintptr_t>(ExposureSlot+0x70,0);
+}
+// Existing adapters need neither optional method when no buffer was requested.
+struct LegacyHost:Host
+{
+private:
+    using Host::IsExposureBufferAdmitted;
+    using Host::RequestBufferState;
+};
 int main()
 {
     auto rejected=[](auto alter)
@@ -145,6 +171,7 @@ int main()
         assert(!callbacks&&h.calls.empty());
     };
     for(unsigned i=0;i<11;++i)rejected([i](Host& h,E::Input&){h.codeFailure=i;});
+    for(unsigned i=11;i<13;++i)rejected([i](Host& h,E::Input& in){AddExposure(h,in);h.codeFailure=i;});
     rejected([](Host& h,E::Input&){h.imageOk=false;});
     rejected([](Host& h,E::Input&){h.scopeOk=false;});
     rejected([](Host& h,E::Input&){h.Put<uint8_t>(Tls+0x14,0);});
@@ -163,6 +190,19 @@ int main()
     rejected([](Host&,E::Input& in){in.image=~uintptr_t(0);});
     rejected([](Host&,E::Input& in){in.preserveReadOnlyDepth=true;});
     rejected([](Host& h,E::Input& in){in.preserveReadOnlyDepth=true;h.readonlyDepth=true;in.textures[3].handle=3;});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);h.exposureAdmitted=false;});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);in.exposure.handle=0;});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);in.exposure.handle=0x8001;});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);in.exposure.native=0;});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);h.Put<int32_t>(ExposureSlot,0);});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);h.Put<int32_t>(ExposureSlot,-1);});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);h.Put<uintptr_t>(ExposureSlot+0x18,1);});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);h.Put<uintptr_t>(ExposureSlot+0x70,1);});
+    for(unsigned kind:{1,2,4,5,7,15})
+        rejected([kind](Host& h,E::Input& in){AddExposure(h,in);h.Put<uint8_t>(ExposureSlot+0xe,(kind<<4)|8);});
+    for(unsigned view:{0,1,2,3,4,5,6,7,11,12,13,15})
+        rejected([view](Host& h,E::Input& in){AddExposure(h,in);h.Put<uint8_t>(ExposureSlot+0xe,0x30|view);});
+    rejected([](Host& h,E::Input& in){AddExposure(h,in);h.memory.erase(ExposureSlot+0xe);});
     { Host h;auto in=Setup(h);h.Put<uint8_t>(Tls+0x14,0);
       E::RecordPrivateCompute(h,in,[]{return true;});assert(!h.getters); }
     for(unsigned mode=0;mode<3;++mode)
@@ -175,7 +215,7 @@ int main()
         });
         assert(result.outcome==(mode==0?E::Outcome::PrivateRecordedRestored:E::Outcome::PrivateFailedRestored));
         assert(result.requestsIssued==4&&result.callbackEntered&&result.bindingsRestored);
-        assert(h.actualPso==Pso&&h.getters==1&&h.codeCount==11);
+        assert(h.actualPso==Pso&&h.getters==1&&h.codeCount==11&&!h.exposureChecks);
         assert((h.calls==std::vector<std::string>{"read1","read2","read3","read4","flush","private","reentry","pso"}));
         assert((h.states==std::vector<uint32_t>{0xc0,0xc0,0xc0,0xc0}));
     }
@@ -196,6 +236,42 @@ int main()
     { Host h;auto in=Setup(h);in.preserveReadOnlyDepth=true;h.readonlyDepth=true;
       const auto result=E::RecordPrivateCompute(h,in,[&]{h.readonlyDepth=false;return true;});
       assert(result.outcome==E::Outcome::ScopeLostAfterPrivate&&!result.bindingsRestored); }
+    for(unsigned kind:{0,3,6})for(unsigned view:{8,9,10,14})
+    {
+        Host h;auto in=Setup(h);AddExposure(h,in);h.Put<uint8_t>(ExposureSlot+0xe,(kind<<4)|view);
+        in.preserveReadOnlyDepth=true;h.readonlyDepth=true;
+        const auto result=E::RecordPrivateCompute(h,in,[&]{h.calls.push_back("private");return true;});
+        assert(result.outcome==E::Outcome::PrivateRecordedRestored&&result.requestsIssued==5);
+        assert(result.bindingsRestored&&h.codeCount==13&&h.exposureChecks>=5);
+        assert((h.calls==std::vector<std::string>{"read1","read2","read3","read4","buffer10","flush","private","reentry","pso"}));
+        assert((h.states==std::vector<uint32_t>{0xc0,0xc0,0xc0,0xe0,0xc0}));
+    }
+    { Host h;auto in=Setup(h);AddExposure(h,in);h.loseOnFlush=true;
+      const auto result=E::RecordPrivateCompute(h,in,[]{assert(false);return true;});
+      assert(result.outcome==E::Outcome::ScopeLostBeforePrivate&&result.requestsIssued==5); }
+    for(unsigned change=0;change<5;++change)
+    {
+        Host h;auto in=Setup(h);AddExposure(h,in);
+        const auto result=E::RecordPrivateCompute(h,in,[&]{
+            if(change==0)h.exposureAdmitted=false;
+            if(change==1)h.Put<int32_t>(ExposureSlot,3);
+            if(change==2)h.Put<uintptr_t>(ExposureSlot+0x18,1);
+            if(change==3)h.Put<uint8_t>(ExposureSlot+0xe,0x48);
+            if(change==4)h.Put<uintptr_t>(ExposureSlot+0x70,1);
+            return true;
+        });
+        assert(result.outcome==E::Outcome::ScopeLostAfterPrivate&&!result.bindingsRestored);
+        assert(h.calls.back()=="flush");
+    }
+    { Host h;auto in=Setup(h);AddExposure(h,in);
+      const auto result=E::RecordPrivateCompute(h,in,[]()->bool{throw std::runtime_error("copy failed");});
+      assert(result.outcome==E::Outcome::PrivateFailedRestored&&result.bindingsRestored); }
+    { LegacyHost h;auto in=Setup(h);
+      const auto result=E::RecordPrivateCompute(h,in,[]{return true;});
+      assert(result.outcome==E::Outcome::PrivateRecordedRestored&&result.requestsIssued==4&&h.codeCount==11); }
+    { LegacyHost h;auto in=Setup(h);AddExposure(h,in);
+      const auto result=E::RecordPrivateCompute(h,in,[]{assert(false);return true;});
+      assert(result.outcome==E::Outcome::Refused&&h.calls.empty()); }
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-engine-access-") as name:

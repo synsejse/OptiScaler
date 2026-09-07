@@ -71,11 +71,19 @@ bool WantsEarlyGuideCapture();
 // submission/completion: the existing actual-list queue observer/fence and worker
 // still determine GetStatus().complete. A false return can mean refused setup;
 // true only means copies recorded (worker startup/disk failure is separate status).
+// Optional exposureWords is a fourth distinct private immutable 2x1 RGBA32_UINT
+// mip0/slice0, single-mip/array/sample texture in the same 0xc0 state. Row-major
+// RGBA words0..6 are the exact source uint32 bits at byte offsets0,4,...,24;
+// word7 must be zero padding, checked only after the GPU completion fence. The
+// helper does not read an engine exposure resource or interpret/normalize words.
+// Caller must supply actual GPU-word producer/binding provenance separately and
+// retain its producer Work in keepAlive; a well-formed texture is NOT that proof.
+// All four entries share the existing256MiB cap, owner and completion fence.
 // Output: <exe>/FSRRR-early-guide-captures/<UTC timestamp>/manifest.json plus three
-// native companions. Caller provenance is evidence, not promoted to frame proof.
+// guides and the optional raw-word companion. Caller evidence is not frame proof.
 bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                        const std::array<Texture, 3>& guides, const std::string& provenanceJson,
-                       const std::shared_ptr<void>& keepAlive) noexcept;
+                       const std::shared_ptr<void>& keepAlive, const Texture* exposureWords = nullptr) noexcept;
 
 // Caller preconditions (not authenticated by this generic readback helper):
 // - Authenticate the exact fog PSO, draw, bindings, subresource and blend descriptor.

@@ -21,6 +21,7 @@ inline constexpr uint32_t ImageTimestamp = 0x68af45ea;
 inline constexpr uintptr_t RegistryRva = 0x3438a28;
 inline constexpr uintptr_t GetCurrentListRva = 0x1f6400, RequestStateRva = 0x1f40dc,
                            FlushRva = 0x1f7164, ReenterRva = 0x2a3e9d4;
+inline constexpr uintptr_t RequestBufferStateRva = 0x1f51c4;
 // Preserve pixel readability if an input is also used by the intercepted draw:
 // that raw DrawInstanced resumes AFTER its engine binding/transition setup.
 inline constexpr uint32_t InputReadState = 0xc0; // NON_PIXEL | PIXEL_SHADER_RESOURCE
@@ -51,7 +52,20 @@ inline constexpr CodeRange Code[] = {
     { 0xa1ffa8, 0x278, "2015eca47699d30f91c4c7719854975d10b8f8221c1a32fd8fc82183ca72ec18" }
 };
 
+// Authenticated only when the optional exposure buffer is present. The buffer
+// request uses its own table at context+0x568; it is NOT the texture helper.
+inline constexpr CodeRange BufferCode[] = {
+    { 0x1f51c4, 0x180, "5fe9728672a33a381bddb7dce4757eb2a1581a002f4965d22fe75011666a3096" },
+    { 0x1f483c, 0x196, "951414fc4b92797853094a3b16baa4c5e8c2f96347826b6dda80366baad9cb91" }
+};
+
 struct TextureBorrow
+{
+    uint32_t handle = 0;
+    uintptr_t native = 0;
+};
+
+struct BufferBorrow
 {
     uint32_t handle = 0;
     uintptr_t native = 0;
@@ -65,6 +79,9 @@ struct Input
     // Narrow lighting-only opt-in: t4 is also the currently bound DSV with BOTH
     // depth and stencil read-only. Never accept a caller-selected arbitrary mask.
     bool preserveReadOnlyDepth = false;
+    // Optional exact buffer used by BOTH original vertex/pixel t37. This is not
+    // a generic buffer-read API; the host proves descriptor/format/current-use.
+    BufferBorrow exposure {};
 };
 
 enum class Outcome
@@ -85,6 +102,23 @@ struct Result
 
 namespace Detail
 {
+inline bool HasExposure(const Input& input)
+{
+    // A partial nonzero pair is an invalid request, not an absent optional.
+    return input.exposure.handle || input.exposure.native;
+}
+
+template <typename Host> bool ExposureAdmitted(Host& host, const Input& input)
+{
+    if (!HasExposure(input)) return true;
+    if constexpr (requires {
+        host.IsExposureBufferAdmitted(input.exposure);
+        host.RequestBufferState(uintptr_t {}, uintptr_t {}, uint32_t {}, uint32_t {});
+    })
+        return host.IsExposureBufferAdmitted(input.exposure);
+    return false; // Existing hosts cannot silently opt into a missing contract.
+}
+
 template <typename Host> bool ReadOnlyDepthAdmitted(Host& host, const Input& input)
 {
     if (!input.preserveReadOnlyDepth) return true;
@@ -101,11 +135,35 @@ template <typename Host, typename T> bool Read(Host& host, uintptr_t base, uintp
     return host.Read(base + offset, &value, sizeof(value));
 }
 
+template <typename Host> bool ReadExposure(Host& host, uintptr_t registry, const BufferBorrow& buffer,
+                                         int32_t& refs)
+{
+    if (!buffer.handle || buffer.handle > 0x8000 || !buffer.native) return false;
+    // Buffer table capacity/stride: constructor91b6f9..91b711. Refcount is
+    // incremented by21c937; native resource is used by1f5307/1f0a01/1f0aca.
+    const uintptr_t slot = 0x5c0af0 + uintptr_t(buffer.handle - 1) * 0xb0;
+    uintptr_t native = 0, externalSynchronization = 0;
+    uint8_t kinds = 0;
+    if (!Read(host, registry, slot, refs) || refs <= 0 ||
+        !Read(host, registry, slot + 0x18, native) || native != buffer.native ||
+        !Read(host, registry, slot + 0xe, kinds) ||
+        !Read(host, registry, slot + 0x70, externalSynchronization) || externalSynchronization)
+        return false;
+    const auto memoryKind = kinds >> 4;
+    const auto viewKind = kinds & 0xf;
+    // Refuse dynamic kind4 and the1/2/5 branches that skip ordinary state
+    // requests. Admit only known state-managed kinds, never an unknown enum.
+    // The selected low kinds take the structured SRV factory branch221542.
+    return (memoryKind == 0 || memoryKind == 3 || memoryKind == 6) &&
+        (viewKind == 8 || viewKind == 9 || viewKind == 10 || viewKind == 14);
+}
+
 struct Snapshot
 {
     uintptr_t tls = 0, context = 0, cache = 0, registry = 0;
     uint32_t thread = 0, kind = 0;
     std::array<int32_t, 4> refs {};
+    int32_t exposureRefs = 0;
 };
 
 template <typename Host> bool SameScope(Host& host, const Input& input, const Snapshot& saved)
@@ -113,8 +171,10 @@ template <typename Host> bool SameScope(Host& host, const Input& input, const Sn
     uintptr_t tls = 0, context = 0, list = 0, cache = 0, pso = 0, registry = 0;
     uint8_t initialized = 0;
     uint32_t kind = 0;
+    int32_t exposureRefs = 0;
     return host.ThreadId() == saved.thread &&
         ReadOnlyDepthAdmitted(host, input) &&
+        ExposureAdmitted(host, input) &&
         host.IsAdmittedFogScope(input.originalFogScope, input.list, input.originalPso, input.textures) &&
         host.ReadTlsSlotZero(tls) && tls == saved.tls &&
         Read(host, tls, 0x14, initialized) && initialized &&
@@ -123,7 +183,9 @@ template <typename Host> bool SameScope(Host& host, const Input& input, const Sn
         Read(host, context, 0x60, cache) && cache == saved.cache &&
         Read(host, context, 0x68, kind) && kind == saved.kind &&
         Read(host, context, 0x3d0, pso) && pso == input.originalPso &&
-        Read(host, input.image, RegistryRva, registry) && registry == saved.registry;
+        Read(host, input.image, RegistryRva, registry) && registry == saved.registry &&
+        (!HasExposure(input) || (ReadExposure(host, registry, input.exposure, exposureRefs) &&
+                                 exposureRefs == saved.exposureRefs));
 }
 
 template <typename Host> bool ReadTexture(Host& host, uintptr_t registry, const TextureBorrow& texture,
@@ -152,6 +214,12 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
     for (const auto& code : Code)
         if (!host.LiveCodeMatches(input.image, code))
             return false;
+    if (HasExposure(input))
+    {
+        if (!ExposureAdmitted(host, input)) return false;
+        for (const auto& code : BufferCode)
+            if (!host.LiveCodeMatches(input.image, code)) return false;
+    }
     // ReadTlsSlotZero clones only gs:[0x58] -> slot0 using bounded reads.
     // Never call the engine getter until its initialization branch is excluded.
     uint8_t initialized = 0;
@@ -162,6 +230,7 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
         !Read(host, saved.context, 0x60, saved.cache) || !saved.cache ||
         !Read(host, saved.context, 0x68, saved.kind) ||
         !Read(host, input.image, RegistryRva, saved.registry) || !saved.registry ||
+        (HasExposure(input) && !ReadExposure(host, saved.registry, input.exposure, saved.exposureRefs)) ||
         !SameScope(host, input, saved))
         return false;
     // Internal kind is NOT D3D12_COMMAND_LIST_TYPE. Reject only the known
@@ -198,9 +267,16 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
 // - The optional IsReadOnlyDepthAliasAdmitted validates the current input[3]
 //   native resource against the exact bound DSV and proves BOTH read-only flags.
 //   It is rechecked at each scope gate when preserveReadOnlyDepth is true.
+// - Optional IsExposureBufferAdmitted proves exact original VS AND PS t37 use,
+//   authored structured SRV/28-byte stride, descriptor ownership/range, current
+//   native BUFFER extent, no writable alias, and retained same-scope lifetime.
+//   It is rechecked at each gate together with the buffer registry fields.
 // - CurrentNativeList invokes the authenticated Win64 void*() getter.
 // - RequestState invokes void(context*, uint32 handle, uint32 nativeState,
 //   uint32 subresource); Flush invokes void(context*); Reenter invokes void(list*).
+// - Optional RequestBufferState invokes void(context*, uint32 handle,
+//   uint32 nativeState). Its fixed0xc0 preserves original VS+PS readability;
+//   it does NOT admit CopyBufferRegion reads from the engine resource.
 // - RestorePso calls native list->SetPipelineState(originalPso), NOT a cache write.
 // - privateWork performs only synchronous native compute recording on this list;
 //   it must not change TLS/engine caches/graphics state or invoke engine helpers.
@@ -223,6 +299,18 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
         const auto readState = InputReadState | ((i == 3 && input.preserveReadOnlyDepth) ? 0x20u : 0u);
         host.RequestState(input.image + RequestStateRva, saved.context, texture.handle, readState, AllSubresources);
         ++result.requestsIssued;
+    }
+    if (Detail::HasExposure(input))
+    {
+        if constexpr (requires {
+            host.RequestBufferState(uintptr_t {}, uintptr_t {}, uint32_t {}, uint32_t {});
+        })
+        {
+            host.RequestBufferState(input.image + RequestBufferStateRva, saved.context,
+                                    input.exposure.handle, InputReadState);
+            ++result.requestsIssued;
+        }
+        // Missing method was already refused before any mutation in Prepare.
     }
     host.Flush(input.image + FlushRva, saved.context);
     if (!Detail::SameScope(host, input, saved))
