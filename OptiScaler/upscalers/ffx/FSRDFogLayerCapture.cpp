@@ -50,7 +50,7 @@ struct Batch
     std::optional<Entry> lightingT8; // Owned copy-readable encoded input; never a reconstructed scene layer.
     std::optional<std::array<Entry, 2>> rayCopies; // Private original-ray snapshots; units remain caller evidence.
     std::optional<Entry> hardwareDepth; // Fog-only private scalar snapshot, never a base scene layer.
-    std::optional<std::array<Entry, 3>> privateReset; // Fog-only independent RESET diagnostics, no scene substitution.
+    std::optional<std::array<Entry, 3>> privateReset; // Fog-only denoiser outputs; mode is caller metadata, never scene substitution.
     std::optional<Entry> rgbIdentity; // Private post-identity/pre-Fog snapshot; success is not inferred.
     std::shared_ptr<void> keepAlive;
     Json metadata;
@@ -674,6 +674,13 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
         }
         const auto privateResetCount = std::count_if(layers.privateReset.begin(), layers.privateReset.end(),
                                                       [](const auto& texture) { return bool(texture.resource); });
+        if (layers.privateOutputMode != Layers::PrivateOutputMode::IndependentReset &&
+            layers.privateOutputMode != Layers::PrivateOutputMode::TemporalWindowFinalSceneControl32)
+            throw std::runtime_error("unknown private denoiser output metadata mode");
+        const bool temporalFinalScene =
+            layers.privateOutputMode == Layers::PrivateOutputMode::TemporalWindowFinalSceneControl32;
+        if (temporalFinalScene && (!layers.privateResetSceneWrite || privateResetCount != 3 || layers.rgbIdentity.resource))
+            throw std::runtime_error("temporal final-frame metadata requires caller scene-write evidence, all three outputs and no RGB identity");
         if (privateResetCount && privateResetCount != 3)
             throw std::runtime_error("private RESET outputs must be all present or all absent");
         if (layers.privateResetSceneWrite && (privateResetCount != 3 || layers.rgbIdentity.resource))
@@ -838,6 +845,18 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                 }
                 companion["value_transform"] = "none; native private RGBA float16 bits including unmodified alpha";
                 companion["input_provenance"] = "caller_supplied; provider context, RESET, current inputs and frame association not authenticated by readback helper";
+                if (temporalFinalScene)
+                {
+                    companion["schema"] = "optiscaler.fsr_rr.temporal_window_output.v1";
+                    companion["intended_mode"] = "temporal_window_final_scene_control";
+                    companion["scene_write_scope"] = "final_frame_of_bounded_32_frame_window; caller_supplied";
+                    companion["temporal_window"] = {
+                        { "frame_count", 32 }, { "captured_frame_ordinal", 32 },
+                        { "first_frame_reset", true }, { "subsequent_frames_reset", false },
+                        { "proof", "caller_supplied; not_verified_by_readback_helper" }
+                    };
+                    companion["input_provenance"] = "caller_supplied; provider context, temporal RESET policy, frame count, history continuity, current inputs and frame association not authenticated by readback helper";
+                }
                 batch->metadata["companions"].push_back(std::move(companion));
             }
 

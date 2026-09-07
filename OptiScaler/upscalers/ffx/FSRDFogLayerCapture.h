@@ -34,7 +34,7 @@ struct Layers
     // Exact typed R32_FLOAT, mip0/slice0, single-mip/array/sample, scene extent,
     // state0xc0. This is not a linearized distance or the material stencil plane.
     Texture hardwareDepth;
-    // Optional all-or-none private independent RESET outputs. In order:
+    // Optional all-or-none private denoiser outputs (independent RESET by default). In order:
     // converted radiance, AMD denoised radiance, production composed color.
     // Exactly typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
     // exact state0xc0. This helper only captures them; it never writes scene RGB.
@@ -43,10 +43,21 @@ struct Layers
     // Exact typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
     // state0xc0. Presence does not establish that the RGB identity test passed.
     Texture rgbIdentity;
-    // Caller reports a separately admitted ONE-SHOT composed-RGB scene write.
+    // Caller reports a separately admitted composed-RGB scene write (ONE-SHOT
+    // independent RESET by default; explicit temporal mode below is separate).
     // Requires all three privateReset outputs; incompatible with rgbIdentity.
     // Metadata only: this boolean grants no scene-write authority or quality proof.
     bool privateResetSceneWrite = false;
+    enum class PrivateOutputMode
+    {
+        IndependentReset = 0,
+        TemporalWindowFinalSceneControl32 = 1
+    };
+    // Metadata-only caller attestation: final frame32 of a bounded32-frame scene
+    // window, first frame RESET and later frames temporal. Requires sceneWrite,
+    // all three outputs, no rgbIdentity. Does not authorize or verify any draw,
+    // frame count, history continuity, submission ordering or output correctness.
+    PrivateOutputMode privateOutputMode = PrivateOutputMode::IndependentReset;
 };
 
 struct Status
@@ -186,6 +197,14 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 // before remains the original pre-control snapshot; after remains post-original
 // Fog. For this control, a Fog RGB reference must use the actually written composed
 // RGB, not before, and original native alpha must be assessed separately.
+// Explicit privateOutputMode=TemporalWindowFinalSceneControl32 instead labels the
+// same three files as temporal_window_output.v1 / temporal_window_final_scene_control:
+// caller claims32 frames, captured ordinal32, RESET only on frame1. Requires
+// privateResetSceneWrite=true, all three outputs and no rgbIdentity; unknown enum
+// values are rejected. This changes metadata only, never bytes, admission authority,
+// resource/capture budgets, request slots or fences. The helper does NOT verify
+// these temporal claims; the final frame's actual receipts must do that separately.
+// IndependentReset remains the default and preserves existing metadata exactly.
 // Optional rgbIdentity is a distinct private immutable snapshot after a caller's
 // identity RGB draw and before the original Fog draw. before remains the native
 // snapshot BEFORE the identity draw; after remains AFTER the original Fog draw.
