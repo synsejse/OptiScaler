@@ -46,6 +46,7 @@ void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept;
 // no frame limit/readbacks, and new histories only after a drained scene change.
 void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t provider = 0,
                         const FSRD::DenoiserSettings* settings = nullptr) noexcept;
+void NotifyFeatureReleased(ID3D12Device* device) noexcept; // Stop insertion when the game disables/recreates RR.
 enum class TemporalTestPhase : uint8_t { Unavailable, Ready, Requested, Refused, Warmup, Active, Stalled, Stopped, Complete, Restarting };
 struct TemporalTestStatus
 {

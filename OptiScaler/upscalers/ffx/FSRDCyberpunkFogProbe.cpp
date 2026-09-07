@@ -1066,7 +1066,9 @@ void StopTemporalWindow(TemporalWindow& window, const char* reason, bool restart
             std::lock_guard lock(window.mutex);
             first = !window.stopped;
             window.stopped = true;
-            window.restartRequested |= window.continuous && restart;
+            // Before the first admitted role there is no private dependency to
+            // abandon. Loading/menu warm-up may safely try a fresh context later.
+            window.restartRequested |= window.continuous && (restart || !window.policy);
             if (window.policy) window.policy->Stop(); // Existing obligations still drain.
             if (window.failure.empty()) window.failure = reason;
         }
@@ -6282,6 +6284,13 @@ bool CanRestartTemporalWindow(TemporalWindow& window)
         (!window.policy || !window.policy->SubmissionWatches()) &&
         std::none_of(window.frames.begin(), window.frames.end(), [](const auto& frame) { return bool(frame); }) &&
         std::none_of(window.pendingCalls.begin(), window.pendingCalls.end(), [](const auto& value) { return value.Valid(); });
+}
+
+void NotifyFeatureReleased(ID3D12Device* device) noexcept
+{
+    auto window = temporalWindow.load(std::memory_order_acquire);
+    if (window && window->continuous && device == window->device.Get())
+        StopTemporalWindow(*window, "RR feature recreated or disabled", true);
 }
 
 void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t provider,

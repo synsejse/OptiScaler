@@ -36,12 +36,25 @@ class ContinuousLifetime(unittest.TestCase):
         self.assertLess(maintain.index('FSRDSubmission::Complete(producerTicket)'), maintain.index('frame->retired = true'))
         self.assertNotIn('WaitForSingleObject', maintain)
 
+    def test_warmup_retry_and_feature_release_keep_submission_guards(self):
+        stop = section('void StopTemporalWindow(', 'bool TemporalRecordingRequested(')
+        self.assertIn('window.continuous && (restart || !window.policy)', stop)
+        notify = section('void NotifyFeatureReleased(', 'void PollTemporalWindow(')
+        self.assertIn('device == window->device.Get()', notify)
+        self.assertIn('StopTemporalWindow(*window, "RR feature recreated or disabled", true)', notify)
+        feature = (BASE / 'FSRDFeature_Dx12.cpp').read_text()
+        destructor = feature.split('FSRDFeatureDx12::~FSRDFeatureDx12()', 1)[1].split('\n}', 1)[0]
+        self.assertLess(destructor.index('NotifyFeatureReleased(Device)'), destructor.index('DestroyDenoiserContext()'))
+        admit = section('uint64_t AdmitTemporalSubmission(', 'void ReturnedTemporalSubmission(')
+        self.assertIn('if (window.stopped) return 0;', admit)
+        self.assertLess(admit.index('if (window.stopped) return 0;'), admit.index('window.pendingWarmup ='))
+
     def test_actual_reclamation_and_restart_o0_o3(self):
         compiler = os.environ.get('CXX') or shutil.which('c++')
         if not compiler:
             self.skipTest('Set CXX for compiled host reclamation checks')
         functions = section('void RetireVisualWatch(', 'void MaintainTemporalWindow(')
-        functions += section('bool CanRestartTemporalWindow(', 'void PollTemporalWindow(')
+        functions += section('bool CanRestartTemporalWindow(', 'void NotifyFeatureReleased(')
         fixture = r'''
 #include "FSRDCyberpunkTemporalWindowPolicy.h"
 #include <atomic>

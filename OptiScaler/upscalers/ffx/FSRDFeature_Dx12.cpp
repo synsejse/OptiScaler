@@ -307,6 +307,7 @@ FSRDFeatureDx12::~FSRDFeatureDx12()
         return;
     }
 
+    FSRDCyberpunkFogProbe::NotifyFeatureReleased(Device);
     DestroyDenoiserContext();
 }
 
