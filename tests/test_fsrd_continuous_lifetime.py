@@ -33,8 +33,25 @@ class ContinuousLifetime(unittest.TestCase):
         maintain = section('void MaintainTemporalWindow(', 'uint64_t AdmitTemporalSubmission(')
         self.assertIn('FSRDSubmission::Complete(producerTicket)', maintain)
         self.assertIn('!window.policy->ConsumerEmbedded(frame->temporalKey)', maintain)
+        self.assertIn('slot.get() == frame.get() && slot.use_count() == 2', maintain)
+        self.assertLess(maintain.index('slot.use_count() == 2'), maintain.index('frame->retired = true'))
         self.assertLess(maintain.index('FSRDSubmission::Complete(producerTicket)'), maintain.index('frame->retired = true'))
         self.assertNotIn('WaitForSingleObject', maintain)
+
+    def test_selected_consumer_drains_but_new_fog_is_not_admitted(self):
+        embed = section('bool PacketPolicy::EmbedConsumer(', 'bool PacketPolicy::SealConsumer(')
+        self.assertIn('window->continuous && window->restartRequested', embed)
+        self.assertIn('EmbedConsumer(key, recording, first, owners, drain)', embed)
+        record = section('void RecordPrivateReset(', 'std::shared_ptr<CapturePlan> PrepareCapture(')
+        self.assertIn('window.stopped && !(window.continuous && window.restartRequested)', record)
+        observe = section('PrivateResetPacket* ObserveTemporalFog(', 'void WINAPI HookDraw(')
+        self.assertIn('if (window->stopped) return nullptr;', observe)
+
+    def test_restart_required_checkbox_keeps_latched_observers(self):
+        for path in ('OptiScaler/hooks/D3D12_Hooks.cpp', 'OptiScaler/hooks/Streamline_Hooks.cpp'):
+            source = (ROOT / path).read_text()
+            self.assertIn('#include <upscalers/ffx/FSRDPreFogSession.h>', source)
+            self.assertIn('FSRD::PreFogSession::Continuous()', source)
 
     def test_warmup_retry_and_feature_release_keep_submission_guards(self):
         stop = section('void StopTemporalWindow(', 'bool TemporalRecordingRequested(')

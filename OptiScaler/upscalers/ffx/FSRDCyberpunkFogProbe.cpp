@@ -519,7 +519,9 @@ bool PacketPolicy::EmbedConsumer(ResetPolicy::Recording recording, uint64_t firs
 {
     if (!window) return local.EmbedConsumer(recording, first, owners);
     std::lock_guard lock(window->mutex);
-    return !window->stopped && window->policy && window->policy->EmbedConsumer(key, recording, first, owners);
+    const bool drain = window->continuous && window->restartRequested;
+    return (!window->stopped || drain) && window->policy &&
+        window->policy->EmbedConsumer(key, recording, first, owners, drain);
 }
 bool PacketPolicy::SealConsumer(ResetPolicy::Recording recording, uint64_t last, bool success, bool restored) noexcept
 {
@@ -4636,7 +4638,7 @@ void RecordPrivateReset(ID3D12GraphicsCommandList* list, CapturePlan& plan)
         std::optional<TemporalCamera::PreviousFrame> previous;
         {
             std::lock_guard lock(window.mutex);
-            if (window.stopped || !window.policy || !window.queueIdentity ||
+            if ((window.stopped && !(window.continuous && window.restartRequested)) || !window.policy || !window.queueIdentity ||
                 window.policy->CommittedFrames() != packet->temporalKey.index ||
                 (packet->temporalKey.index && !window.previous))
                 throw std::runtime_error("temporal previous consumer has not returned/committed");
@@ -5973,7 +5975,11 @@ void MaintainTemporalWindow(TemporalWindow& window)
         if (window.continuous)
         {
             std::lock_guard lock(window.mutex);
-            unusedProducer = window.stopped && window.policy &&
+            // A selected Fog/Ray callback can still be preparing this packet
+            // when Stop arrives. Do not release its GPU owners beneath that CPU
+            // reader merely because no consumer has been embedded yet.
+            const auto& slot = window.frames[frame->temporalKey.index % window.frames.size()];
+            unusedProducer = window.stopped && slot.get() == frame.get() && slot.use_count() == 2 && window.policy &&
                 !window.policy->FrameFailed(frame->temporalKey) &&
                 !window.policy->ConsumerEmbedded(frame->temporalKey) &&
                 window.policy->ProducerReturned(frame->temporalKey);

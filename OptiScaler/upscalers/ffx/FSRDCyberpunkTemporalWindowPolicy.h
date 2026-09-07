@@ -149,11 +149,15 @@ class Window
         if (!frame->policy->SealProducer(seal)) return RefuseFrame(*frame);
         return true;
     }
-    bool EmbedConsumer(FrameKey key, Recording recording, uint64_t firstReadOrdinal, bool ownersRetained) noexcept
+    bool EmbedConsumer(FrameKey key, Recording recording, uint64_t firstReadOrdinal, bool ownersRetained,
+                       bool drainStopped = false) noexcept
     {
         auto* frame = Find(key);
         if (!frame || !(frame->roles & RoleBit(Role::Fog))) return MissingRole();
-        if (_stopped) return false;
+        // Only a consumer claimed before an expected stop may finish recording.
+        // ClaimRole still forbids new Fog roles after Stop, and a hard failure
+        // never gains this permission. Legacy bounded controls are unchanged.
+        if (_stopped && !(Continuous() && drainStopped && _failure == Failure::WindowStopped)) return false;
         if (key.index != _committed) { StopWith(Failure::ConsumerNotCurrent); return false; }
         if (!frame->policy->EmbedConsumer(recording, firstReadOrdinal, ownersRetained)) return RefuseFrame(*frame);
         frame->consumer = recording;

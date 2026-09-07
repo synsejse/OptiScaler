@@ -237,6 +237,25 @@ int main(){
   auto s=submit(w,{producer(0),consumer(0)});w.Stop();
   auto r=w.AfterExecute(s.receipt);assert(r.consumer==key);
   assert(w.CommitConsumer(key,true)&&w.CommittedFrames()==1&&w.Stopped());}
+ // An already-selected Fog callback may finish after an expected stop. New
+ // roles, hard failures and legacy bounded mode never get that permission.
+ {Window w(epoch,queue,first,0);const auto key=producers(w,0);
+  assert(w.ClaimRole(first,Role::Fog)==key);w.Stop();
+  assert(!w.ClaimRole(first+1,Role::Ray).Valid());
+  assert(!w.EmbedConsumer(key,consumer(0),5,true));
+  assert(w.EmbedConsumer(key,consumer(0),5,true,true));
+  assert(w.SealConsumer(key,consumer(0),6,true,true));
+  auto s=submit(w,{producer(0),consumer(0)});assert(s.allowed);
+  assert(w.AfterExecute(s.receipt).consumer==key&&w.CommitConsumer(key,true));}
+ {Window w(epoch,queue,first,0);const auto key=producers(w,0);w.Stop();
+  assert(!w.ClaimRole(first,Role::Fog).Valid());
+  assert(!w.EmbedConsumer(key,consumer(0),5,true,true));}
+ {Window w(epoch,queue,first,0);const auto key=producers(w,0);
+  assert(w.ClaimRole(first,Role::Fog)==key);w.FailFrame(key);
+  assert(!w.EmbedConsumer(key,consumer(0),5,true,true));}
+ {Window w(epoch,queue,first,32);const auto key=producers(w,0);
+  assert(w.ClaimRole(first,Role::Fog)==key);w.Stop();
+  assert(!w.EmbedConsumer(key,consumer(0),5,true,true));}
  // Submitted look-ahead work with no consumer can retire only after its actual
  // return and a newer producer Reset; this never commits denoiser history.
  {Window w(epoch,queue,first,0);const auto key=producers(w,0);w.Stop();

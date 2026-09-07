@@ -8,6 +8,7 @@
 
 #include <resource_tracking/ResTrack_Dx12.h>
 #include <upscalers/ffx/FSRDCyberpunkFogProbe.h>
+#include <upscalers/ffx/FSRDPreFogSession.h>
 
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
@@ -1043,7 +1044,7 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
 {
     ID3D12GraphicsCommandList* probeList = nullptr;
     if (commandList && (Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
-                        Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default()))
+                        Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default() || FSRD::PreFogSession::Continuous()))
     {
         if (!Util::CheckForRealObject(__FUNCTION__, commandList, (IUnknown**) &probeList))
             probeList = commandList;
@@ -1310,7 +1311,7 @@ static void HookToCommandList(ID3D12Device* InDevice)
             }
 
             if (Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
-                Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default())
+                Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default() || FSRD::PreFogSession::Continuous())
             {
                 ID3D12GraphicsCommandList* probeList = nullptr;
                 if (!Util::CheckForRealObject(__FUNCTION__, commandList, (IUnknown**) &probeList))
@@ -2153,7 +2154,7 @@ static void HookToDevice(ID3D12Device* InDevice)
         pVTable = *(PVOID**) realDevice;
 
     FSRDCyberpunkFogProbe::Initialize(Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
-                                     Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default());
+                                     Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default() || FSRD::PreFogSession::Continuous());
     FSRDCyberpunkFogProbe::HookDevice(realDevice ? realDevice : InDevice);
 
     // hudless
