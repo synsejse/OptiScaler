@@ -85,6 +85,8 @@ struct Host
     unsigned exposureChecks=0;
     bool lightingAdmitted=false;
     unsigned lightingChecks=0;
+    bool residencyAdmitted=false;
+    unsigned residencyChecks=0;
     template<class T> void Put(uintptr_t address,T value)
     { auto& bytes=memory[address]; bytes.resize(sizeof(T)); std::memcpy(bytes.data(),&value,sizeof(T)); }
     bool Read(uintptr_t address,void* output,size_t bytes) noexcept
@@ -110,6 +112,8 @@ struct Host
     { ++exposureChecks;return exposureAdmitted&&buffer.handle==10&&buffer.native==0x810000; }
     bool IsLightingT8Admitted(const E::TextureBorrow& texture) noexcept
     { ++lightingChecks;return lightingAdmitted&&texture.handle==11&&texture.native==0x820000; }
+    bool IsTextureResidencyAdmitted(uintptr_t registry,const E::TextureBorrow& texture) noexcept
+    { ++residencyChecks;return residencyAdmitted&&registry==Registry&&texture.handle==11&&texture.native==0x820000; }
     uint32_t ThreadId() noexcept { return thread; }
     bool ReadTlsSlotZero(uintptr_t& result) noexcept { result=tls;return tlsOk; }
     bool ListIsDirect(uintptr_t list) noexcept { assert(list==List);return direct; }
@@ -172,6 +176,7 @@ private:
     using Host::IsExposureBufferAdmitted;
     using Host::RequestBufferState;
     using Host::IsLightingT8Admitted;
+    using Host::IsTextureResidencyAdmitted;
 };
 int main()
 {
@@ -223,6 +228,9 @@ int main()
     rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uintptr_t>(LightingSlot,1);});
     rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uint8_t>(LightingSlot+0x56,0x40);});
     rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uintptr_t>(LightingSlot+0x68,1);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uintptr_t>(LightingSlot+0x68,in.lightingT8.native);});
+    rejected([](Host& h,E::Input& in){AddLighting(h,in);h.residencyAdmitted=true;h.Put<uintptr_t>(LightingSlot+0x68,1);});
+    rejected([](Host& h,E::Input& in){h.residencyAdmitted=true;h.Put<uintptr_t>(Registry+0x2f1d8+0x68,in.textures[0].native);});
     rejected([](Host& h,E::Input& in){AddLighting(h,in);h.Put<uint32_t>(Context+0x68,4);h.Put<uint8_t>(Registry+0x1a8e988,1);});
     { Host h;auto in=Setup(h);h.Put<uint8_t>(Tls+0x14,0);
       E::RecordPrivateCompute(h,in,[]{return true;});assert(!h.getters); }
@@ -301,6 +309,14 @@ int main()
       assert(result.outcome==E::Outcome::PrivateRecordedRestored&&result.requestsIssued==6&&h.lightingChecks>=4);
       assert((h.calls==std::vector<std::string>{"read1","read2","read3","read4","buffer10","read11","flush","private","reentry","pso"}));
       assert(h.states.back()==0x8c0); }
+    { Host h;auto in=Setup(h);AddLighting(h,in);h.residencyAdmitted=true;
+      h.Put<uintptr_t>(LightingSlot+0x68,in.lightingT8.native);
+      const auto result=E::RecordPrivateCompute(h,in,[]{return true;});
+      assert(result.outcome==E::Outcome::PrivateRecordedRestored&&result.requestsIssued==5&&h.residencyChecks>=4); }
+    { Host h;auto in=Setup(h);AddLighting(h,in);h.residencyAdmitted=true;
+      h.Put<uintptr_t>(LightingSlot+0x68,in.lightingT8.native);
+      const auto result=E::RecordPrivateCompute(h,in,[&]{h.residencyAdmitted=false;return true;});
+      assert(result.outcome==E::Outcome::ScopeLostAfterPrivate&&!result.bindingsRestored); }
     for(unsigned change=0;change<5;++change)
     {
         Host h;auto in=Setup(h);AddLighting(h,in);

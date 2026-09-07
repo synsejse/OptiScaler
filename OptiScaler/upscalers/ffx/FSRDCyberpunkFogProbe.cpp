@@ -1891,6 +1891,7 @@ struct LightingCapturePlan
     Json exposureBindings;
     std::shared_ptr<FSRD::CyberpunkExposurePass::Work> exposureWork;
     FSRD::CyberpunkLightingSource::Snapshot lightingT8Source {};
+    uintptr_t lightingT8Engine = 0;
     FSRD::CyberpunkGuidePass::SourceView lightingT8View;
     Json lightingT8Bindings;
     bool lightingT8Prepared = false;
@@ -1984,6 +1985,18 @@ Json ObserveExposureBindings(const LightingCapturePlan& plan, uintptr_t expected
     return result;
 }
 
+uintptr_t CurrentLightingEngine(const LightingCapturePlan& plan)
+{
+    uintptr_t tls = 0, engine = 0, native = 0, pso = 0;
+    uint8_t initialized = 0;
+    if (!ReadEarly(uintptr_t(__readgsqword(0x58)), tls) || !ReadEarlyAt(tls, 0x14, initialized) || !initialized ||
+        !ReadEarlyAt(tls, 0x188, engine) || !engine ||
+        !ReadEarlyAt(engine, 0x30, native) || native != plan.list ||
+        !ReadEarlyAt(engine, 0x3d0, pso) || pso != uintptr_t(plan.pso.Get()))
+        throw std::runtime_error("current original lighting engine/list/PSO unavailable");
+    return engine;
+}
+
 bool SameLightingT8Source(const LightingCapturePlan& plan) noexcept
 {
     try
@@ -1993,7 +2006,8 @@ bool SameLightingT8Source(const LightingCapturePlan& plan) noexcept
         return lightingScope && lightingScope->serial == plan.serial && lightingScope->t8BindObserved &&
             lightingScope->t8BindCalls == 1 && lightingScope->t8Handle == plan.lightingT8Source.handle &&
             earlyHeapTrackingValid.load() && plan.lightingT8View.resource && plan.lightingT8View.heap &&
-            FSRD::CyberpunkLightingSource::Observe(memory, authenticatedImage.load(), plan.context, fresh) &&
+            plan.lightingT8Engine && CurrentLightingEngine(plan) == plan.lightingT8Engine &&
+            FSRD::CyberpunkLightingSource::Observe(memory, authenticatedImage.load(), plan.context, fresh, plan.lightingT8Engine) &&
             fresh == plan.lightingT8Source && uintptr_t(plan.lightingT8View.resource.Get()) == fresh.native &&
             plan.lightingT8View.descriptor.ptr == fresh.descriptor &&
             ObserveExposureBindings(plan, fresh.descriptor, 8, 1) == plan.lightingT8Bindings;
@@ -2013,7 +2027,12 @@ void PrepareLightingT8(LightingCapturePlan& plan)
             !lightingScope->t8BindObserved || lightingScope->t8BindCalls != 1)
             throw std::runtime_error("selected All_NRD shader or original PS t8 binder receipt absent");
         ExposureMemory memory;
-        if (!FSRD::CyberpunkLightingSource::Observe(memory, authenticatedImage.load(), plan.context, plan.lightingT8Source))
+        for (const auto& code : FSRD::CyberpunkLightingSource::Code)
+            if (!MatchLiveCode(authenticatedImage.load(), { code.rva, code.bytes, code.sha256 }))
+                throw std::runtime_error("native texture residency live body mismatch");
+        plan.lightingT8Engine = CurrentLightingEngine(plan);
+        if (!FSRD::CyberpunkLightingSource::Observe(memory, authenticatedImage.load(), plan.context,
+                                                   plan.lightingT8Source, plan.lightingT8Engine))
             throw std::runtime_error("current owner t8 resource/ordinary view route refused");
         const auto& source = plan.lightingT8Source;
         if (source.handle != lightingScope->t8Handle)
@@ -2059,6 +2078,17 @@ void PrepareLightingT8(LightingCapturePlan& plan)
         evidence["binder_first_register"] = 5; evidence["binder_count"] = lightingScope->t8BindCount;
         evidence["actual_pixel_binding"] = plan.lightingT8Bindings;
         evidence["native_view_format"] = unsigned(desc.Format);
+        if (source.externalSync)
+        {
+            const auto& residency = source.residency;
+            evidence["residency"] = { { "status", "already_registered_in_current_original_list" },
+                { "engine_context", residency.engineContext }, { "set", residency.set },
+                { "object", residency.object }, { "underlying", residency.underlying },
+                { "object_bytes", residency.objectBytes }, { "index", residency.index },
+                { "count", residency.count }, { "capacity", residency.capacity },
+                { "member_address", residency.memberAddress }, { "selected_member_bit", residency.memberBit },
+                { "native_insertion_required", false } };
+        }
         plan.lightingT8Prepared = true;
     }
     catch (const std::exception& error)
@@ -2257,6 +2287,18 @@ struct LightingEngineHost
     {
         return plan.lightingT8Prepared && texture.handle == plan.lightingT8Source.handle &&
             texture.native == plan.lightingT8Source.native && SameLightingT8Source(plan);
+    }
+    bool IsTextureResidencyAdmitted(uintptr_t registry,
+                                    const FSRD::CyberpunkEngineAccess::TextureBorrow& texture) noexcept
+    {
+        // Only this optional, actually bound original t8 may use the newly
+        // authenticated existing-member path. Other guides retain zero-only.
+        if (registry != plan.lightingT8Source.registry ||
+            !plan.lightingT8Source.residency.memberBit || !IsLightingT8Admitted(texture))
+            return false;
+        for (const auto& code : FSRD::CyberpunkLightingSource::Code)
+            if (!MatchLiveCode(authenticatedImage.load(), { code.rva, code.bytes, code.sha256 })) return false;
+        return true;
     }
     bool IsAdmittedFogScope(uint64_t serial, uintptr_t list, uintptr_t pso,
                             const std::array<FSRD::CyberpunkEngineAccess::TextureBorrow, 4>& inputs) noexcept

@@ -1,7 +1,10 @@
 """Compile the actual bounded final-lighting owner t8 reader, without game calls."""
 import os
+import hashlib
 from pathlib import Path
+import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -25,21 +28,45 @@ class LightingSource(unittest.TestCase):
 namespace S=FSRD::CyberpunkLightingSource;
 constexpr uintptr_t Image=0x140000000, Context=0x100000, View=0x200000,
     Owner=0x300000, Registry=0x400000, Native=0x500000, Descriptor=0x600000;
+constexpr uintptr_t Engine=0x700000, Set=0x710000, Array=0x720000, Allocator=0x730000;
 constexpr uintptr_t Slot(uint32_t handle=12) { return Registry+0x2f1d8+uintptr_t(handle-1)*0xb0; }
 struct Host
 {
     std::map<uintptr_t,std::vector<uint8_t>> memory;
     std::vector<uintptr_t> reads;
     uintptr_t throwing=0;
+    uintptr_t toggledWord=0;
+    uint64_t toggledBits=0;
+    unsigned changeAfterArray=0;
     template<class T> void Put(uintptr_t address,T value)
     { auto& bytes=memory[address];bytes.resize(sizeof(T));std::memcpy(bytes.data(),&value,sizeof(T)); }
     bool Read(uintptr_t address,void* output,size_t bytes)
     {
         reads.push_back(address);
         if(address==throwing)throw std::runtime_error("bounded memory unavailable");
-        const auto found=memory.find(address);
-        if(found==memory.end()||found->second.size()!=bytes)return false;
-        std::memcpy(output,found->second.data(),bytes);return true;
+        auto found=memory.upper_bound(address);
+        if(found==memory.begin())return false;
+        --found;
+        const auto offset=address-found->first;
+        if(offset>found->second.size()||bytes>found->second.size()-offset)return false;
+        std::memcpy(output,found->second.data()+offset,bytes);
+        if(address==toggledWord&&bytes==sizeof(uint64_t))
+        {
+            uint64_t word=0;std::memcpy(&word,output,sizeof(word));
+            Put<uint64_t>(address,word^toggledBits);
+        }
+        if(address==Array&&changeAfterArray)
+        {
+            const auto change=changeAfterArray;changeAfterArray=0;
+            if(change==1)Put<uintptr_t>(Array,0);
+            if(change==2)Put<uint32_t>(Set,99);
+            if(change==3)Put<uint8_t>(Set+0x24,0);
+            if(change==4)Put<uintptr_t>(Engine+0x630,Set+0x100);
+            if(change==5)Put<uintptr_t>(Set+8,Array+0x100);
+            if(change==6)Put<uint8_t>(Allocator+0x28,0);
+            if(change==7)Put<uintptr_t>(Slot()+0x68,Native+1);
+        }
+        return true;
     }
     bool WasRead(uintptr_t address)const
     { for(auto read:reads)if(read==address)return true;return false; }
@@ -62,9 +89,26 @@ Host Setup(uint32_t handle=12)
     h.Put<uint32_t>(Owner+0x26c,handle);h.Put<uintptr_t>(Image+0x3438a28,Registry);
     Texture(h,handle);return h;
 }
+void Residency(Host& h,uint32_t index=0,int32_t count=1,int32_t member=0)
+{
+    h.Put<uintptr_t>(Slot()+0x68,Native);h.Put<uint64_t>(Slot()+0x70,0x780000);
+    h.Put<uintptr_t>(Engine+0x630,Set);h.Put<uint32_t>(Set,index);
+    h.Put<uintptr_t>(Set+8,Array);h.Put<int32_t>(Set+0x10,count);
+    h.Put<int32_t>(Set+0x20,count);h.Put<uint8_t>(Set+0x24,1);h.Put<uint8_t>(Set+0x25,0);
+    h.Put<uintptr_t>(Set+0x28,Allocator);h.Put<uint8_t>(Allocator+0x28+index,1);
+    h.Put<uint64_t>(Slot()+0x88+8*(index>>6),1ull<<(index&63));
+    auto& bytes=h.memory[Array];bytes.resize(size_t(count)*sizeof(uintptr_t));
+    for(int32_t i=0;i<count;++i)
+    {
+        uintptr_t value=i==member?Slot()+0x60:0x800000+uintptr_t(i)*16;
+        std::memcpy(bytes.data()+size_t(i)*sizeof(value),&value,sizeof(value));
+    }
+}
 int main()
 {
     static_assert(std::is_trivially_copyable_v<S::Snapshot>);
+    static_assert(std::is_trivially_copyable_v<S::ResidencySnapshot>);
+    static_assert(S::ResidencyIndices==100&&S::MaxResidencyScan==4096);
     static_assert(noexcept(S::Observe(std::declval<Host&>(),0,0,std::declval<S::Snapshot&>())));
     const S::Snapshot empty;
     auto h=Setup();S::Snapshot out;
@@ -127,6 +171,71 @@ int main()
     assert(!S::IsFinalBind(Image,Image+0x155cc1,5,6,1));
     assert(!S::IsFinalBind(0,0x155cc0,5,6,1));
     assert(!S::IsFinalBind(UINTPTR_MAX,0x155cbf,5,6,1));
+    // No fifth context argument means the previous strict refusal is preserved.
+    h=Setup();Residency(h);assert(!S::Observe(h,Image,Context,out)&&out==empty);
+    assert(S::Observe(h,Image,Context,out,Engine));
+    assert(out.externalSync==Native&&out.residency.engineContext==Engine&&out.residency.set==Set);
+    assert(out.residency.object==Slot()+0x60&&out.residency.underlying==Native&&out.residency.objectBytes==0x780000);
+    assert(out.residency.array==Array&&out.residency.memberAddress==Array&&out.residency.allocator==Allocator);
+    assert(out.residency.memberBit&&out.residency.open==1&&!out.residency.outOfMemory&&out.residency.reserved==1);
+    assert(S::Observe(h,Image,Context,repeated,Engine)&&out==repeated);
+    auto registered=out;
+    S::ResidencySnapshot proof;
+    assert(S::ObserveRegisteredResidency(h,Engine,out,proof)&&proof==out.residency);
+    const S::ResidencySnapshot noProof;
+    assert(!S::ObserveRegisteredResidency(h,0,out,proof)&&proof==noProof);
+    // All 100 native indices fit the exact two-word membership representation.
+    for(uint32_t index:{0u,63u,64u,99u})
+    {
+        auto t=Setup();Residency(t,index,65,64);
+        assert(S::Observe(t,Image,Context,repeated,Engine));
+        assert(repeated.residency.index==index&&repeated.residency.memberAddress==Array+64*sizeof(uintptr_t));
+        assert(t.WasRead(Array)&&t.WasRead(Array+64*sizeof(uintptr_t)));
+    }
+    // Bounds include the diagnostic scan cap, without treating it as an engine maximum.
+    h=Setup();Residency(h,1,S::MaxResidencyScan,S::MaxResidencyScan-1);
+    assert(S::Observe(h,Image,Context,repeated,Engine));
+    auto refuseResident=[&](auto change)
+    {
+        auto t=Setup();Residency(t);change(t);auto result=registered;
+        assert(!S::Observe(t,Image,Context,result,Engine)&&result==empty);
+    };
+    refuseResident([](Host& t){t.Put<uintptr_t>(Slot()+0x68,Native+1);});
+    refuseResident([](Host& t){t.Put<uint64_t>(Slot()+0x70,0);});
+    refuseResident([](Host& t){t.Put<uintptr_t>(Engine+0x630,0);});
+    refuseResident([](Host& t){t.Put<uintptr_t>(Engine+0x630,UINTPTR_MAX-8);});
+    refuseResident([](Host& t){t.Put<uint32_t>(Set,100);});
+    refuseResident([](Host& t){t.Put<uint32_t>(Set,0xffffffff);});
+    refuseResident([](Host& t){t.Put<uintptr_t>(Set+8,0);});
+    refuseResident([](Host& t){t.Put<uintptr_t>(Set+8,UINTPTR_MAX-4);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x10,0);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x10,-1);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x10,S::MaxResidencyCapacity+1);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x20,0);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x20,-1);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x20,2);});
+    refuseResident([](Host& t){t.Put<int32_t>(Set+0x10,5000);t.Put<int32_t>(Set+0x20,4097);});
+    refuseResident([](Host& t){t.Put<uint8_t>(Set+0x24,0);});
+    refuseResident([](Host& t){t.Put<uint8_t>(Set+0x24,2);});
+    refuseResident([](Host& t){t.Put<uint8_t>(Set+0x25,1);});
+    refuseResident([](Host& t){t.Put<uintptr_t>(Set+0x28,0);});
+    refuseResident([](Host& t){t.Put<uint8_t>(Allocator+0x28,0);});
+    refuseResident([](Host& t){t.Put<uint64_t>(Slot()+0x88,0);});
+    refuseResident([](Host& t){t.Put<uintptr_t>(Array,Slot()+0x60+1);});
+    refuseResident([](Host& t){t.memory.erase(Array);});
+    refuseResident([](Host& t){t.throwing=Array;});
+    refuseResident([](Host& t){t.toggledWord=Slot()+0x88;t.toggledBits=1;});
+    for(unsigned change=1;change<=7;++change)
+        refuseResident([&](Host& t){t.changeAfterArray=change;});
+    h=Setup();Residency(h,0,2,0);h.Put(Array,std::array<uintptr_t,2>{Slot()+0x60,Slot()+0x60});
+    assert(!S::Observe(h,Image,Context,repeated,Engine)&&repeated==empty);
+    // Other command-list bits may change between reads and between snapshots.
+    h=Setup();Residency(h);h.toggledWord=Slot()+0x88;h.toggledBits=1ull<<17;
+    assert(S::Observe(h,Image,Context,repeated,Engine)&&repeated==registered);
+    h.Put<uint64_t>(Slot()+0x88,(1ull<<32)|1);
+    assert(S::Observe(h,Image,Context,repeated,Engine)&&repeated==registered);
+    // Unmanaged resources do not read or rely on a supplied residency context.
+    h=Setup();assert(S::Observe(h,Image,Context,repeated,Engine)&&!h.WasRead(Engine+0x630));
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-lighting-source-") as directory:
@@ -139,6 +248,30 @@ int main()
                                         capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 subprocess.run([str(output)], check=True)
+
+    def test_exact_residency_code_manifest_matches_installed_executable(self):
+        executable = Path('/home/synse/Games/Heroic/Games/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe')
+        if not executable.is_file():
+            self.skipTest('Exact local executable fixture unavailable')
+        data = executable.read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(),
+                         'a7de82945c03e041fc7339fcf9066224d98db2f5d80fea50f7947bb350a60991')
+        pe = struct.unpack_from('<I', data, 0x3c)[0]
+        sections = struct.unpack_from('<H', data, pe + 6)[0]
+        optional = struct.unpack_from('<H', data, pe + 20)[0]
+        ranges = []
+        for index in range(sections):
+            offset = pe + 24 + optional + index * 40
+            virtual_bytes, rva, _, raw = struct.unpack_from('<IIII', data, offset + 8)
+            ranges.append((rva, virtual_bytes, raw))
+        entries = re.findall(r'\{ (0x[0-9a-f]+), (0x[0-9a-f]+), "([0-9a-f]{64})" \}', HEADER.read_text())
+        self.assertEqual(len(entries), 3)
+        self.assertEqual([int(entry[0], 16) for entry in entries], [0x1f5a28, 0x1fe694, 0x1fe5f4])
+        for rva, count, digest in entries:
+            rva, count = int(rva, 16), int(count, 16)
+            section = next(item for item in ranges if item[0] <= rva and rva + count <= item[0] + item[1])
+            offset = section[2] + rva - section[0]
+            self.assertEqual(hashlib.sha256(data[offset:offset + count]).hexdigest(), digest)
 
     def test_host_bound_use_and_cpu_constants_proof_labels(self):
         source = (HEADER.parent / "FSRDCyberpunkFogProbe.cpp").read_text()

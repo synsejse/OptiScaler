@@ -216,14 +216,22 @@ template <typename Host> bool ReadTexture(Host& host, uintptr_t registry, const 
     if (!texture.handle || texture.handle > 0x8000 || !texture.native)
         return false;
     const uintptr_t slot = 0x2f1d8 + uintptr_t(texture.handle - 1) * 0xb0;
-    uintptr_t native = 0, externalSynchronization = 0;
+    uintptr_t native = 0, residencyResource = 0;
     uint8_t flags = 0;
-    return Read(host, registry, slot - 8, refs) && refs > 0 &&
+    if (!(Read(host, registry, slot - 8, refs) && refs > 0 &&
         Read(host, registry, slot, native) && native == texture.native &&
-        // Unsupported paths: +0x56 bit6 skips state requests, +0x68 invokes
-        // the separate synchronization helper. Do not claim either is handled.
+        // The skip-state branch remains unsupported. Nonzero +0x68 is the
+        // managed residency object's underlying resource, not a fence.
         Read(host, registry, slot + 0x56, flags) && !(flags & 0x40) &&
-        Read(host, registry, slot + 0x68, externalSynchronization) && !externalSynchronization;
+        Read(host, registry, slot + 0x68, residencyResource)))
+        return false;
+    if (!residencyResource) return true;
+    if (residencyResource != texture.native) return false;
+    // Only a host with exact current original-use and already-registered
+    // residency proof may opt in. Legacy adapters retain the old refusal.
+    if constexpr (requires { host.IsTextureResidencyAdmitted(registry, texture); })
+        return host.IsTextureResidencyAdmitted(registry, texture);
+    return false;
 }
 
 template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& saved)
@@ -300,6 +308,10 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
 //   It receives a fixed COPY_SOURCE|NON_PIXEL|PIXEL read request. Native state
 //   may remain a compatible superset; subsequent diagnostic readback must NOT
 //   emit a source barrier with a guessed exact StateBefore/restore value.
+// - Optional IsTextureResidencyAdmitted must authenticate the original native
+//   residency helper and prove this original-use resource already belongs to
+//   the current list's open residency set. Pointer equality alone is not proof.
+//   It is rechecked with each ReadTexture; no implicit insertion is admitted.
 // - CurrentNativeList invokes the authenticated Win64 void*() getter.
 // - RequestState invokes void(context*, uint32 handle, uint32 nativeState,
 //   uint32 subresource); Flush invokes void(context*); Reenter invokes void(list*).
