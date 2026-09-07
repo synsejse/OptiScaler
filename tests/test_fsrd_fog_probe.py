@@ -1,4 +1,4 @@
-"""Metadata-only fog probe integration guards; Windows CI/live testing are separate."""
+"""Fog probe/capture integration guards; Windows CI/live testing are separate."""
 from pathlib import Path
 import re
 import unittest
@@ -52,10 +52,17 @@ class FogProbe(unittest.TestCase):
         self.assertIn("~RestoreScope() { scope = previous; }", hook)
         self.assertIn("if (!scope || inMetadata)", function("LogDraw"))
 
-    def test_metadata_only_and_no_resource_state_or_file_writes(self):
-        for mutation in ("->Draw", "->Dispatch", "->Copy", "->ResourceBarrier", "->SetPipelineState",
-                         "->OMSetRenderTargets", "WriteFile(", "CreateShaderResourceView", "CreateRenderTargetView"):
-            self.assertNotIn(mutation, SOURCE)
+    def test_metadata_only_path_cannot_capture_or_mutate_render_state(self):
+        draw = function("HookDraw")
+        self.assertLess(draw.index("captureEnabled.load() && !inMetadata && scope"), draw.index("PrepareCapture("))
+        self.assertLess(function("PrepareCapture").index("!captureEnabled.load()"),
+                        function("PrepareCapture").index("CopyMain("))
+        self.assertLess(function("PrepareAuthoredPso").index("!captureEnabled.load()"),
+                        function("PrepareAuthoredPso").index("originalCreateGraphics("))
+        for name in ("HookFogNode", "HookSetPso", "HookSetRtv", "LogDraw"):
+            for mutation in ("->Draw", "->Dispatch", "->Copy", "->ResourceBarrier", "->SetPipelineState",
+                             "->OMSetRenderTargets", "WriteFile(", "CreateRenderTargetView"):
+                self.assertNotIn(mutation, function(name))
         self.assertIn("originalSetRtv(list, count, rtvs, contiguous, dsv)", SOURCE)
 
     def test_never_claims_preexisting_pso_or_rtv_was_observed(self):
@@ -98,6 +105,118 @@ class FogProbe(unittest.TestCase):
         self.assertLess(poll.index("if (!DeleteFileW(request.c_str()))"), poll.index("drawLogs.store(0)"))
         self.assertNotIn("scopes.store", poll)
         self.assertIn("not a frame association", poll)
+
+    def test_capture_requires_separate_flag_and_explicit_one_shot_request(self):
+        self.assertIn("FfxDenoiserCyberpunkFogCapture.value_or_default()", function("Initialize"))
+        poll = function("PollRearm")
+        self.assertIn("captureEnabled.load() && captureTrackingValid.load()", poll)
+        self.assertIn('L"FSRRR-fog-capture.request"', poll)
+        self.assertIn("FSRDFogLayerCapture::Request()", poll)
+        prepare = function("PrepareCapture")
+        self.assertIn("!FSRDFogLayerCapture::WantsCapture()", prepare)
+        self.assertIn("captureStarted.exchange(true)", prepare)
+
+    def test_rtv_resource_is_acquired_at_bind_never_from_late_cpu_handle(self):
+        bind = function("HookSetRtv")
+        self.assertIn("FSRDFogLayerCapture::WantsCapture()", bind)
+        self.assertIn("bound.resource = slot->resource", bind)
+        self.assertIn("bound.view = slot->view", bind)
+        self.assertIn("bound.slotGeneration = slot->generation", bind)
+        self.assertLess(bind.index("bound.resource = slot->resource"), bind.index("originalSetRtv("))
+        prepare = function("PrepareCapture")
+        self.assertIn("const auto& bound = s.boundRtv", prepare)
+        self.assertIn("plan->main = bound.resource", prepare)
+        self.assertNotIn("FindRtv(", prepare)
+
+    def test_frozen_original_rtv_restores_binding_despite_cpu_slot_recycling(self):
+        prepare = function("PrepareCapture")
+        self.assertIn("heapDesc.NumDescriptors = 2", prepare)
+        self.assertIn("CreateRenderTargetView(plan->main.Get(), &plan->originalView, plan->frozenOriginalRtv)", prepare)
+        finish = function("FinishCapture")
+        self.assertIn("originalSetRtv(list, 1, &plan.frozenOriginalRtv, plan.contiguous, nullptr)", finish)
+        self.assertNotIn("&plan.originalRtv", finish)
+        self.assertIn("s.hasDsv", prepare)
+
+    def test_state_history_is_reset_scoped_and_ambiguity_refuses_capture(self):
+        reset = function("HookReset")
+        self.assertLess(reset.index("originalReset("), reset.index("if (SUCCEEDED(hr))"))
+        self.assertIn("state = {}", reset)
+        self.assertIn("state.generation = ++data.nextRecording", reset)
+        self.assertIn("data.lists.erase(identity.Get())", function("HookCreateList"))
+        self.assertIn("state.known = false", function("HookClearState"))
+        self.assertIn("state.known = false", function("HookExecuteBundle"))
+        prepare = function("PrepareCapture")
+        for guard in ("!foundState->second.known", "foundState->second.predicated",
+                      "foundState->second.renderPass", "foundState->second.queryCount",
+                      "foundState->second.viewportCount != 1", "foundState->second.scissorCount != 1"):
+            self.assertIn(guard, prepare)
+        self.assertIn("D3D12_QUERY_TYPE_TIMESTAMP", function("HookEndQuery"))
+        self.assertIn("QueryInterface(IID_PPV_ARGS(&identity))", function("ListIdentity"))
+
+    def test_exact_vertex_and_pixel_code_and_no_side_effect_pipeline_guards(self):
+        clone = function("PrepareAuthoredPso")
+        self.assertIn("174ce05e0a97ce65f80358b2a01bbadea4c314fb386cfac6064940a870f91a5a", SOURCE)
+        self.assertIn("hash.Finish() != FogVertexSha256", clone)
+        for guard in ("desc.GS.BytecodeLength", "desc.HS.BytecodeLength", "desc.DS.BytecodeLength",
+                      "desc.StreamOutput.NumEntries", "desc.StreamOutput.NumStrides", "desc.InputLayout.NumElements",
+                      "desc.DepthStencilState.DepthEnable", "desc.DepthStencilState.StencilEnable",
+                      "desc.SampleDesc.Count != 1", "desc.NumRenderTargets != 1", "!streamSafe"):
+            self.assertIn(guard, clone)
+        self.assertIn("tagged.vertexBytes.assign", clone)
+        self.assertIn("tagged.pixelBytes.assign", clone)
+        self.assertIn("tagged.root = desc.pRootSignature", clone)
+        self.assertIn("clone.CachedPSO = {}", clone)
+        self.assertIn("DXGI_FORMAT_R32G32B32A32_FLOAT", clone)
+        self.assertIn("BlendEnable = FALSE", clone)
+
+    def test_capture_storage_retained_before_first_gpu_copy(self):
+        prepare = function("PrepareCapture")
+        self.assertLess(prepare.index("FSRDSubmission::Retain("), prepare.index("CopyMain("))
+        self.assertIn("mainBytes + 2 * copyBytes + authoredBytes > MaxCaptureTextureBytes", prepare)
+        self.assertIn("MaxCaptureTextureBytes = 256ull * 1024 * 1024", SOURCE)
+        self.assertIn("D3D12_RTV_DIMENSION_TEXTURE2D", prepare)
+        self.assertIn("bound.view.Texture2D.MipSlice != 0", prepare)
+        self.assertIn("desc.DepthOrArraySize != 1", prepare)
+        self.assertIn("desc.SampleDesc.Count != 1", prepare)
+        self.assertIn("plan->layers", function("FinishCapture"))
+        self.assertNotIn("Record(plan->device.Get(), list, plan->main", SOURCE)
+
+    def test_same_draw_before_after_then_private_layer_zero_clear_and_restore(self):
+        draw = function("HookDraw")
+        self.assertLess(draw.index("PrepareCapture("), draw.index("originalDraw("))
+        self.assertLess(draw.index("originalDraw("), draw.index("FinishCapture("))
+        finish = function("FinishCapture")
+        self.assertLess(finish.index("CopyMain("), finish.index("ClearRenderTargetView("))
+        self.assertIn("const FLOAT clear[] = { 0, 0, 0, 0 }", finish)
+        self.assertLess(finish.index("&plan->authoredRtv"), finish.index("originalDraw(list, 3, 1, 0, 0)"))
+        self.assertIn("~RestoreDrawState()", finish)
+        self.assertLess(finish.index("originalDraw(list, 3, 1, 0, 0)"), finish.index("FSRDFogLayerCapture::Record("))
+        for forbidden in ("->SetGraphicsRootSignature", "->SetDescriptorHeaps", "->RSSetViewports", "->RSSetScissorRects"):
+            self.assertNotIn(forbidden, SOURCE)
+        self.assertIn("~RestoreMainState()", function("CopyMain"))
+
+    def test_capture_does_not_claim_a_later_rr_frame_association(self):
+        prepare = function("PrepareCapture")
+        self.assertIn('{ "rr_frame_association", "not_established" }', prepare)
+        self.assertIn('"scope_serial"', prepare)
+        self.assertIn('"command_list_generation"', prepare)
+        self.assertIn('"viewports"', prepare)
+        self.assertIn('"scissor_rects"', prepare)
+
+    def test_descriptor_and_list_tracking_bounded_and_forwarded_once(self):
+        self.assertIn("MaxRtvHeaps = 64, MaxRtvSlots = 65536, MaxCommandLists = 128", SOURCE)
+        self.assertIn("captureTrackingValid.store(false)", function("Track"))
+        copied = function("TrackDescriptorCopy")
+        self.assertLess(copied.index("snapshot.push_back"), copied.index("*slot = snapshot[cursor]"))
+        for hook, original in (("HookCreateHeap", "originalCreateHeap"), ("HookCreateRtv", "originalCreateRtv"),
+                               ("HookCreateList", "originalCreateList"), ("HookCopyDescriptors", "originalCopyDescriptors"),
+                               ("HookCopyDescriptorsSimple", "originalCopyDescriptorsSimple"), ("HookReset", "originalReset"),
+                               ("HookClearState", "originalClearState"), ("HookSetPredication", "originalSetPredication"),
+                               ("HookBeginQuery", "originalBeginQuery"), ("HookEndQuery", "originalEndQuery"),
+                               ("HookExecuteBundle", "originalExecuteBundle"), ("HookSetViewports", "originalSetViewports"),
+                               ("HookSetScissors", "originalSetScissors"), ("HookBeginRenderPass", "originalBeginRenderPass"),
+                               ("HookEndRenderPass", "originalEndRenderPass")):
+            self.assertEqual(function(hook).count(original + "("), 1)
 
 
 if __name__ == "__main__":
