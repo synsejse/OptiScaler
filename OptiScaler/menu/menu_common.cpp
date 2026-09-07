@@ -20,6 +20,7 @@
 #include <upscaler_time/UpscalerTime_Vk.h>
 #include <upscalers/ffx/FSRDResearchCapture.h>
 #include <upscalers/ffx/FSRDDiagnostics.h>
+#include <upscalers/ffx/FSRDPreFogSession.h>
 
 #include <imgui/imgui_internal.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -2824,6 +2825,12 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         FSRDResearch::Poll();
         if (currentBackend == Upscaler::FSRD)
         {
+            if (FSRD::PreFogSession::LateSrOnly())
+            {
+                ImGui::TextWrapped("Pre-Fog experiment: late SR only. Early denoising is one-shot, not continuous.");
+                ShowHelpMarker("Frames without the explicit early scene test remain noisy.\n"
+                               "No late denoiser fallback; RR debug controls are inactive. Restart to change this route.");
+            }
             if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())
             {
                 ImGui::TextUnformatted("Lighting: Fused");

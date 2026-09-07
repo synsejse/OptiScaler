@@ -23,6 +23,10 @@ void HookCommandList(ID3D12GraphicsCommandList* commandList);
 // one-shot packet for an explicit FSRRR-prefog-reset.request JSON marker; its
 // supplied extent is allocation metadata, never a future frame association.
 void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept;
+// The same explicit RESET marker may select "scene_reset_once" only in a
+// restart-fixed CyberpunkPreFogExperiment session. One composed private RESET
+// result then replaces original pre-Fog RGB, never alpha. Original Fog runs once;
+// late evaluations stay SR-only. This is NOT continuous temporal denoising.
 // Separate one-shot FSRRR-prefog-rgb-identity.request JSON marker with exactly
 // {"mode":"rgb_identity_only"}. Requires an unused authenticated capture session.
 // Copies pre-Fog RGB back through the approved RGB-only raster helper, snapshots

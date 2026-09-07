@@ -75,7 +75,15 @@ class PrivateResetHost(unittest.TestCase):
         self.assertNotIn('PrivateDenoise::Work', capture_plan)
         self.assertNotIn('PrivateResetPacket', capture_plan)
         feature = (BASE / 'FSRDFeature_Dx12.cpp').read_text()
-        self.assertRegex(feature, r'if \(_denoiser.IsCreated\(\)\)\s*FSRDCyberpunkFogProbe::ArmPrivateReset\(')
+        poll = body(feature, 'void FSRDFeatureDx12::PollPreFogExperiments()',
+                    'bool FSRDFeatureDx12::EvaluatePreFogSrOnly(')
+        self.assertRegex(poll, r'if \(_denoiser.IsCreated\(\)\)\s*FSRDCyberpunkFogProbe::ArmPrivateReset\(')
+        self.assertEqual(feature.count('PollPreFogExperiments();'), 2)
+        fixed_route = body(feature, 'bool FSRDFeatureDx12::EvaluatePreFogSrOnly(',
+                           'bool FSRDFeatureDx12::Evaluate(')
+        self.assertIn('PollPreFogExperiments();', fixed_route)
+        self.assertLess(record.index('work->Record(list)'), record.index('RecordSceneReset(list, plan, *packet)'))
+        self.assertLess(record.index('RecordSceneReset(list, plan, *packet)'), record.index('attempted.complete = true'))
 
     def test_request_reader_lifetime_ends_before_windows_delete(self):
         arm = body(HOST, 'void ArmPrivateReset(', 'uint64_t AdmitPrivateResetSubmission(')
@@ -96,6 +104,7 @@ class PrivateResetHost(unittest.TestCase):
         self.assertIn('seal.rayTerminal = packet->rayTerminal', lighting)
         fog = body(HOST, 'void FinishCapture(', 'bool MatchesFinalLightingDraw(')
         self.assertLess(fog.index('FSRDFogLayerCapture::Record('), fog.index('policy.SealConsumer('))
+        self.assertIn('(packet->sceneResetOnce && !plan->sceneResetWritten)', fog)
         draw = body(HOST, 'void WINAPI HookDraw(', 'void WINAPI HookDrawIndexed(')
         self.assertEqual(draw.count('originalDraw(list, count, instances, start, firstInstance);'), 1)
         self.assertLess(draw.index('PrepareCapture('), draw.index('originalDraw('))

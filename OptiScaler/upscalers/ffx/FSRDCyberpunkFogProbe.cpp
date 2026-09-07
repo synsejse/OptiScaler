@@ -16,6 +16,7 @@
 #include "FSRDCyberpunkFogDepthCopy.h"
 #include "FSRDCyberpunkFogDenoiseAccess.h"
 #include "FSRDCyberpunkFogRgbWrite.h"
+#include "FSRDPreFogSession.h"
 #include "FSRDPrivateRayCopy.h"
 #include "FSRDCyberpunkResetCamera.h"
 #include "FSRDCyberpunkLightingConstants.h"
@@ -390,6 +391,7 @@ struct PrivateResetPacket
     UINT width = 0, height = 0;
     float delta = 0;
     bool rayClaimed = false, guideClaimed = false, fogClaimed = false;
+    bool sceneResetOnce = false; // Immutable after publication; requires fixed late-SR-only session.
     ResetPolicy::Recording producer {};
 };
 // Published only after CPU allocation/provider initialization has completed on
@@ -2417,6 +2419,7 @@ struct CapturePlan
     uint32_t depthFrame = 0;
     bool depthPrepared = false;
     bool rgbIdentity = false, rgbIdentityPrepared = false;
+    bool sceneResetOnce = false, sceneResetWritten = false;
     UINT64 retainedTextureBytes = 0;
 };
 
@@ -3781,15 +3784,13 @@ bool IsFullRgbViewport(const ListState& state, UINT width, UINT height) noexcept
         r.left == 0 && r.top == 0 && r.right == LONG(width) && r.bottom == LONG(height);
 }
 
-bool SameFogRgbSource(const CapturePlan& plan) noexcept
+bool SameFogRgbTarget(const CapturePlan& plan, UINT width, UINT height, IUnknown* deviceIdentity) noexcept
 {
     try
     {
-        auto* packet = rgbIdentityPacket.load(std::memory_order_acquire);
-        if (!packet || privateResetPacket.load(std::memory_order_acquire) || privateResetArming.load(std::memory_order_acquire) ||
-            !plan.rgbIdentity || !plan.rgbIdentityPrepared || !plan.privateHeap || !plan.frozenOriginalRtv.ptr ||
-            !plan.layers.before.resource || plan.layers.before.state != D3D12_RESOURCE_STATES(0xc0) ||
-            !plan.layers.rgbIdentity.resource || !originalSetRtv || !originalSetPso || !SameFogDepthSource(plan)) return false;
+        if (!deviceIdentity || privateResetArming.load(std::memory_order_acquire) ||
+            !plan.privateHeap || !plan.frozenOriginalRtv.ptr || !originalSetRtv || !originalSetPso ||
+            !SameFogDepthSource(plan)) return false;
         const auto& d = plan.depthSnapshot;
         const auto& current = *scope;
         const auto& bound = current.boundRtv;
@@ -3803,7 +3804,7 @@ bool SameFogRgbSource(const CapturePlan& plan) noexcept
             bound.heap.Get() != plan.sourceHeap.Get() || bound.view.Format != view.Format ||
             bound.view.ViewDimension != view.ViewDimension || bound.view.Texture2D.MipSlice != view.Texture2D.MipSlice ||
             bound.view.Texture2D.PlaneSlice != view.Texture2D.PlaneSlice ||
-            FAILED(plan.device->QueryInterface(IID_PPV_ARGS(&identity))) || !identity || identity.Get() != packet->deviceIdentity.Get())
+            FAILED(plan.device->QueryInterface(IID_PPV_ARGS(&identity))) || !identity || identity.Get() != deviceIdentity)
             return false;
         // Scope holds the actual original-use RTV resource/view, not a reread of
         // its reusable CPU slot. The approved helper changes no IA/RS/VRS; the
@@ -3814,9 +3815,18 @@ bool SameFogRgbSource(const CapturePlan& plan) noexcept
         const auto found = data.lists.find(plan.endpoint->list.Get());
         return found != data.lists.end() && found->second.known && !found->second.predicated &&
             !found->second.renderPass && !found->second.queryCount && found->second.generation == plan.drawState.generation &&
-            IsFullRgbViewport(found->second, packet->width, packet->height);
+            IsFullRgbViewport(found->second, width, height);
     }
     catch (...) { return false; }
+}
+
+bool SameFogRgbSource(const CapturePlan& plan) noexcept
+{
+    auto* packet = rgbIdentityPacket.load(std::memory_order_acquire);
+    return packet && !privateResetPacket.load(std::memory_order_acquire) &&
+        plan.rgbIdentity && plan.rgbIdentityPrepared && plan.layers.before.resource &&
+        plan.layers.before.state == D3D12_RESOURCE_STATES(0xc0) && plan.layers.rgbIdentity.resource &&
+        SameFogRgbTarget(plan, packet->width, packet->height, packet->deviceIdentity.Get());
 }
 
 struct FogRgbEngineHost : FogDepthEngineHost
@@ -4086,6 +4096,68 @@ void RecordFogDepth(ID3D12GraphicsCommandList* list, CapturePlan& plan)
     }
 }
 
+struct FogSceneResetEngineHost : FogRgbEngineHost
+{
+    explicit FogSceneResetEngineHost(const CapturePlan& value) : FogRgbEngineHost(value) {}
+    bool IsAdmittedFogRgbScope(const FSRD::CyberpunkFogDenoiseAccess::Input& input) noexcept
+    {
+        auto* packet = privateResetPacket.load(std::memory_order_acquire);
+        if (input.copySource || !FSRD::PreFogSession::LateSrOnly() || !packet || !packet->sceneResetOnce ||
+            rgbIdentityPacket.load(std::memory_order_acquire) || plan.rgbIdentity || !plan.sceneResetOnce ||
+            plan.sceneResetWritten || !packet->denoise || !packet->denoise->Recorded() ||
+            !plan.layers.privateReset[2].resource || plan.layers.privateReset[2].state != D3D12_RESOURCE_STATES(0xc0) ||
+            plan.layers.privateReset[2].resource.Get() != packet->denoise->Outputs().composed.Get() ||
+            packet->consumerIdentity.Get() != plan.endpoint->list.Get()) return false;
+        {
+            std::lock_guard lock(packet->mutex);
+            if (!packet->fogClaimed || packet->policy.Failed()) return false;
+        }
+        return SameFogRgbTarget(plan, packet->width, packet->height, packet->deviceIdentity.Get());
+    }
+};
+
+void RecordSceneReset(ID3D12GraphicsCommandList* list, CapturePlan& plan, PrivateResetPacket& packet)
+{
+    if (!packet.sceneResetOnce) return;
+    if (!plan.sceneResetOnce || plan.rgbIdentity || plan.sceneResetWritten || !FSRD::PreFogSession::LateSrOnly())
+        throw std::runtime_error("scene RESET requires the fixed late-SR-only route and a fresh admitted target");
+    const char* error = nullptr;
+    // The existing private RESET dispatch/compositor has already restored native
+    // bindings. Its output is shader-readable on this SAME consumer recording;
+    // the retained packet's mandatory pre-submit producer gate remains in force.
+    auto work = FSRD::CyberpunkFogRgbWrite::Prepare(plan.device.Get(), packet.width, packet.height,
+        plan.layers.privateReset[2].resource, plan.main, plan.originalView, plan.drawState.viewports[0],
+        plan.drawState.scissors[0], &error);
+    if (!work) throw std::runtime_error(error && *error ? error : "scene RESET RGB preparation refused");
+    FogSceneResetEngineHost host { plan };
+    FSRD::CyberpunkFogDenoiseAccess::Input input;
+    input.image = authenticatedImage.load(); input.list = uintptr_t(list);
+    input.originalPso = uintptr_t(plan.originalPso.Get()); input.originalFogScope = plan.depthSnapshot.scope.serial;
+    input.depth = { plan.depthSnapshot.handle, plan.depthSnapshot.native };
+    const auto result = FSRD::CyberpunkFogDenoiseAccess::RecordSceneRgb(host, input, [&] { return work->Record(list); });
+    if (result.outcome == FSRD::CyberpunkFogDenoiseAccess::SceneOutcome::ScopeLostAfterMutation ||
+        (result.bindingsRestored && !host.targetRestored)) PrivateResetFatal();
+    if (result.outcome != FSRD::CyberpunkFogDenoiseAccess::SceneOutcome::SceneRecordedRestored ||
+        !result.bindingsRestored || !host.targetRestored || !work->Recorded())
+        throw std::runtime_error("scene RESET RGB recording/restoration refused; consumer must not submit");
+    plan.sceneResetWritten = true;
+    plan.layers.privateResetSceneWrite = true;
+    const auto& source = plan.depthSnapshot.scope;
+    plan.provenance["scene_reset_control"] = {
+        { "mode", "scene_reset_once" }, { "status", "RGB_recorded_original_bindings_restored" },
+        { "late_route", "fixed_SR_only" }, { "temporal_history", "independent_one_shot_RESET_only" },
+        { "source", "same_consumer_private_RESET_composed" },
+        { "source_address", uintptr_t(plan.layers.privateReset[2].resource.Get()) },
+        { "target_address", uintptr_t(plan.main.Get()) }, { "scope", source.serial },
+        { "list", source.list }, { "recording_generation", source.recordingGeneration },
+        { "view", source.view }, { "frame_source_object", plan.depthFrameObject }, { "frame_source_value", plan.depthFrame },
+        { "render_extent", { packet.width, packet.height } },
+        { "alpha", "native_target_alpha_unwritten" }, { "bindings_restored", true },
+        { "original_target_restored", true }, { "draw_recorded", true },
+        { "submission", "existing_producer_and_complete_consumer_gate_required" },
+        { "displayed_frame", "not_captured_by_this_readback" } };
+}
+
 void RecordPrivateReset(ID3D12GraphicsCommandList* list, CapturePlan& plan)
 {
     auto* packet = privateResetPacket.load(std::memory_order_acquire);
@@ -4209,6 +4281,8 @@ void RecordPrivateReset(ID3D12GraphicsCommandList* list, CapturePlan& plan)
         { "first_read_ordinal", firstRead }, { "temporal_history", "independent one-shot RESET only" } };
     // Seal only after subsequent original/private draw and readback recording in
     // FinishCapture. Exceptions anywhere before that leave the gate unsealed.
+    RecordSceneReset(list, plan, *packet);
+    plan.provenance["private_reset"]["scene_modified"] = plan.sceneResetWritten;
     attempted.complete = true;
 }
 
@@ -4234,6 +4308,8 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     auto plan = std::make_shared<CapturePlan>();
     const auto* rgbPacket = rgbIdentityPacket.load(std::memory_order_acquire);
     plan->rgbIdentity = rgbPacket != nullptr;
+    const auto* resetPacket = privateResetPacket.load(std::memory_order_acquire);
+    plan->sceneResetOnce = resetPacket && resetPacket->sceneResetOnce;
     plan->endpoint = std::make_shared<EndpointTrace>();
     ListState state;
     {
@@ -4340,15 +4416,18 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         RefuseCapture("RTV resource is not a supported single-array/single-sample RGBA16F target");
         return {};
     }
-    if (plan->rgbIdentity &&
-        (privateResetPacket.load(std::memory_order_acquire) || lightingRequested.load() || earlyRequested.load() ||
+    const UINT writeWidth = rgbPacket ? rgbPacket->width : (resetPacket ? resetPacket->width : 0);
+    const UINT writeHeight = rgbPacket ? rgbPacket->height : (resetPacket ? resetPacket->height : 0);
+    if ((plan->rgbIdentity || plan->sceneResetOnce) &&
+        ((plan->rgbIdentity && (resetPacket || lightingRequested.load() || earlyRequested.load())) ||
+         (plan->sceneResetOnce && (rgbPacket || !FSRD::PreFogSession::LateSrOnly())) ||
          !s.fogHelper || nativeCaller != authenticatedImage.load() + FSRD::CyberpunkFogDepth::DrawReturnRva ||
          desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.MipLevels != 1 ||
          desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
-         desc.Width != rgbPacket->width || desc.Height != rgbPacket->height ||
-         !IsFullRgbViewport(state, rgbPacket->width, rgbPacket->height)))
+         desc.Width != writeWidth || desc.Height != writeHeight ||
+         !IsFullRgbViewport(state, writeWidth, writeHeight)))
     {
-        RefuseCapture("RGB identity requires exact full typed RGBA16F original Fog draw and exclusive mode");
+        RefuseCapture("pre-Fog RGB write requires exact full typed RGBA16F original draw and exclusive mode");
         return {};
     }
     Json earlyAvailability;
@@ -4596,7 +4675,7 @@ void FinishCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<Captur
         auto* packet = privateResetPacket.load(std::memory_order_acquire);
         const auto point = PrivateResetPoint(plan->endpoint->list.Get(), plan->drawState.generation);
         std::lock_guard lock(packet->mutex);
-        if (!recorded || !packet->policy.SealConsumer(
+        if (!recorded || (packet->sceneResetOnce && !plan->sceneResetWritten) || !packet->policy.SealConsumer(
             { uintptr_t(plan->endpoint->list.Get()), plan->drawState.generation }, point, true, true))
             throw std::runtime_error("private RESET completed consumer seal refused");
     }
@@ -5093,14 +5172,19 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
                 std::ifstream file(path, std::ios::binary);
                 file >> controls;
             }
-            if (controls.at("mode") != "private_reset_only" ||
+            const bool sceneReset = controls.at("mode") == "scene_reset_once";
+            if ((controls.at("mode") != "private_reset_only" && !sceneReset) ||
                 controls.at("delta_source") != "explicit_reset_control_not_captured_duration")
-                throw std::runtime_error("private RESET requires explicit private-only experiment controls");
+                throw std::runtime_error("RESET requires explicit private-only or one-shot scene experiment controls");
+            if (sceneReset && (!FSRD::PreFogSession::LateSrOnly() ||
+                !MatchLiveCode(authenticatedImage.load(), FogTopologyCode)))
+                throw std::runtime_error("scene RESET requires restart-fixed late-SR-only mode and authenticated RGB target route");
             ComPtr<IUnknown> identity;
             if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))))
                 throw std::runtime_error("private RESET device identity unavailable");
             auto packet = std::make_unique<PrivateResetPacket>(uintptr_t(identity.Get()));
             packet->device = device; packet->deviceIdentity = identity;
+            packet->sceneResetOnce = sceneReset;
             packet->width = width; packet->height = height;
             packet->provider = controls.at("provider_id").get<uint64_t>();
             packet->delta = controls.at("delta_ms").get<float>();
@@ -5143,7 +5227,8 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
             privateResetPacket.store(packet.release(), std::memory_order_release);
             lightingRequestedAt.store(GetTickCount64());
             lightingRequested.store(true);
-            LOG_INFO("[FSRRR private RESET] armed {}x{} fixed private targets; no game writes; exact frame and pre-submit gate required", width, height);
+            LOG_INFO("[FSRRR private RESET] armed {}x{} fixed private targets; mode={}; exact frame and pre-submit gate required",
+                     width, height, sceneReset ? "scene_reset_once_RGB_only_fixed_late_SR" : "private_only_no_game_writes");
         }
         catch (const std::exception& error) { LOG_WARN("[FSRRR private RESET] arm refused: {}", error.what()); }
     });

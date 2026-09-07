@@ -74,7 +74,10 @@ class FogRgbIdentityHost(unittest.TestCase):
         self.assertLess(draw.index('PrepareCapture('), draw.index('originalDraw('))
         self.assertLess(draw.index('earlyFatalRecording.load()'), draw.index('originalDraw('))
         feature = (BASE / 'FSRDFeature_Dx12.cpp').read_text()
-        self.assertRegex(feature, r'if \(_denoiser.IsCreated\(\)\)\s*FSRDCyberpunkFogProbe::ArmRgbIdentity\(')
+        poll = feature.split('void FSRDFeatureDx12::PollPreFogExperiments()', 1)[1].split(
+            'bool FSRDFeatureDx12::EvaluatePreFogSrOnly(', 1)[0]
+        self.assertRegex(poll, r'if \(_denoiser.IsCreated\(\)\)\s*FSRDCyberpunkFogProbe::ArmRgbIdentity\(')
+        self.assertEqual(feature.count('PollPreFogExperiments();'), 2)
         self.assertEqual(feature.count('ArmRgbIdentity('), 1)
         self.assertNotIn('rgbIdentityPacket', feature)
         project = (ROOT / 'OptiScaler/OptiScaler.vcxproj').read_text()

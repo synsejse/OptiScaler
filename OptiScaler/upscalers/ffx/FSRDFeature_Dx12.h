@@ -4,6 +4,7 @@
 #include "fsr-rr/ffx_denoiser.h"
 #include "FSRDDiagnostics.h"
 #include "FSRDDenoiserCore.h"
+#include "FSRDPreFogSession.h"
 #include <DirectXMath.h>
 
 /**
@@ -75,11 +76,20 @@ class FSRDFeatureDx12 : public FFXFeatureDx12
     float _upscaleFovVertical;
     float _upscaleDeltaTime;
 
+    FSRD::PreFogSession::LateSrHistory _preFogSrHistory;
+    bool _preFogSrScalarOverride = false;
+    bool _preFogSrGameReset = false;
+    bool _loggedPreFogRoute = false;
+    bool _loggedPreFogScalarFailure = false;
+    double _preFogSrLastFrameTime = 0;
+
     std::unique_ptr<FSRDPreprocessor_Dx12> FSRDConvShader;
 
     bool InitFFX(const NVSDK_NGX_Parameter* InParameters) override;
 
     void OverrideUpscaleDispatch(ffxDispatchDescUpscale& params) override;
+    bool EvaluatePreFogSrOnly(ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters);
+    void PollPreFogExperiments();
 
     bool CreateDenoiserContext();
 

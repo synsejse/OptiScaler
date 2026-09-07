@@ -287,7 +287,9 @@ FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InPar
       _upscaleColorOverride(nullptr),
       _upscaleFovVertical(0.0f), _upscaleDeltaTime(0.0f)
 {
+    FSRD::PreFogSession::Freeze(Config::Instance()->FfxDenoiserCyberpunkPreFogExperiment.value_or_default());
     _lastDenoiserFrameTime = Util::MillisecondsNow();
+    _preFogSrLastFrameTime = _lastDenoiserFrameTime;
     _moduleLoaded = FfxApiProxy::IsDenoiserReady();
 
     if (_moduleLoaded)
@@ -599,6 +601,17 @@ bool FSRDFeatureDx12::UpdateSize(const NVSDK_NGX_Parameter* parameters)
 
 void FSRDFeatureDx12::OverrideUpscaleDispatch(ffxDispatchDescUpscale& params)
 {
+    if (_preFogSrScalarOverride)
+    {
+        // Keep the base evaluator's actual late Color/depth/motion/exposure.
+        // This independent scalar path never needs a fake color replacement.
+        params.cameraFovAngleVertical = _upscaleFovVertical;
+        params.frameTimeDelta = _upscaleDeltaTime;
+        params.reset |= _preFogSrHistory.Begin(params.renderSize.width, params.renderSize.height,
+                                               params.upscaleSize.width, params.upscaleSize.height,
+                                               _preFogSrGameReset);
+        return;
+    }
     if (_upscaleColorOverride == nullptr)
         return;
 
@@ -606,6 +619,97 @@ void FSRDFeatureDx12::OverrideUpscaleDispatch(ffxDispatchDescUpscale& params)
     params.cameraFovAngleVertical = _upscaleFovVertical;
     params.frameTimeDelta = _upscaleDeltaTime;
     params.reset |= _isInReset || _diagnosticUpscaleReset;
+}
+
+void FSRDFeatureDx12::PollPreFogExperiments()
+{
+    const auto& cfg = *Config::Instance();
+    if (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
+        cfg.FfxDenoiserCyberpunkFogCapture.value_or_default())
+    {
+        // Provider/context startup remains unchanged. Both routes can arm the
+        // explicit controls; this polling does not run the late denoiser.
+        if (_denoiser.IsCreated())
+            FSRDCyberpunkFogProbe::ArmPrivateReset(Device, RenderWidth(), RenderHeight());
+        if (_denoiser.IsCreated())
+            FSRDCyberpunkFogProbe::ArmRgbIdentity(Device, RenderWidth(), RenderHeight());
+    }
+}
+
+bool FSRDFeatureDx12::EvaluatePreFogSrOnly(ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters)
+{
+    bool succeeded = false;
+    struct FinishLateSr
+    {
+        FSRDFeatureDx12& feature;
+        const bool& succeeded;
+        ~FinishLateSr()
+        {
+            feature._preFogSrScalarOverride = false;
+            feature._upscaleColorOverride = nullptr;
+            feature._preFogSrHistory.Complete(succeeded);
+        }
+    } finish { *this, succeeded };
+    _upscaleColorOverride = nullptr;
+    _preFogSrScalarOverride = false;
+    _frameShowNativeDebug = false;
+    if (!_loggedPreFogRoute)
+    {
+        LOG_WARN("{} RR debug controls are inactive in this process-fixed route.", FSRD::PreFogSession::StatusText());
+        _loggedPreFogRoute = true;
+    }
+    const auto refuse = [&](const char* reason) {
+        if (!_loggedPreFogScalarFailure)
+            LOG_ERROR("Pre-Fog late SR refused: {}. No late RR fallback; next successful SR resets history.", reason);
+        _loggedPreFogScalarFailure = true;
+        return false;
+    };
+    if (!commandList || !parameters) return refuse("missing current command list/parameters");
+
+    unsigned int width = RenderWidth(), height = RenderHeight();
+    GetRenderResolution(parameters, &width, &height);
+    if (!width || !height || width > _contextDesc.maxRenderSize.width || height > _contextDesc.maxRenderSize.height)
+        return refuse("current render extent exceeds the actual SR context capacity");
+    PollPreFogExperiments();
+
+    float* projection = nullptr;
+    std::array<float, 16> currentProjection {};
+    if (parameters->Get(NVSDK_NGX_Parameter_DLSS_VIEW_TO_CLIP_MATRIX, reinterpret_cast<void**>(&projection)) !=
+            NVSDK_NGX_Result_Success || !projection)
+        return refuse("current DLSSD projection is unavailable");
+    // NGX owns this current-call matrix pointer, as in the existing RR route.
+    // No late-global SL camera or early-packet matrix is substituted.
+    memcpy_s(currentProjection.data(), sizeof(currentProjection), projection, sizeof(currentProjection));
+    if (!FSRD::PreFogSession::VerticalFov(currentProjection, _upscaleFovVertical))
+        return refuse("current DLSSD perspective projection is unsupported or nonfinite");
+
+    auto& cfg = *Config::Instance();
+    const double now = Util::MillisecondsNow();
+    const float measuredDelta = float(now - _preFogSrLastFrameTime);
+    _preFogSrLastFrameTime = now;
+    float delta = 0;
+    const bool hasExplicitDelta = cfg.FsrUseFsrInputValues.value_or_default() &&
+        parameters->Get("FSR.frameTimeDelta", &delta) == NVSDK_NGX_Result_Success;
+    const bool hasGameDelta = !hasExplicitDelta &&
+        parameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &delta) == NVSDK_NGX_Result_Success;
+    if (!hasExplicitDelta && !hasGameDelta)
+        delta = measuredDelta; // Independent measured late SR interval; never early RESET's fixed control delta.
+    if (!FSRD::PreFogSession::Finite(delta) || delta <= 0)
+        return refuse("current frame duration is nonfinite or nonpositive");
+    _upscaleDeltaTime = delta;
+    unsigned int reset = 0;
+    parameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
+    _preFogSrGameReset = reset != 0;
+
+    if (!RCAS->IsInit()) cfg.RcasEnabled.set_volatile_value(false);
+    if (!OutputScaler->IsInit()) cfg.OutputScalingEnabled.set_volatile_value(false);
+    _loggedPreFogScalarFailure = false;
+    _preFogSrScalarOverride = true;
+    // Exactly one base SR call on original late game inputs. No RR contract,
+    // conversion, configure, dispatch, composition, debug blit or camera commit.
+    // Base owns its normal resource handling and the single _frameCount increment.
+    succeeded = FFXFeatureDx12::EvaluateInternal(commandList, parameters);
+    return succeeded;
 }
 
 void FSRDFeatureDx12::CommitCameraHistory()
@@ -623,8 +727,12 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     if (!IsInited())
     {
         _hasCameraHistory = false;
+        _preFogSrHistory.Invalidate();
         return false;
     }
+
+    if (FSRD::PreFogSession::LateSrOnly())
+        return EvaluatePreFogSrOnly(InCommandList, InParameters);
 
     auto& state = State::Instance();
     auto& cfg = *Config::Instance();
@@ -706,10 +814,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     if (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
         cfg.FfxDenoiserCyberpunkFogCapture.value_or_default())
     {
-        if (_denoiser.IsCreated())
-            FSRDCyberpunkFogProbe::ArmPrivateReset(Device, RenderWidth(), RenderHeight());
-        if (_denoiser.IsCreated())
-            FSRDCyberpunkFogProbe::ArmRgbIdentity(Device, RenderWidth(), RenderHeight());
+        PollPreFogExperiments();
         ID3D12Resource* color = nullptr;
         ID3D12Resource* beforeParticles = nullptr;
         TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Color, color);

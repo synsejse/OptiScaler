@@ -464,6 +464,7 @@ class Config
     CustomOptional<bool> FfxDenoiserNativeDebug { false }; // Context creation only; restart required.
     CustomOptional<bool> FfxDenoiserCyberpunkFogProbe { false }; // Opt-in provenance only; restart required.
     CustomOptional<bool> FfxDenoiserCyberpunkFogCapture { false }; // Explicit one-shot research capture, not a fix.
+    CustomOptional<bool> FfxDenoiserCyberpunkPreFogExperiment { false }; // Process-fixed late SR only; restart required.
 
     CustomOptional<float> FfxDenoiserDisocclusionThreshold { 0.02f };
     CustomOptional<float> FfxDenoiserCrossBlNormStr { 0.7f };

@@ -37,12 +37,16 @@ struct Layers
     // Optional all-or-none private independent RESET outputs. In order:
     // converted radiance, AMD denoised radiance, production composed color.
     // Exactly typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
-    // exact state0xc0. These are diagnostic copies, never scene replacements.
+    // exact state0xc0. This helper only captures them; it never writes scene RGB.
     std::array<Texture, 3> privateReset;
     // Optional private snapshot AFTER the identity RGB draw, still BEFORE Fog.
     // Exact typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
     // state0xc0. Presence does not establish that the RGB identity test passed.
     Texture rgbIdentity;
+    // Caller reports a separately admitted ONE-SHOT composed-RGB scene write.
+    // Requires all three privateReset outputs; incompatible with rgbIdentity.
+    // Metadata only: this boolean grants no scene-write authority or quality proof.
+    bool privateResetSceneWrite = false;
 };
 
 struct Status
@@ -174,6 +178,14 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 // is performed; provider input semantics, current-frame joins and RESET context
 // admission are caller evidence, not inferred from the three file layouts. These
 // companions do NOT enable a live correction or modify any original scene layer.
+// privateResetSceneWrite explicitly labels a separately admitted caller ONE-SHOT
+// scene control: all three RESET outputs are required and rgbIdentity must be
+// absent. Companion metadata becomes independent_RESET_scene_control with
+// live_correction=true, but this remains caller evidence, not proof of a write or
+// its correctness. No resource, copy or pixel semantics change in this helper.
+// before remains the original pre-control snapshot; after remains post-original
+// Fog. For this control, a Fog RGB reference must use the actually written composed
+// RGB, not before, and original native alpha must be assessed separately.
 // Optional rgbIdentity is a distinct private immutable snapshot after a caller's
 // identity RGB draw and before the original Fog draw. before remains the native
 // snapshot BEFORE the identity draw; after remains AFTER the original Fog draw.

@@ -676,6 +676,8 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                                                       [](const auto& texture) { return bool(texture.resource); });
         if (privateResetCount && privateResetCount != 3)
             throw std::runtime_error("private RESET outputs must be all present or all absent");
+        if (layers.privateResetSceneWrite && (privateResetCount != 3 || layers.rgbIdentity.resource))
+            throw std::runtime_error("one-shot RESET scene metadata requires all three outputs and no RGB identity companion");
         if (privateResetCount)
         {
             if (!keepAlive)
@@ -827,6 +829,13 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                 companion["output_index"] = i;
                 companion["intended_mode"] = "independent_RESET_diagnostic";
                 companion["live_correction"] = false;
+                if (layers.privateResetSceneWrite)
+                {
+                    companion["intended_mode"] = "independent_RESET_scene_control";
+                    companion["live_correction"] = true;
+                    companion["scene_write_scope"] = "one_shot_only; caller_supplied";
+                    companion["scene_write_proof"] = "not_verified_by_readback_helper";
+                }
                 companion["value_transform"] = "none; native private RGBA float16 bits including unmodified alpha";
                 companion["input_provenance"] = "caller_supplied; provider context, RESET, current inputs and frame association not authenticated by readback helper";
                 batch->metadata["companions"].push_back(std::move(companion));
