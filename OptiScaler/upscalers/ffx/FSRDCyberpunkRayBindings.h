@@ -59,6 +59,13 @@ struct Snapshot
     std::array<TextureBinding, 3> textures {}; // Original motion t4, radiance u0, hit u8.
     bool operator==(const Snapshot&) const = default;
 };
+// Diagnostic copies only, populated exclusively when two complete CPU reads
+// disagree. They never authorize recording or replace the accepted snapshot.
+struct ChangedSnapshots
+{
+    Snapshot first {}, second {};
+    bool available = false;
+};
 enum class Failure : uint8_t
 {
     None, Caller, UploadReceipt, CurrentScope, TextureSource, BindingRange, DescriptorMismatch, Changed, ReadException
@@ -182,9 +189,10 @@ template<class Host> bool ReadCurrent(Host& host, uintptr_t image, uintptr_t lis
 template<class Host>
 bool Observe(Host& host, uintptr_t image, uintptr_t caller, uintptr_t list4,
              const Scope& scope, const Receipt& receipt, const TextureHandles& handles,
-             Snapshot& output, Failure* reason = nullptr) noexcept
+             Snapshot& output, Failure* reason = nullptr, ChangedSnapshots* changed = nullptr) noexcept
 {
     output = {};
+    if (changed) *changed = {};
     Failure failure = Failure::Caller;
     bool success = false;
     try
@@ -203,6 +211,7 @@ bool Observe(Host& host, uintptr_t image, uintptr_t caller, uintptr_t list4,
                 {
                     failure = Failure::Changed;
                     if (first == second) { output = first; failure = Failure::None; success = true; }
+                    else if (changed) { *changed = { first, second, true }; }
                 }
             }
         }

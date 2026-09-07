@@ -98,7 +98,7 @@ class RayBindingsHost(unittest.TestCase):
         structs = SOURCE.split("struct RayBindReceipt\n", 1)[1].split("bool ReadExactMemory(", 1)[0]
         helpers = "\n".join(function(name) for name in ("BeginRayBind", "CompleteRayBind"))
         hooks = "\n".join(function(name) for name in (
-            "HookRayNode", "HookBindTextures", "HookBindUavs", "DescribeRayBinding", "HookDispatchRays"))
+            "HookRayNode", "HookBindTextures", "HookBindUavs", "DescribeRayBinding", "DescribeChangedRaySnapshots", "HookDispatchRays"))
         harness = r'''
 #include <array>
 #include <atomic>

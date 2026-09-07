@@ -187,6 +187,20 @@ int main()
             mutation==3?R::Failure::BindingRange:R::Failure::TextureSource);
     h=Setup();h.mutationTrigger=Array+24;h.mutation=4;
     assert(Observe(h,repeated)&&repeated==out); // Unrelated dirty range is not a global race guard.
+    // Refusal diagnostics preserve both complete snapshots without admitting
+    // the changed input. No partial/stale evidence survives the next call.
+    R::ChangedSnapshots changed;
+    h=Setup();h.mutationTrigger=Array+24;h.mutation=1;
+    assert(!R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
+    assert(reason==R::Failure::Changed&&repeated==empty&&changed.available);
+    assert(changed.first==out&&changed.first.textures[0].refs==1&&changed.second.textures[0].refs==2);
+    changed.second.textures[0].refs=1;assert(changed.first==changed.second);
+    h=Setup();assert(R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
+    assert(!changed.available&&changed.first==empty&&changed.second==empty);
+    changed.available=true;changed.first=out;
+    h=Setup();h.throwing=Array;
+    assert(!R::Observe(h,Image,Image+R::DispatchReturnRva,List4,Scope(),Receipt(),Handles(),repeated,&reason,&changed));
+    assert(reason==R::Failure::ReadException&&!changed.available&&changed.first==empty&&changed.second==empty);
     h=Setup();Range(h,0,65535,6,1);h.Put<uintptr_t>(Array+8*65535,B6);
     assert(Observe(h,repeated)&&repeated.b6.descriptorIndex==65535);
     h=Setup();Range(h,1,10,2,3);h.Put<uintptr_t>(Array+8*12,Motion);

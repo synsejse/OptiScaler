@@ -2389,6 +2389,35 @@ Json DescribeRayBinding(const FSRD::CyberpunkRayBindings::Binding& binding)
         { "range_bytes", binding.range } };
 }
 
+Json DescribeChangedRaySnapshots(const FSRD::CyberpunkRayBindings::ChangedSnapshots& changed)
+{
+    if (!changed.available) return nullptr;
+    const auto& a = changed.first;
+    const auto& b = changed.second;
+    Json result { { "scope_equal", a.scope == b.scope },
+        { "caller", { a.callerRva, b.callerRva } }, { "list4", { a.list4, b.list4 } },
+        { "cache", { a.cache, b.cache } }, { "layout", { a.layout, b.layout } },
+        { "descriptor_array", { a.descriptorArray, b.descriptorArray } },
+        { "registry", { a.registry, b.registry } },
+        { "b6", { DescribeRayBinding(a.b6), DescribeRayBinding(b.b6) } },
+        { "textures", Json::array() } };
+    for (size_t i = 0; i < a.textures.size(); ++i)
+    {
+        const auto& x = a.textures[i];
+        const auto& y = b.textures[i];
+        result["textures"].push_back({ { "register", i == 0 ? 4 : i == 1 ? 0 : 8 },
+            { "kind", i == 0 ? "SRV" : "UAV" }, { "equal", x == y },
+            { "handle", { x.handle, y.handle } }, { "slot", { x.slot, y.slot } },
+            { "refs", { x.refs, y.refs } }, { "native", { x.native, y.native } },
+            { "descriptor", { x.descriptor, y.descriptor } },
+            { "requested_srv_state", { x.requestedSrvState, y.requestedSrvState } },
+            { "extra", { x.extra, y.extra } }, { "uav_array", { x.uavArray, y.uavArray } },
+            { "compact", { x.compact, y.compact } },
+            { "binding", { DescribeRayBinding(x.binding), DescribeRayBinding(y.binding) } } });
+    }
+    return result;
+}
+
 void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPATCH_RAYS_DESC* description)
 {
     const auto caller = uintptr_t(_ReturnAddress());
@@ -2461,11 +2490,16 @@ void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPA
                 struct Reader { bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); } } reader;
                 FSRD::CyberpunkRayBindings::Snapshot snapshot;
                 FSRD::CyberpunkRayBindings::Failure reason {};
+                FSRD::CyberpunkRayBindings::ChangedSnapshots changed;
                 const FSRD::CyberpunkRayBindings::TextureHandles handles {
                     current->bindings[0].handle, current->bindings[1].handle, current->bindings[2].handle };
                 if (!FSRD::CyberpunkRayBindings::Observe(reader, authenticatedImage.load(), caller, uintptr_t(list),
-                        observed, current->receipt, handles, snapshot, &reason))
+                        observed, current->receipt, handles, snapshot, &reason, &changed))
+                {
+                    if (changed.available)
+                        observation["changed_snapshots"] = DescribeChangedRaySnapshots(changed);
                     throw std::runtime_error(std::string(FSRD::CyberpunkRayBindings::FailureName(reason)));
+                }
                 if (rayScope != current || CurrentRayConstantScope() != observed)
                     throw std::runtime_error("native ray scope changed after descriptor observation");
                 observation["native_caller_rva"] = snapshot.callerRva;
