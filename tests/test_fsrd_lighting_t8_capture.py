@@ -34,7 +34,13 @@ class LightingT8Capture(unittest.TestCase):
                       "batch->lightingT8->bytes > MaxBytes - totalBytes"):
             self.assertLess(record.index(guard), record.index("AllocateReadback(device, entry)"))
         self.assertIn("totalBytes += batch->lightingT8->bytes", record)
-        self.assertNotIn("lightingT8", body("Record"))  # Not exposed through unrelated fog-layer API.
+        # Cross-companion alias checks may mention the field, but Fog still has
+        # no t8 input or producer/copy admission path.
+        self.assertNotIn("lightingT8", HEADER.split("struct Layers", 1)[1].split("};", 1)[0])
+        for forbidden in ('batch->lightingT8 =', '.role = "lighting_t8"',
+                          'PrepareEntry(device, *batch->lightingT8',
+                          'RecordCopy(list, *batch->lightingT8)'):
+            self.assertNotIn(forbidden, body("Record"))
 
     def test_raw_encoded_metadata_preserves_semantic_uncertainty(self):
         record = body("RecordEarlyGuides")

@@ -10,6 +10,7 @@
 #include <set>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #include <sl_dlss_g.h>
 #include <vulkan/vulkan.h>
 #include <ankerl/unordered_dense.h>
@@ -151,7 +152,9 @@ class State
     bool fgHudlessCompare = false;
     bool fgChanged = false;
     bool scChanged = false;
-    bool skipHeapCapture = false;
+    // Explicit process-wide suppression used by legacy initialization paths.
+    // Temporary allocation scopes below are independent and thread-local.
+    std::atomic<bool> skipHeapCapture { false };
 
     bool fgCaptureResources = false;
     size_t fgCapturedResourceCount = 0;
@@ -481,16 +484,27 @@ class ScopedSkipParentWrapping
 class ScopedSkipHeapCapture
 {
   private:
+    inline static thread_local bool currentThreadSuppressed = false;
     bool previousState;
 
   public:
-    ScopedSkipHeapCapture()
+    ScopedSkipHeapCapture() noexcept : previousState(currentThreadSuppressed)
     {
-        previousState = State::Instance().skipHeapCapture;
-        State::Instance().skipHeapCapture = true;
+        currentThreadSuppressed = true;
     }
 
-    ~ScopedSkipHeapCapture() { State::Instance().skipHeapCapture = previousState; }
+    ~ScopedSkipHeapCapture() { currentThreadSuppressed = previousState; }
+
+    ScopedSkipHeapCapture(const ScopedSkipHeapCapture&) = delete;
+    ScopedSkipHeapCapture& operator=(const ScopedSkipHeapCapture&) = delete;
+    ScopedSkipHeapCapture(ScopedSkipHeapCapture&&) = delete;
+    ScopedSkipHeapCapture& operator=(ScopedSkipHeapCapture&&) = delete;
+
+    static bool ShouldSkip() noexcept
+    {
+        // This flag does not publish other state; it is only a suppression policy.
+        return currentThreadSuppressed || State::Instance().skipHeapCapture.load(std::memory_order_relaxed);
+    }
 };
 
 class ScopedSkipVulkanHooks

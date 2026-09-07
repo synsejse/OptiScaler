@@ -50,6 +50,7 @@ struct Batch
     std::optional<Entry> lightingT8; // Owned copy-readable encoded input; never a reconstructed scene layer.
     std::optional<std::array<Entry, 2>> rayCopies; // Private original-ray snapshots; units remain caller evidence.
     std::optional<Entry> hardwareDepth; // Fog-only private scalar snapshot, never a base scene layer.
+    std::optional<std::array<Entry, 3>> privateReset; // Fog-only independent RESET diagnostics, no scene substitution.
     std::shared_ptr<void> keepAlive;
     Json metadata;
     std::filesystem::path directory;
@@ -428,6 +429,9 @@ void WriteWhenComplete(const WorkerArgs& args)
                 WriteEntry(batch, entry);
         if (batch.hardwareDepth)
             WriteEntry(batch, *batch.hardwareDepth);
+        if (batch.privateReset)
+            for (const auto& entry : *batch.privateReset)
+                WriteEntry(batch, entry);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
         FinishStatus(kind, true, batch.guidesOnly ? (batch.rayCopies ?
@@ -665,12 +669,68 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
             if (totalBytes > MaxBytes)
                 throw std::runtime_error("fog capture including hardware depth exceeds the shared256MiB readback limit");
         }
+        const auto privateResetCount = std::count_if(layers.privateReset.begin(), layers.privateReset.end(),
+                                                      [](const auto& texture) { return bool(texture.resource); });
+        if (privateResetCount && privateResetCount != 3)
+            throw std::runtime_error("private RESET outputs must be all present or all absent");
+        if (privateResetCount)
+        {
+            if (!keepAlive)
+                throw std::runtime_error("private RESET outputs require retained recording owners");
+            constexpr const char* roles[] = {
+                "private_reset_radiance", "private_reset_denoised", "private_reset_composed"
+            };
+            std::array<Entry, 3> outputs;
+            std::array<ComPtr<IUnknown>, 3> identities;
+            const auto& scene = batch->entries.front().footprint.Footprint;
+            for (size_t i = 0; i < outputs.size(); ++i)
+            {
+                const auto& texture = layers.privateReset[i];
+                const auto desc = texture.resource->GetDesc();
+                // Reuse the exact typed RGBA16F private-copy layout/state gate,
+                // not its ray provenance or semantics. No format broadening.
+                if (!IsRayCopyTexture(desc, texture.viewFormat, texture.subresource, texture.state,
+                                      scene.Width, scene.Height, false))
+                    throw std::runtime_error("private RESET output layout/state must match the native scene extent");
+                Check(texture.resource->QueryInterface(IID_PPV_ARGS(&identities[i])),
+                      "private RESET output identity unavailable");
+                if (!identities[i])
+                    throw std::runtime_error("private RESET output identity is null");
+                const auto distinct = [&](const Entry& entry) {
+                    ComPtr<IUnknown> identity;
+                    Check(entry.source.resource->QueryInterface(IID_PPV_ARGS(&identity)),
+                          "private RESET companion identity unavailable");
+                    if (!identity || identity.Get() == identities[i].Get())
+                        throw std::runtime_error("private RESET output must not alias another layer or companion");
+                };
+                for (const auto& entry : batch->entries) distinct(entry);
+                if (batch->boundCb12) distinct(*batch->boundCb12);
+                if (batch->earlyGuides)
+                    for (const auto& entry : *batch->earlyGuides) distinct(entry);
+                if (batch->hardwareDepth) distinct(*batch->hardwareDepth);
+                if (batch->exposureWords) distinct(*batch->exposureWords);
+                if (batch->lightingT8) distinct(*batch->lightingT8);
+                if (batch->rayCopies)
+                    for (const auto& entry : *batch->rayCopies) distinct(entry);
+                for (size_t previous = 0; previous < i; ++previous)
+                    if (identities[previous].Get() == identities[i].Get())
+                        throw std::runtime_error("private RESET outputs must have distinct canonical identities");
+                outputs[i] = Entry { .role = roles[i], .source = texture };
+                PrepareEntry(device, outputs[i]);
+                totalBytes += outputs[i].bytes;
+                if (totalBytes > MaxBytes)
+                    throw std::runtime_error("private RESET outputs exceed the shared256MiB readback limit");
+            }
+            batch->privateReset = std::move(outputs);
+        }
         // Validate every optional entry and the aggregate budget before allocating.
         for (auto& entry : batch->entries) AllocateReadback(device, entry);
         if (batch->boundCb12) AllocateReadback(device, *batch->boundCb12);
         if (batch->earlyGuides)
             for (auto& entry : *batch->earlyGuides) AllocateReadback(device, entry);
         if (batch->hardwareDepth) AllocateReadback(device, *batch->hardwareDepth);
+        if (batch->privateReset)
+            for (auto& entry : *batch->privateReset) AllocateReadback(device, entry);
         batch->directory = Util::ExePath().parent_path() / "FSRRR-fog-captures" / Timestamp();
         batch->metadata = { { "schema", "optiscaler.fsr_rr.fog_layers.v1" },
                             { "complete", false },
@@ -716,6 +776,19 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
             batch->metadata["companions"].push_back(std::move(companion));
         }
 
+        if (batch->privateReset)
+            for (size_t i = 0; i < batch->privateReset->size(); ++i)
+            {
+                auto companion = Describe((*batch->privateReset)[i]);
+                companion["schema"] = "optiscaler.fsr_rr.private_reset_output.v1";
+                companion["output_index"] = i;
+                companion["intended_mode"] = "independent_RESET_diagnostic";
+                companion["live_correction"] = false;
+                companion["value_transform"] = "none; native private RGBA float16 bits including unmodified alpha";
+                companion["input_provenance"] = "caller_supplied; provider context, RESET, current inputs and frame association not authenticated by readback helper";
+                batch->metadata["companions"].push_back(std::move(companion));
+            }
+
         auto args = std::make_unique<WorkerArgs>();
         args->batch = batch;
         // Hold a module reference only while worker code may execute; do not permanently pin it.
@@ -746,6 +819,9 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
                 RecordCopy(list, entry);
         if (batch->hardwareDepth)
             RecordCopy(list, *batch->hardwareDepth);
+        if (batch->privateReset)
+            for (const auto& entry : *batch->privateReset)
+                RecordCopy(list, entry);
         recorded = true;
 
         const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);

@@ -38,6 +38,60 @@ transparent, refractive, and nonlinear passes may have changed that scene.
 
 ## Measured evidence
 
+### Same-frame native RESET control (2026-09-07, 12:22 UTC capture)
+
+The matched native captures at `122224` share explicit CPU frame88999, its
+source object, view and full repeated camera metadata; all20 bound GPU Fog
+camera words match the Lighting recipe. Both actual completion fences finished.
+The replay uses the production GPU conversion/composition shaders, native
+motion/hit/material/depth snapshots, the same AMD1.1 provider and all six
+explicit settings. The only control change is pre-Fog versus post-Fog color.
+All six converted guide outputs are bit-identical between those two GPU runs.
+
+`progress/native-reset-order-20260907-122224.png` and its `-far-surface.png`
+crop show the post-Fog control reproducing the material outlines, while pre-Fog
+AMD followed by the captured original Fog retains the haze. The latter Fog
+composition is an explicitly labelled CPU precision reference, not a live
+correction. No fitted exposure, guessed two-signal split or extra Fog is applied
+to the post-Fog control. This replaces the earlier imperfect late-frame pairing
+as the stronger composition-order experiment. It remains a single-frame RESET
+test, not a temporal quality guarantee.
+
+### Opt-in live private RESET
+
+With the authenticated Cyberpunk probe/capture enabled and an already initialized
+late RR feature, `FSRRR-prefog-reset.request` can request **one private-output-only
+RESET per process**. Do not combine it with other capture markers. Example for
+the tested provider (enumeration still verifies it exists):
+
+```json
+{
+  "mode": "private_reset_only",
+  "provider_id": 8382887756413599744,
+  "delta_source": "explicit_reset_control_not_captured_duration",
+  "delta_ms": 16.667,
+  "settings": {"1": 1, "2": 1, "3": 65504, "4": 50, "5": 0, "6": 0.01}
+}
+```
+
+Five fixed private targets are allocated before the request becomes visible.
+Original ray and final-lighting callbacks produce those exact targets; Fog's
+worker may record its consumer first. Before native submission, a non-optional
+gate verifies the complete same-frame producers and their native state
+restoration, same-list/Reset ray→guide ordering, and same-queue producer→Fog
+ordering. Unknown, reversed, overlapping-unreturned or duplicate dependencies
+are refused. Once consumer commands exist, failure terminates only the
+authenticated Cyberpunk diagnostic rather than submitting undefined reads.
+
+Fog captures additionally contain `private_reset_radiance.rgba16f`,
+`private_reset_denoised.rgba16f`, and `private_reset_composed.rgba16f`, under the
+actual consumer completion fence. The original scene RGB/alpha and Fog draw
+remain unchanged. The private context resets once with explicit experimental
+duration; no late temporal history is borrowed. Continuous history and the
+early-RR/late-SR handoff remain separate work before a live image correction.
+
+### Earlier exploratory controls
+
 The exact installed executable and shader-cache identities are recorded in
 [the native guide investigation](FSR_RR_GUIDE_PRODUCER.md). Proprietary shader
 bytes, disassemblies and captures remain local, outside version control.

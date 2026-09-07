@@ -71,13 +71,15 @@ bool Authenticate(std::span<const std::byte> bytes)
 ComPtr<IUnknown> Identity(IUnknown* object)
 {
     ComPtr<IUnknown> result;
+    Require(object != nullptr, "object identity absent");
     Check(object->QueryInterface(IID_PPV_ARGS(&result)), "object identity unavailable");
+    Require(bool(result), "object identity absent");
     return result;
 }
 bool OnDevice(ID3D12DeviceChild* object, ID3D12Device* expected)
 {
     ComPtr<ID3D12Device> device;
-    return object && SUCCEEDED(object->GetDevice(IID_PPV_ARGS(&device))) &&
+    return object && SUCCEEDED(object->GetDevice(IID_PPV_ARGS(&device))) && device &&
            Identity(device.Get()).Get() == Identity(expected).Get();
 }
 
@@ -100,11 +102,65 @@ void ValidateSource(ID3D12Device* device, const SourceView& source, UINT width, 
 }
 } // namespace
 
+struct Targets::Impl
+{
+    ComPtr<ID3D12Device> device;
+    std::array<ComPtr<ID3D12Resource>, 3> outputs;
+    UINT width = 0, height = 0;
+    std::atomic<bool> claimed = false;
+};
+Targets::Targets(std::unique_ptr<Impl> implementation) : _impl(std::move(implementation)) {}
+Targets::~Targets() = default;
+const std::array<ComPtr<ID3D12Resource>, 3>& Targets::Outputs() const noexcept { return _impl->outputs; }
+
+std::shared_ptr<Targets> AllocateTargets(ID3D12Device* device, UINT width, UINT height,
+                                       const char** error) noexcept
+{
+    if (error) *error = "";
+    try
+    {
+        Require(device && width && height && width <= MaxDimension && height <= MaxDimension,
+                "invalid private guide extent");
+        Identity(device);
+        auto data = std::make_unique<Targets::Impl>();
+        data->device = device; data->width = width; data->height = height;
+        std::array<D3D12_RESOURCE_DESC, 3> descriptions {};
+        UINT64 allocated = 0;
+        for (UINT i = 0; i < descriptions.size(); ++i)
+        {
+            auto& output = descriptions[i];
+            output.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            output.Width = width; output.Height = height;
+            output.DepthOrArraySize = 1; output.MipLevels = 1; output.SampleDesc.Count = 1;
+            output.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            output.Format = i < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            const auto allocation = device->GetResourceAllocationInfo(0, 1, &output);
+            Require(allocation.SizeInBytes && allocation.SizeInBytes <= MaxOutputBytes - allocated,
+                    "guide output allocation exceeds budget");
+            allocated += allocation.SizeInBytes;
+        }
+        ScopedSkipHeapCapture skipHeapCapture {};
+        D3D12_HEAP_PROPERTIES properties {}; properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        properties.CreationNodeMask = 1; properties.VisibleNodeMask = 1;
+        for (UINT i = 0; i < descriptions.size(); ++i)
+        {
+            Check(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &descriptions[i],
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&data->outputs[i])),
+                  "guide output creation failed");
+            Require(bool(data->outputs[i]), "guide output absent");
+        }
+        return std::shared_ptr<Targets>(new Targets(std::move(data)));
+    }
+    catch (...) { if (error) *error = "guide target allocation failed or exceeded budget"; }
+    return {};
+}
+
 struct Work::Impl
 {
     ComPtr<ID3D12Device> device;
     std::array<SourceView, 4> sources;
     std::array<ComPtr<ID3D12Resource>, 3> outputs;
+    std::shared_ptr<Targets> targets;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     ComPtr<ID3D12Resource> constants;
     ComPtr<ID3D12RootSignature> root;
@@ -121,8 +177,33 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
     const std::array<SourceView, 4>& sources, const CyberpunkGuideConstants::PassConstants& pass,
     const CyberpunkGuideConstants::SharedConstants& shared, std::span<const std::byte> shader) noexcept
 {
+    return Work::PrepareImpl(device, width, height, sources, pass, shared, shader, {}, false);
+}
+
+std::shared_ptr<Work> PrepareInto(ID3D12Device* device, UINT width, UINT height,
+    const std::array<SourceView, 4>& sources, const CyberpunkGuideConstants::PassConstants& pass,
+    const CyberpunkGuideConstants::SharedConstants& shared, std::span<const std::byte> shader,
+    const std::shared_ptr<Targets>& targets) noexcept
+{
+    return Work::PrepareImpl(device, width, height, sources, pass, shared, shader, targets, true);
+}
+
+std::shared_ptr<Work> Work::PrepareImpl(ID3D12Device* device, UINT width, UINT height,
+    const std::array<SourceView, 4>& sources, const CyberpunkGuideConstants::PassConstants& pass,
+    const CyberpunkGuideConstants::SharedConstants& shared, std::span<const std::byte> shader,
+    const std::shared_ptr<Targets>& supplied, bool preallocated) noexcept
+{
     try
     {
+        auto targets = supplied;
+        if (preallocated)
+        {
+            Require(bool(targets), "private guide target set absent");
+            Require(!targets->_impl->claimed.exchange(true), "private guide target set already claimed");
+            Require(device && width == targets->_impl->width && height == targets->_impl->height &&
+                    Identity(device).Get() == Identity(targets->_impl->device.Get()).Get(),
+                    "private guide target device or extent differs");
+        }
         Require(device && width && height && width <= MaxDimension && height <= MaxDimension, "invalid private guide extent");
         Require(pass[0] == std::bit_cast<uint32_t>(float(width)) && pass[1] == std::bit_cast<uint32_t>(float(height)),
                 "b6 output extent mismatch");
@@ -140,8 +221,19 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
         const std::vector<std::byte> ownedShader(shader.begin(), shader.end());
         Require(Authenticate(ownedShader), "guide shader is not authenticated exact game bytecode");
         for (const auto& source : sources) ValidateSource(device, source, width, height);
+        if (!preallocated)
+        {
+            targets = AllocateTargets(device, width, height);
+            Require(bool(targets), "private guide target allocation failed");
+            Require(!targets->_impl->claimed.exchange(true), "private guide target set already claimed");
+        }
         auto data = std::make_unique<Work::Impl>();
         data->device = device; data->sources = sources; data->width = width; data->height = height;
+        data->targets = targets; data->outputs = targets->_impl->outputs;
+        for (const auto& output : data->outputs)
+            for (const auto& source : sources)
+                Require(Identity(output.Get()).Get() != Identity(source.resource.Get()).Get(),
+                        "private guide source aliases a private target");
         data->stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         ScopedSkipHeapCapture skipHeapCapture {};
 
@@ -194,28 +286,15 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
         nullExposure.Buffer.NumElements = 1; nullExposure.Buffer.StructureByteStride = 28;
         device->CreateShaderResourceView(nullptr, &nullExposure, descriptorAt(6));
 
-        D3D12_HEAP_PROPERTIES properties {}; properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-        properties.CreationNodeMask = 1;
-        properties.VisibleNodeMask = 1;
-        D3D12_RESOURCE_DESC output {};
-        output.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; output.Width = width; output.Height = height;
-        output.DepthOrArraySize = 1; output.MipLevels = 1; output.SampleDesc.Count = 1;
-        output.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        UINT64 allocated = 0;
         for (UINT i = 0; i < 3; ++i)
         {
-            output.Format = i < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
-            const auto allocation = device->GetResourceAllocationInfo(0, 1, &output);
-            Require(allocation.SizeInBytes && allocation.SizeInBytes <= MaxOutputBytes - allocated, "guide output allocation exceeds budget");
-            allocated += allocation.SizeInBytes;
-            Check(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &output,
-                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&data->outputs[i])), "guide output creation failed");
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-            uav.Format = output.Format; uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            uav.Format = data->outputs[i]->GetDesc().Format; uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             device->CreateUnorderedAccessView(data->outputs[i].Get(), nullptr, &uav, descriptorAt(7 + i));
         }
 
-        properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_HEAP_PROPERTIES properties {}; properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+        properties.CreationNodeMask = 1; properties.VisibleNodeMask = 1;
         D3D12_RESOURCE_DESC constants {};
         constants.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; constants.Width = ConstantBytes;
         constants.Height = 1; constants.DepthOrArraySize = 1; constants.MipLevels = 1;

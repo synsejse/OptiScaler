@@ -113,7 +113,10 @@ template<class Host> bool Prepare(Host& host, const Input& input, Saved& saved) 
 //   retained device/resource/descriptor lifetime, supported depth-plane/extent,
 //   no main/writable/DSV alias, and no query/predication/render-pass/bundle ambiguity.
 //   All other inputs are admitted private Color/guides/motion/hit resources, with
-//   known read states and producer→consumer ordering on this same list. Source
+//   known read states at GPU use and producer→consumer ordering. They may be
+//   produced earlier on this list, or by an owned private producer recording
+//   whose exact dependency is enforced by a mandatory pre-Execute gate. CPU
+//   callback order/allocation alone is never permission to consume them. Source
 //   pointers, refs or an old graph snapshot do not establish this contract.
 //   With copySource=true, the host also admits the exact native source format,
 //   plane and copy extent and retains the private destination before recording.

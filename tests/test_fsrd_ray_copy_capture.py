@@ -33,7 +33,11 @@ class RayCopyCapture(unittest.TestCase):
                       "IsRayCopyTexture(", "PrepareEntry(device, entry, false, false, false, i == 1)",
                       "guides and optional ray companions exceed the shared256MiB readback limit"):
             self.assertLess(record.index(guard), record.index("AllocateReadback(device, entry)"))
-        self.assertNotIn("rayCopies", body("Record"))
+        self.assertNotIn("rayCopies", HEADER.split("struct Layers", 1)[1].split("};", 1)[0])
+        for forbidden in ('batch->rayCopies =', '.role = "ray_motion"', '.role = "ray_hit"',
+                          'for (auto& entry : *batch->rayCopies) AllocateReadback',
+                          'for (const auto& entry : *batch->rayCopies)\n            RecordCopy'):
+            self.assertNotIn(forbidden, body("Record"))
         self.assertIn("std::optional<std::array<Entry, 2>> rayCopies", SOURCE)
         self.assertIn("bool exposureWords = false, bool rayHit = false", SOURCE)
         prepare = body("PrepareEntry")

@@ -99,6 +99,22 @@ class PrivateGuidePass(unittest.TestCase):
         self.assertIn(r'upscalers\ffx\FSRDCyberpunkGuidePass.cpp', compiles)
         self.assertFalse(any('dlss_convert.dxil' in value for value in includes | compiles))
 
+    def test_predeclared_targets_are_fixed_factory_outputs_not_readiness(self):
+        target = HEADER.split('class Targets\n', 1)[1].split('class Work :', 1)[0]
+        self.assertIn('Targets(const Targets&) = delete', target)
+        self.assertLess(target.index('private:'), target.index('explicit Targets('))
+        self.assertIn('Outputs() const noexcept', target)
+        self.assertIn('Allocation alone is NOT production', HEADER)
+        self.assertIn('GPU ordering before submitting', HEADER)
+        self.assertIn('std::atomic<bool> claimed = false', SOURCE)
+        self.assertEqual(SOURCE.count('targets->_impl->claimed.exchange(true)'), 2)
+        prepare = SOURCE.split('std::shared_ptr<Work> Work::PrepareImpl', 1)[1].split('bool Work::Record', 1)[0]
+        self.assertLess(prepare.index('claimed.exchange(true)'), prepare.index('PackPass('))
+        self.assertLess(prepare.index('ValidateSource('), prepare.index('targets = AllocateTargets('))
+        self.assertIn('data->outputs = targets->_impl->outputs', prepare)
+        self.assertIn('private guide source aliases a private target', prepare)
+        self.assertNotIn('D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr', prepare)
+
 
 if __name__ == '__main__':
     unittest.main()

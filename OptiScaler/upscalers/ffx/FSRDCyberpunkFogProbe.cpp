@@ -18,6 +18,9 @@
 #include "FSRDPrivateRayCopy.h"
 #include "FSRDCyberpunkResetCamera.h"
 #include "FSRDCyberpunkLightingConstants.h"
+#include "FSRDCyberpunkPrivateResetSource.h"
+#include "FSRDCyberpunkPrivateResetPolicy.h"
+#include "FSRDPrivateDenoise.h"
 
 #include <Util.h>
 #include <resource_tracking/FSRDSubmission.h>
@@ -36,6 +39,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -298,6 +302,7 @@ struct RayCopyBundle
     unsigned dispatchOrdinal = 0, completedDispatches = 0;
     bool originalReturned = false, cleanupEntered = false, cleanupConsumed = false, invalidated = false, recorded = false;
     Json provenance;
+    bool privateReset = false;
 };
 struct Registry
 {
@@ -356,6 +361,45 @@ std::atomic<unsigned> drawLogs { 0 }, emptyLogs { 0 };
 std::atomic<unsigned> arm { 0 };
 std::atomic<uint64_t> scopes { 0 };
 std::mutex hookMutex;
+
+namespace ResetPolicy = FSRD::CyberpunkPrivateResetPolicy;
+namespace ResetSource = FSRD::CyberpunkPrivateResetSource;
+struct PrivateResetPacket
+{
+    explicit PrivateResetPacket(uintptr_t identity) : policy(identity) {}
+    std::mutex mutex;
+    ResetPolicy::Policy policy;
+    ComPtr<ID3D12Device> device;
+    ComPtr<IUnknown> deviceIdentity, producerIdentity, consumerIdentity, queueIdentity;
+    std::shared_ptr<FSRD::CyberpunkGuidePass::Targets> guides;
+    std::shared_ptr<FSRD::PrivateRayCopy::Targets> rays;
+    // Not retained by a submission ticket: the Work/converter/ticket graph must
+    // remain acyclic. This one explicit packet survives process teardown.
+    std::shared_ptr<FSRD::PrivateDenoise::Work> denoise;
+    std::optional<ResetSource::Source> source;
+    FSRD::DenoiserSettings settings {};
+    uint64_t provider = 0, rayTerminal = 0, guideBegin = 0;
+    UINT width = 0, height = 0;
+    float delta = 0;
+    bool rayClaimed = false, guideClaimed = false, fogClaimed = false;
+    ResetPolicy::Recording producer {};
+};
+// Published only after CPU allocation/provider initialization has completed on
+// the late RR caller. Exactly one packet/process; never replace an embedded read.
+std::atomic<PrivateResetPacket*> privateResetPacket { nullptr };
+std::atomic<bool> privateResetArming { false };
+
+[[noreturn]] void PrivateResetFatal() noexcept
+{
+    earlyFatalRecording.store(true);
+    try { LOG_ERROR("[FSRRR private RESET] FATAL unsafe private dependency; refusing native submission in authenticated Cyberpunk"); }
+    catch (...) {}
+    // This function is reachable only through a packet armed under the exact
+    // executable authentication. Never terminates a launcher or another process.
+    TerminateProcess(GetCurrentProcess(), 0xf51d0002u);
+    RaiseFailFastException(nullptr, nullptr, 0);
+    std::terminate();
+}
 
 using FogNode = void(__fastcall*)(void* node, void* context);
 FogNode originalFogNode = nullptr;
@@ -804,6 +848,47 @@ ComPtr<IUnknown> EndpointListIdentity(ID3D12GraphicsCommandList* list)
     return identity;
 }
 
+uint64_t PrivateResetPoint(IUnknown* identity, uint64_t generation)
+{
+    auto& data = Data();
+    std::lock_guard lock(data.mutex);
+    const auto found = data.lists.find(identity);
+    if (!captureTrackingValid.load() || found == data.lists.end() || !found->second.known ||
+        found->second.generation != generation || found->second.predicated || found->second.renderPass ||
+        found->second.queryCount)
+        throw std::runtime_error("private RESET recording generation/state unavailable");
+    return ++found->second.endpointOrdinal;
+}
+
+// The same packet can be encountered first by any CPU recording worker. Key
+// equality is necessary, but the independent pre-Execute policy proves ordering.
+void ClaimPrivateReset(PrivateResetPacket& packet, const Json& metadata, ID3D12Device* device,
+                       bool& role)
+{
+    auto source = ResetSource::Parse(metadata, packet.delta);
+    ComPtr<IUnknown> identity;
+    if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))) ||
+        identity.Get() != packet.deviceIdentity.Get() || source.width != packet.width || source.height != packet.height)
+        throw std::runtime_error("private RESET active device/extent differs from allocated targets");
+    std::lock_guard lock(packet.mutex);
+    if (packet.policy.Failed() || role || (packet.source && !packet.source->SameFrame(source)))
+    {
+        packet.policy.Fail();
+        throw std::runtime_error("private RESET repeated role or exact current-frame/camera mismatch");
+    }
+    if (!packet.source) packet.source = std::move(source);
+    role = true;
+}
+
+void FailPrivateReset() noexcept
+{
+    if (auto* packet = privateResetPacket.load(std::memory_order_acquire))
+    {
+        std::lock_guard lock(packet->mutex);
+        packet->policy.Fail(); // Never clear a consumer obligation on an exception.
+    }
+}
+
 Json OwnEndpointResource(EndpointTrace& trace, ID3D12Resource* resource)
 {
     if (!resource)
@@ -1127,7 +1212,7 @@ void PollRearm() noexcept
     Metadata([] {
         static std::mutex requestMutex;
         std::unique_lock lock(requestMutex, std::try_to_lock);
-        if (!lock)
+        if (!lock || privateResetArming.load(std::memory_order_acquire))
             return;
         if (captureEnabled.load() && captureTrackingValid.load())
         {
@@ -1820,6 +1905,7 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
                                            const D3D12_DISPATCH_RAYS_DESC& dispatch, unsigned ordinal)
 {
     if (!originalRayCleanup || !rayScope || rayScope->nativeDispatchDepth ||
+        privateResetArming.load(std::memory_order_acquire) ||
         !lightingRequested.load() || lightingAttempted.load() || rayCopyAttempted.exchange(true)) return {};
     auto plan = std::make_shared<RayCopyBundle>();
     plan->input.image = authenticatedImage.load(); plan->input.dispatch = snapshot; plan->dispatchOrdinal = ordinal;
@@ -1869,7 +1955,24 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
                 throw std::runtime_error("ray-copy simultaneous-access source is unsupported");
         }
         const char* failure = nullptr;
-        plan->work = FSRD::PrivateRayCopy::Prepare(plan->device.Get(), plan->width, plan->height, plan->sources, &failure);
+        if (auto* packet = privateResetPacket.load(std::memory_order_acquire))
+        {
+            if (rayScope->receipt.words[FSRD::CyberpunkRayConstants::EncodingByteOffset / 4] != 0 ||
+                rayScope->receipt.words[FSRD::CyberpunkRayConstants::WriteHitByteOffset / 4] != 1)
+                throw std::runtime_error("private RESET requires observed absolute hit encoding and enabled hit write");
+            const auto metadata = Json::parse(FSRDCyberpunkEarlyGuides::Describe(rayScope->context, authenticatedImage.load()));
+            ClaimPrivateReset(*packet, metadata, plan->device.Get(), packet->rayClaimed);
+            plan->privateReset = true;
+            plan->work = FSRD::PrivateRayCopy::PrepareInto(plan->device.Get(), plan->width, plan->height,
+                                                          plan->sources, packet->rays, &failure);
+            std::lock_guard lock(packet->mutex);
+            packet->producerIdentity = plan->listIdentity;
+            packet->producer = { uintptr_t(plan->listIdentity.Get()), snapshot.scope.recordingGeneration };
+            if (!packet->policy.DeclareProducer(packet->producer))
+                throw std::runtime_error("private RESET producer declaration refused");
+        }
+        else
+            plan->work = FSRD::PrivateRayCopy::Prepare(plan->device.Get(), plan->width, plan->height, plan->sources, &failure);
         if (!plan->work || !SameRayCopyScope(*plan))
             throw std::runtime_error(failure && *failure ? failure : "ray-copy source changed during preparation");
         plan->provenance["frame_source_object"] = plan->frameSourceObject;
@@ -1880,6 +1983,7 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
     }
     catch (const std::exception& error) { plan->provenance["reason"] = error.what(); }
     catch (...) { plan->provenance["reason"] = "ray-copy preparation threw"; }
+    FailPrivateReset();
     plan->provenance["status"] = "refused_before_state_requests";
     auto& data = Data();
     std::lock_guard lock(data.mutex);
@@ -1909,6 +2013,14 @@ void FinishRayCopy(const std::shared_ptr<RayCopyBundle>& plan)
     }
     plan->recorded = result.outcome == FSRD::CyberpunkRayAccess::Outcome::CopyRecordedRestored &&
         result.hitRestored && plan->work->Recorded();
+    if (plan->privateReset)
+    {
+        auto* packet = privateResetPacket.load(std::memory_order_acquire);
+        const auto point = PrivateResetPoint(plan->listIdentity.Get(), plan->input.dispatch.scope.recordingGeneration);
+        std::lock_guard lock(packet->mutex);
+        if (!plan->recorded) packet->policy.Fail();
+        else packet->rayTerminal = point;
+    }
     plan->provenance["status"] = plan->recorded ? "private_raw_copy_recorded_hit_restored" : "private_raw_copy_refused_or_failed";
     plan->provenance["outcome"] = unsigned(result.outcome);
     plan->provenance["engine_state_requests"] = result.requestsIssued;
@@ -2594,6 +2706,7 @@ struct LightingCapturePlan
     Json lightingT8Bindings;
     bool lightingT8Prepared = false;
     std::shared_ptr<RayCopyBundle> rayCopy; // Private copy Work retained by this capture's keepAlive.
+    bool privateReset = false;
 };
 
 struct ExposureMemory
@@ -3121,8 +3234,12 @@ std::shared_ptr<FSRD::CyberpunkGuidePass::Work> PrepareLightingGuideWork(Lightin
     if (shader.size() != GuideShaderBytes) throw std::runtime_error("runtime authenticated guide shader unavailable");
     if (ObserveLightingBindings(plan.list, uintptr_t(plan.pso.Get()), current) != plan.bindings)
         throw std::runtime_error("current authored binding cache changed before descriptor copies");
-    auto work = FSRD::CyberpunkGuidePass::Prepare(plan.device.Get(), dimensions[0], dimensions[1], sources, pass,
-        FSRD::CyberpunkGuideConstants::PackShared(sharedWords), shader);
+    auto* packet = privateResetPacket.load(std::memory_order_acquire);
+    auto work = plan.privateReset
+        ? FSRD::CyberpunkGuidePass::PrepareInto(plan.device.Get(), dimensions[0], dimensions[1], sources, pass,
+            FSRD::CyberpunkGuideConstants::PackShared(sharedWords), shader, packet->guides)
+        : FSRD::CyberpunkGuidePass::Prepare(plan.device.Get(), dimensions[0], dimensions[1], sources, pass,
+            FSRD::CyberpunkGuideConstants::PackShared(sharedWords), shader);
     if (!work) throw std::runtime_error("private guide resource/PSO setup refused");
     plan.provenance["sources"] = std::move(views);
     plan.provenance["cb12_words"] = sharedWords;
@@ -3221,6 +3338,11 @@ std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsComman
         fresh.at("guide_settings") != plan->metadata.at("guide_settings") ||
         fresh.at("camera_provenance").at("matrices") != plan->metadata.at("camera_provenance").at("matrices"))
         throw std::runtime_error("current lighting camera/settings changed during preparation");
+    if (auto* packet = privateResetPacket.load(std::memory_order_acquire))
+    {
+        ClaimPrivateReset(*packet, plan->metadata, plan->device.Get(), packet->guideClaimed);
+        plan->privateReset = true;
+    }
     plan->work = PrepareLightingGuideWork(*plan);
     PrepareLightingExposure(*plan); // Optional raw words; three native guides remain available if refused.
     PrepareLightingT8(*plan); // Original encoded texture, without denoising/decoding.
@@ -3341,6 +3463,13 @@ void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_pt
     if (plan->lightingT8Prepared) input.lightingT8 = { plan->lightingT8Source.handle, plan->lightingT8Source.native };
     if (!FSRDSubmission::Retain(plan->device.Get(), list, plan))
         throw std::runtime_error("lighting capture lifetime retention unavailable");
+    if (plan->privateReset)
+    {
+        auto* packet = privateResetPacket.load(std::memory_order_acquire);
+        const auto point = PrivateResetPoint(plan->listIdentity.Get(), plan->drawState.generation);
+        std::lock_guard lock(packet->mutex);
+        packet->guideBegin = point;
+    }
     const auto result = FSRD::CyberpunkEngineAccess::RecordPrivateCompute(host, input, [&] {
         return plan->work->Record(list) && (!plan->exposureWork || plan->exposureWork->Record(list));
     });
@@ -3395,6 +3524,29 @@ void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_pt
     const bool recorded = FSRDFogLayerCapture::RecordEarlyGuides(plan->device.Get(), list, outputs, plan->provenance.dump(), plan,
         plan->exposureWork ? &exposure : nullptr, plan->lightingT8Prepared ? &lightingT8 : nullptr,
         pairedRayCopies ? &rayCopies : nullptr);
+    if (plan->privateReset)
+    {
+        auto* packet = privateResetPacket.load(std::memory_order_acquire);
+        const auto point = PrivateResetPoint(plan->listIdentity.Get(), plan->drawState.generation);
+        std::lock_guard lock(packet->mutex);
+        ResetPolicy::ProducerSeal seal;
+        seal.ray = packet->producer;
+        seal.guides = { uintptr_t(plan->listIdentity.Get()), plan->drawState.generation };
+        seal.rayTerminal = packet->rayTerminal; seal.guideBegin = packet->guideBegin;
+        seal.guideTerminal = point; seal.sealed = point;
+        seal.raySucceeded = pairedRayCopies && plan->rayCopy && plan->rayCopy->privateReset;
+        seal.guidesSucceeded = true;
+        for (size_t i = 0; i < 3; ++i)
+            seal.guidesSucceeded &= plan->work->Outputs()[i].Get() == packet->guides->Outputs()[i].Get();
+        seal.rayReadBarriers = seal.raySucceeded;
+        seal.guideReadBarriers = seal.guidesSucceeded;
+        seal.rayRestored = seal.raySucceeded;
+        seal.guidesRestored = result.bindingsRestored;
+        seal.rayOwnersRetained = seal.raySucceeded;
+        seal.guideOwnersRetained = true;
+        if (!recorded || !packet->policy.SealProducer(seal))
+            throw std::runtime_error("private RESET producer seal refused");
+    }
     if (recorded && pairedRayCopies)
     {
         auto& data = Data();
@@ -3747,12 +3899,143 @@ void RecordFogDepth(ID3D12GraphicsCommandList* list, CapturePlan& plan)
     }
 }
 
+void RecordPrivateReset(ID3D12GraphicsCommandList* list, CapturePlan& plan)
+{
+    auto* packet = privateResetPacket.load(std::memory_order_acquire);
+    if (!packet) return;
+    struct RefuseIncomplete
+    {
+        bool complete = false;
+        ~RefuseIncomplete() { if (!complete) FailPrivateReset(); }
+    } attempted;
+    if (!plan.depthPrepared || !plan.layers.hardwareDepth.resource)
+        throw std::runtime_error("private RESET requires successful native Fog hardware-depth copy");
+    ClaimPrivateReset(*packet, plan.depthMetadata, plan.device.Get(), packet->fogClaimed);
+    const auto source = ResetSource::Parse(plan.depthMetadata, packet->delta);
+    const auto& c = source.parameters;
+    FSRD::PrivateDenoise::Parameters parameters;
+    auto& conversion = parameters.conversion;
+    const auto& rays = packet->rays->Outputs();
+    const auto& guides = packet->guides->Outputs();
+    conversion.Resources.InColor = plan.layers.before.resource.Get();
+    conversion.Resources.InDepth = plan.layers.hardwareDepth.resource.Get();
+    conversion.Resources.InMotionVectors = rays[0].Get();
+    conversion.Resources.InNormals = guides[2].Get();
+    conversion.Resources.InRoughness = nullptr;
+    conversion.Resources.InSpecHitDist = rays[1].Get();
+    conversion.Resources.InDiffAlbedo = guides[0].Get();
+    conversion.Resources.InSpecAlbedo = guides[1].Get();
+    std::memcpy(&conversion.InvViewMatrix, c.inverseView.data(), sizeof(conversion.InvViewMatrix));
+    std::memcpy(&conversion.InvProjMatrix, c.inverseProjection.data(), sizeof(conversion.InvProjMatrix));
+    std::memcpy(&conversion.PrevViewMatrix, c.previousView.data(), sizeof(conversion.PrevViewMatrix));
+    std::memcpy(&conversion.PreviousDepthProjection, c.previousDepthProjection.data(), sizeof(conversion.PreviousDepthProjection));
+    std::memcpy(&conversion.RenderSize, c.renderSize.data(), sizeof(conversion.RenderSize));
+    conversion.NearPlane = c.nearPlane; conversion.FarPlane = c.farPlane; conversion.Flags = c.conversionFlags;
+    auto& d = parameters.dispatch;
+    d.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER;
+    d.renderSize = { source.width, source.height };
+    d.cameraRight = { c.cameraRight[0], c.cameraRight[1], c.cameraRight[2] };
+    d.cameraUp = { c.cameraUp[0], c.cameraUp[1], c.cameraUp[2] };
+    d.cameraForward = { c.cameraForward[0], c.cameraForward[1], c.cameraForward[2] };
+    d.cameraPositionDelta = { 0, 0, 0 };
+    d.motionVectorScale = { c.motionScale[0], c.motionScale[1], c.motionScale[2] };
+    d.jitterOffsets = { c.jitterNdc[0], c.jitterNdc[1] };
+    d.cameraAspectRatio = c.aspectRatio; d.cameraNear = c.nearPlane; d.cameraFar = c.farPlane;
+    d.cameraFovAngleVertical = c.verticalFovRadians; d.deltaTime = c.deltaMilliseconds;
+    d.frameIndex = c.frameIndex; d.flags = c.dispatchFlags;
+    parameters.maxRenderSize = d.renderSize;
+    parameters.providerId = packet->provider; parameters.settings = packet->settings;
+    const char* error = nullptr;
+    auto work = FSRD::PrivateDenoise::Prepare(plan.device.Get(), parameters, &error);
+    if (!work) throw std::runtime_error(error && *error ? error : "private RESET preparation failed");
+    const auto repeated = ResetSource::Parse(Json::parse(FSRDCyberpunkEarlyGuides::Describe(
+        scope->context, authenticatedImage.load())), packet->delta);
+    if (!source.SameFrame(repeated))
+        throw std::runtime_error("private RESET current camera changed during provider preparation");
+    // This owner must NOT become part of plan's submission-ticket ownership tree.
+    packet->denoise = work;
+    const auto firstRead = PrivateResetPoint(plan.endpoint->list.Get(), plan.drawState.generation);
+    {
+        std::lock_guard lock(packet->mutex);
+        packet->consumerIdentity = plan.endpoint->list;
+        if (!packet->policy.EmbedConsumer({ uintptr_t(plan.endpoint->list.Get()), plan.drawState.generation }, firstRead, true))
+            throw std::runtime_error("private RESET consumer obligation refused");
+    }
+    // Only our own pre-Fog snapshot changes state. The original target/alpha
+    // stays untouched. Its producer may RECORD later on CPU, but the mandatory
+    // pre-submit gate admits reads only after its exact GPU dependency is proved.
+    constexpr auto readable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    Transition(list, plan.layers.before.resource.Get(), plan.layers.before.state, readable);
+    plan.layers.before.state = readable;
+    FogDepthEngineHost host { plan };
+    FSRD::CyberpunkFogDenoiseAccess::Input input;
+    input.image = authenticatedImage.load(); input.list = uintptr_t(list);
+    input.originalPso = uintptr_t(plan.originalPso.Get()); input.originalFogScope = plan.depthSnapshot.scope.serial;
+    input.depth = { plan.depthSnapshot.handle, plan.depthSnapshot.native };
+    const auto result = FSRD::CyberpunkFogDenoiseAccess::RecordPrivateCompute(host, input, [&] { return work->Record(list); });
+    if (result.outcome == FSRD::CyberpunkFogDenoiseAccess::Outcome::ScopeLostAfterMutation)
+        PrivateResetFatal();
+    if (result.outcome != FSRD::CyberpunkFogDenoiseAccess::Outcome::PrivateRecordedRestored || !work->Recorded())
+        throw std::runtime_error("private RESET recording/restoration failed");
+    const auto& outputs = work->Outputs();
+    plan.layers.privateReset = {
+        FSRDFogLayerCapture::Texture { outputs.radiance, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, readable },
+        FSRDFogLayerCapture::Texture { outputs.denoised, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, readable },
+        FSRDFogLayerCapture::Texture { outputs.composed, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, readable } };
+    const auto& effective = work->EffectiveParameters();
+    const auto& ec = effective.conversion;
+    const auto& ed = effective.dispatch;
+    std::array<uint32_t, 60> constantWords {};
+    std::memcpy(constantWords.data(), &ec.InvViewMatrix, 64);
+    std::memcpy(constantWords.data() + 16, &ec.InvProjMatrix, 64);
+    std::memcpy(constantWords.data() + 32, &ec.PrevViewMatrix, 64);
+    std::memcpy(constantWords.data() + 48, &ec.PreviousDepthProjection, 16);
+    std::memcpy(constantWords.data() + 52, &ec.RenderSize, 16);
+    constantWords[56] = std::bit_cast<uint32_t>(ec.NearPlane);
+    constantWords[57] = std::bit_cast<uint32_t>(ec.FarPlane);
+    constantWords[58] = ec.Flags;
+    const auto floatWords = [](std::initializer_list<float> values) {
+        auto words = Json::array();
+        for (float value : values) words.push_back(std::bit_cast<uint32_t>(value));
+        return words;
+    };
+    plan.provenance["private_reset"] = {
+        { "status", "private_commands_recorded_submission_gate_required" }, { "scene_modified", false },
+        { "provider_id", packet->provider }, { "provider_name", work->ProviderName() },
+        { "delta_ms", packet->delta }, { "delta_source", "explicit_reset_control_not_captured_duration" },
+        { "conversion_flags", ec.Flags }, { "dispatch_flags", ed.flags },
+        { "effective_conversion_cb_words", constantWords },
+        { "effective_dispatch_float_words", {
+            { "motion_scale", floatWords({ ed.motionVectorScale.x, ed.motionVectorScale.y, ed.motionVectorScale.z }) },
+            { "jitter", floatWords({ ed.jitterOffsets.x, ed.jitterOffsets.y }) },
+            { "camera_right", floatWords({ ed.cameraRight.x, ed.cameraRight.y, ed.cameraRight.z }) },
+            { "camera_up", floatWords({ ed.cameraUp.x, ed.cameraUp.y, ed.cameraUp.z }) },
+            { "camera_forward", floatWords({ ed.cameraForward.x, ed.cameraForward.y, ed.cameraForward.z }) },
+            { "camera_delta", floatWords({ ed.cameraPositionDelta.x, ed.cameraPositionDelta.y, ed.cameraPositionDelta.z }) },
+            { "aspect_near_far_fov_delta", floatWords({ ed.cameraAspectRatio, ed.cameraNear, ed.cameraFar,
+                                                        ed.cameraFovAngleVertical, ed.deltaTime }) } } },
+        { "frame", source.frame }, { "view", source.view }, { "frame_object", source.object },
+        { "settings", { effective.settings.crossBilateralNormalStrength, effective.settings.stabilityBias,
+            effective.settings.maxRadiance, effective.settings.radianceClipStdK,
+            effective.settings.gaussianKernelRelaxation, effective.settings.disocclusionThreshold } },
+        { "camera", source.camera }, { "bindings_restored", result.bindingsRestored },
+        { "first_read_ordinal", firstRead }, { "temporal_history", "independent one-shot RESET only" } };
+    // Seal only after subsequent original/private draw and readback recording in
+    // FinishCapture. Exceptions anywhere before that leave the gate unsealed.
+    attempted.complete = true;
+}
+
 std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UINT count, UINT instances,
                                            UINT start, UINT firstInstance, uintptr_t nativeCaller)
 {
+    if (privateResetArming.load(std::memory_order_acquire)) return {};
     if (!captureEnabled.load() || !captureTrackingValid.load() || captureStarted.load() ||
         !FSRDFogLayerCapture::WantsCapture() || !scope)
         return {};
+    // Recheck AFTER acquiring the capture slot's synchronization: arming may
+    // have started between the first latch read and WantsCapture observing the
+    // newly queued slot. False here publishes the entire immutable packet.
+    if (privateResetArming.load(std::memory_order_acquire)) return {};
     const auto& s = *scope;
     if (count != 3 || instances != 1 || start != 0 || firstInstance != 0 ||
         list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT || s.psoList != list || !s.pso ||
@@ -3996,6 +4279,7 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     CopyMain(list, *plan, plan->layers.before.resource.Get());
     RecordFogDepth(list, *plan); // Independent private snapshot on Fog's own list, no guide reads.
     if (plan->fatalEarlyRecording) return plan;
+    RecordPrivateReset(list, *plan);
     PrepareAndRecordEarlyGuides(list, *plan); // Optional private outputs; never writes the original scene.
     return plan;
 }
@@ -4082,6 +4366,15 @@ void FinishCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<Captur
     CaptureBoundCb12(list, *plan);
     const bool recorded = FSRDFogLayerCapture::Record(plan->device.Get(), list, plan->layers,
                                                      plan->provenance.dump(), plan);
+    if (plan->layers.privateReset[0].resource)
+    {
+        auto* packet = privateResetPacket.load(std::memory_order_acquire);
+        const auto point = PrivateResetPoint(plan->endpoint->list.Get(), plan->drawState.generation);
+        std::lock_guard lock(packet->mutex);
+        if (!recorded || !packet->policy.SealConsumer(
+            { uintptr_t(plan->endpoint->list.Get()), plan->drawState.generation }, point, true, true))
+            throw std::runtime_error("private RESET completed consumer seal refused");
+    }
     {
         const auto status = FSRDFogLayerCapture::GetStatus();
         auto& data = Data();
@@ -4109,7 +4402,8 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
     const auto nativeCaller = uintptr_t(_ReturnAddress());
     LogDraw(list, false, count, instances, start, 0, firstInstance);
     std::shared_ptr<LightingCapturePlan> lightingPlan;
-    if (captureEnabled.load() && !inMetadata && lightingRequested.load() && !lightingAttempted.load() &&
+    if (captureEnabled.load() && !inMetadata && !privateResetArming.load(std::memory_order_acquire) &&
+        lightingRequested.load() && !lightingAttempted.load() &&
         FSRDFogLayerCapture::WantsEarlyGuideCapture() &&
         MatchesFinalLightingDraw(lightingScope != nullptr, lightingScope && lightingScope->finalHelper,
             nativeCaller, authenticatedImage.load(), count, instances, start, firstInstance) &&
@@ -4472,6 +4766,161 @@ bool Authenticate(uintptr_t& entry)
     return true;
 }
 } // namespace
+
+void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
+{
+    if (!active.load() || !captureEnabled.load() || !captureTrackingValid.load() ||
+        privateResetPacket.load(std::memory_order_acquire)) return;
+    static std::atomic<ULONGLONG> nextPoll { 0 };
+    auto due = nextPoll.load();
+    const auto now = GetTickCount64();
+    if (now < due || !nextPoll.compare_exchange_strong(due, now + 1000)) return;
+    Metadata([&] {
+        const auto path = Util::ExePath().parent_path() / L"FSRRR-prefog-reset.request";
+        const auto attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return;
+        if (privateResetArming.exchange(true, std::memory_order_acq_rel)) return;
+        struct FinishArming
+        {
+            ~FinishArming() { privateResetArming.store(false, std::memory_order_release); }
+        } finishArming;
+        if (privateResetPacket.load(std::memory_order_acquire)) return;
+        try
+        {
+            if (!device || !width || !height || width > 8192 || height > 8192 ||
+                captureStarted.load() || lightingRequested.load() || lightingAttempted.load() || earlyRequested.load() ||
+                rayCopyAttempted.load() || !rayBindingsAuthenticated.load() || !fogDepthAuthenticated.load() ||
+                authenticatedImage.load() != uintptr_t(GetModuleHandleW(nullptr)) || std::filesystem::file_size(path) > 4096)
+                throw std::runtime_error("private RESET requires an unused authenticated capture session");
+            Json controls;
+            std::ifstream file(path, std::ios::binary);
+            file >> controls;
+            if (controls.at("mode") != "private_reset_only" ||
+                controls.at("delta_source") != "explicit_reset_control_not_captured_duration")
+                throw std::runtime_error("private RESET requires explicit private-only experiment controls");
+            ComPtr<IUnknown> identity;
+            if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))))
+                throw std::runtime_error("private RESET device identity unavailable");
+            auto packet = std::make_unique<PrivateResetPacket>(uintptr_t(identity.Get()));
+            packet->device = device; packet->deviceIdentity = identity;
+            packet->width = width; packet->height = height;
+            packet->provider = controls.at("provider_id").get<uint64_t>();
+            packet->delta = controls.at("delta_ms").get<float>();
+            const auto& settings = controls.at("settings");
+            if (!packet->provider || settings.size() != 6 || !std::isfinite(packet->delta) || packet->delta <= 0)
+                throw std::runtime_error("private RESET provider/duration/settings incomplete");
+            packet->settings = { settings.at("1").get<float>(), settings.at("2").get<float>(),
+                settings.at("3").get<float>(), settings.at("4").get<float>(),
+                settings.at("5").get<float>(), settings.at("6").get<float>() };
+            const char* error = nullptr;
+            packet->guides = FSRD::CyberpunkGuidePass::AllocateTargets(device, width, height, &error);
+            packet->rays = FSRD::PrivateRayCopy::AllocateTargets(device, width, height, &error);
+            if (!packet->guides || !packet->rays)
+                throw std::runtime_error(error && *error ? error : "private RESET target allocation failed");
+            UINT64 bytes = 0;
+            const auto account = [&](const auto& targets) {
+                for (const auto& target : targets)
+                {
+                    const auto desc = target->GetDesc();
+                    const auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+                    if (!size || size > MaxCaptureTextureBytes - bytes)
+                        throw std::runtime_error("private RESET combined target budget exceeded");
+                    bytes += size;
+                }
+            };
+            account(packet->guides->Outputs()); account(packet->rays->Outputs());
+            if (!FSRDFogLayerCapture::RequestEarlyGuides())
+                throw std::runtime_error("private RESET guide capture slot unavailable");
+            if (!FSRDFogLayerCapture::Request())
+            {
+                FSRDFogLayerCapture::CancelEarlyGuideRequest();
+                throw std::runtime_error("private RESET Fog capture slot unavailable");
+            }
+            if (!DeleteFileW(path.c_str()))
+            {
+                FSRDFogLayerCapture::CancelEarlyGuideRequest(); FSRDFogLayerCapture::CancelRequest();
+                throw std::runtime_error("private RESET marker could not be consumed");
+            }
+            privateResetPacket.store(packet.release(), std::memory_order_release);
+            lightingRequestedAt.store(GetTickCount64());
+            lightingRequested.store(true);
+            LOG_INFO("[FSRRR private RESET] armed {}x{} fixed private targets; no game writes; exact frame and pre-submit gate required", width, height);
+        }
+        catch (const std::exception& error) { LOG_WARN("[FSRRR private RESET] arm refused: {}", error.what()); }
+    });
+}
+
+uint64_t AdmitPrivateResetSubmission(ID3D12CommandQueue* queue, UINT count,
+                                      ID3D12CommandList* const* lists) noexcept
+{
+    auto* packet = privateResetPacket.load(std::memory_order_acquire);
+    if (!packet) return 0;
+    try
+    {
+        if (!count) return 0;
+        if (!queue || !lists || count > ResetPolicy::Policy::MaxExecuteLists)
+            PrivateResetFatal();
+        ComPtr<IUnknown> queueIdentity, deviceIdentity;
+        if (FAILED(queue->QueryInterface(IID_PPV_ARGS(&queueIdentity))) ||
+            FAILED(queue->GetDevice(IID_PPV_ARGS(&deviceIdentity))))
+            PrivateResetFatal();
+        std::array<ResetPolicy::Recording, ResetPolicy::Policy::MaxExecuteLists> recordings {};
+        std::array<ComPtr<IUnknown>, ResetPolicy::Policy::MaxExecuteLists> identities;
+        for (UINT i = 0; i < count; ++i)
+        {
+            if (!lists[i] || FAILED(lists[i]->QueryInterface(IID_PPV_ARGS(&identities[i]))))
+                PrivateResetFatal();
+            recordings[i].list = uintptr_t(identities[i].Get());
+        }
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            for (UINT i = 0; i < count; ++i)
+            {
+                const auto found = data.lists.find(identities[i].Get());
+                if (captureTrackingValid.load() && found != data.lists.end() && found->second.known)
+                    recordings[i].generation = found->second.generation;
+            }
+        }
+        ResetPolicy::Decision decision;
+        {
+            std::lock_guard lock(packet->mutex);
+            decision = packet->policy.BeforeExecute(
+                { uintptr_t(queueIdentity.Get()), uintptr_t(deviceIdentity.Get()),
+                  queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT },
+                std::span<const ResetPolicy::Recording>(recordings.data(), count));
+            if (decision.token) packet->queueIdentity = queueIdentity;
+        }
+        if (!decision.Allowed())
+        {
+            try { LOG_ERROR("[FSRRR private RESET] submission refused failure={} count={}", unsigned(decision.failure), count); }
+            catch (...) {}
+            PrivateResetFatal();
+        }
+        if (decision.token)
+        {
+            // Logging is NOT the admission mechanism and cannot unwind it.
+            try { LOG_INFO("[FSRRR private RESET] pre-submit admitted token={} route={} queue={:x} count={}",
+                decision.token, unsigned(decision.admission), uintptr_t(queueIdentity.Get()), count); }
+            catch (...) {}
+        }
+        return decision.token;
+    }
+    catch (...) { PrivateResetFatal(); } // Never best-effort Metadata around this gate.
+}
+
+void ReturnedPrivateResetSubmission(uint64_t token) noexcept
+{
+    if (!token) return;
+    auto* packet = privateResetPacket.load(std::memory_order_acquire);
+    if (!packet) PrivateResetFatal();
+    {
+        std::lock_guard lock(packet->mutex);
+        if (!packet->policy.AfterExecute(token)) PrivateResetFatal();
+    }
+    try { LOG_INFO("[FSRRR private RESET] native Execute returned token={}", token); }
+    catch (...) {}
+}
 
 CaptureCandidate ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                      ID3D12Resource* colorBeforeParticles, uint64_t featureId, uint64_t frameIndex,

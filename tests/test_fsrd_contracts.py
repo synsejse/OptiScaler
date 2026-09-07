@@ -20,8 +20,10 @@ class RRContracts(unittest.TestCase):
         self.assertNotIn("WaitForSingleObject", source)
         self.assertNotIn("Sleep(", source)
         hook = (ROOT / "OptiScaler/resource_tracking/ResTrack_dx12.cpp").read_text()
+        self.assertEqual(hook.count("FSRDResearch::Submitted("), 2)
         for section in hook.split("FSRDResearch::Submitted(")[:-1]:
             self.assertRegex(section, r"o_ExecuteCommandLists\(This, NumCommandLists, ppCommandLists\);\s*"
+                                     r"FSRDCyberpunkFogProbe::ReturnedPrivateResetSubmission\(privateResetSubmission\);\s*"
                                      r"FSRDCyberpunkFogProbe::SubmittedSubmission\(fogSubmission\);\s*$")
 
     def test_research_capture_is_bounded_and_preserves_channels(self):

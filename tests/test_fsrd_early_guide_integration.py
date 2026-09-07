@@ -128,7 +128,17 @@ class EarlyGuideIntegration(unittest.TestCase):
         self.assertIn("image == uintptr_t(GetModuleHandleW(nullptr))", fatal)
         self.assertIn("TerminateProcess(GetCurrentProcess(), 0xf51d0001u)", fatal)
         self.assertEqual(prepare.count("TerminateProcess("), 1)
-        self.assertEqual(SOURCE.count("TerminateProcess("), 4) # Authenticated early-guide, lighting, ray-copy and Fog-depth fatal paths.
+        # Existing native scope-loss paths plus the explicitly armed private
+        # RESET dependency fail-stop. None may terminate an unrelated process.
+        self.assertEqual(SOURCE.count("TerminateProcess("), 5)
+        reset_fatal = function("PrivateResetFatal")
+        self.assertLess(reset_fatal.index("earlyFatalRecording.store(true)"), reset_fatal.index("LOG_ERROR"))
+        self.assertIn("TerminateProcess(GetCurrentProcess(), 0xf51d0002u)", reset_fatal)
+        self.assertIn("RaiseFailFastException", reset_fatal)
+        arm = function("ArmPrivateReset")
+        for gate in ("!active.load()", "!captureEnabled.load()", "!captureTrackingValid.load()",
+                     "authenticatedImage.load() != uintptr_t(GetModuleHandleW(nullptr))"):
+            self.assertLess(arm.index(gate), arm.index("privateResetPacket.store("))
         draw = function("HookDraw")
         self.assertLess(draw.index("earlyFatalRecording.load()"), draw.index("originalDraw("))
 

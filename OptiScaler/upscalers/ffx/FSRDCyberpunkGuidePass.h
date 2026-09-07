@@ -17,6 +17,30 @@ struct SourceView
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor {};
 };
 
+class Work;
+// Opaque, fixed factory outputs: RGBA8_UNORM/RGBA8_UNORM/RGBA16_FLOAT, initially
+// UAV. Allocation alone is NOT production, readable state, frame or GPU-order proof.
+class Targets
+{
+  public:
+    ~Targets();
+    Targets(const Targets&) = delete;
+    Targets& operator=(const Targets&) = delete;
+    const std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3>& Outputs() const noexcept;
+
+  private:
+    struct Impl;
+    explicit Targets(std::unique_ptr<Impl> implementation);
+    friend class Work;
+    friend std::shared_ptr<Targets> AllocateTargets(ID3D12Device*, UINT, UINT, const char**) noexcept;
+    std::unique_ptr<Impl> _impl;
+};
+
+// CPU-only; no arbitrary caller resource arrays can be adopted. The device, extent
+// and destination identities are immutable after successful bounded allocation.
+std::shared_ptr<Targets> AllocateTargets(ID3D12Device* device, UINT width, UINT height,
+                                       const char** error = nullptr) noexcept;
+
 class Work : public std::enable_shared_from_this<Work>
 {
   public:
@@ -40,6 +64,14 @@ class Work : public std::enable_shared_from_this<Work>
     friend std::shared_ptr<Work> Prepare(ID3D12Device*, UINT, UINT,
         const std::array<SourceView, 4>&, const CyberpunkGuideConstants::PassConstants&,
         const CyberpunkGuideConstants::SharedConstants&, std::span<const std::byte>) noexcept;
+    friend std::shared_ptr<Work> PrepareInto(ID3D12Device*, UINT, UINT,
+        const std::array<SourceView, 4>&, const CyberpunkGuideConstants::PassConstants&,
+        const CyberpunkGuideConstants::SharedConstants&, std::span<const std::byte>,
+        const std::shared_ptr<Targets>&) noexcept;
+    static std::shared_ptr<Work> PrepareImpl(ID3D12Device*, UINT, UINT,
+        const std::array<SourceView, 4>&, const CyberpunkGuideConstants::PassConstants&,
+        const CyberpunkGuideConstants::SharedConstants&, std::span<const std::byte>,
+        const std::shared_ptr<Targets>&, bool) noexcept;
     std::unique_ptr<Impl> _impl;
 };
 
@@ -63,4 +95,13 @@ class Work : public std::enable_shared_from_this<Work>
 std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
     const std::array<SourceView, 4>& sources, const CyberpunkGuideConstants::PassConstants& pass,
     const CyberpunkGuideConstants::SharedConstants& shared, std::span<const std::byte> shader) noexcept;
+
+// Same source/shader/recording contract with fixed predeclared outputs. One atomic
+// attempt consumes a nonnull target set even if preparation fails; no retry/rebind.
+// The host must validate actual producer success and GPU ordering before submitting
+// any consumer, independently of which callback records first on the CPU.
+std::shared_ptr<Work> PrepareInto(ID3D12Device* device, UINT width, UINT height,
+    const std::array<SourceView, 4>& sources, const CyberpunkGuideConstants::PassConstants& pass,
+    const CyberpunkGuideConstants::SharedConstants& shared, std::span<const std::byte> shader,
+    const std::shared_ptr<Targets>& targets) noexcept;
 } // namespace FSRD::CyberpunkGuidePass

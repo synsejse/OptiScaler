@@ -41,14 +41,71 @@ void Charge(ID3D12Device* device, const D3D12_RESOURCE_DESC& description, UINT64
     total += allocation.SizeInBytes;
 }
 
+std::array<D3D12_RESOURCE_DESC, 2> OutputDescriptions(UINT width, UINT height)
+{
+    std::array<D3D12_RESOURCE_DESC, 2> descriptions {};
+    for (UINT i = 0; i < descriptions.size(); ++i)
+    {
+        auto& output = descriptions[i];
+        output.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        output.Width = width; output.Height = height;
+        output.DepthOrArraySize = 1; output.MipLevels = 1;
+        output.Format = Formats[i]; output.SampleDesc.Count = 1;
+        output.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        output.Flags = D3D12_RESOURCE_FLAG_NONE;
+    }
+    return descriptions;
+}
+
 // Submission owns this lease, not Work or any submission ticket. No backreferences.
 struct Lease
 {
     ComPtr<ID3D12Device> device;
     Textures sources;
     Textures outputs;
+    std::shared_ptr<Targets> targets;
 };
 } // namespace
+
+struct Targets::Impl
+{
+    ComPtr<ID3D12Device> device;
+    Textures outputs;
+    UINT width = 0, height = 0;
+    std::atomic<bool> claimed = false;
+};
+Targets::Targets(std::unique_ptr<Impl> implementation) : _impl(std::move(implementation)) {}
+Targets::~Targets() = default;
+const Textures& Targets::Outputs() const noexcept { return _impl->outputs; }
+
+std::shared_ptr<Targets> AllocateTargets(ID3D12Device* device, UINT width, UINT height,
+                                       const char** error) noexcept
+{
+    if (error) *error = "";
+    try
+    {
+        Require(device && width && height && width <= MaxDimension && height <= MaxDimension,
+                "invalid ray-copy device or extent");
+        Identity(device);
+        const auto descriptions = OutputDescriptions(width, height);
+        UINT64 totalBytes = 0;
+        for (const auto& output : descriptions) Charge(device, output, totalBytes);
+        auto data = std::make_unique<Targets::Impl>();
+        data->device = device; data->width = width; data->height = height;
+        ScopedSkipHeapCapture skipHeapCapture {};
+        D3D12_HEAP_PROPERTIES heap {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1; heap.VisibleNodeMask = 1;
+        for (UINT i = 0; i < data->outputs.size(); ++i)
+            Require(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &descriptions[i],
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&data->outputs[i]))) && data->outputs[i],
+                    "private ray-copy destination creation failed");
+        return std::shared_ptr<Targets>(new Targets(std::move(data)));
+    }
+    catch (const Refused& refused) { if (error) *error = refused.reason; }
+    catch (...) { if (error) *error = "ray-copy target allocation failed"; }
+    return {};
+}
 
 struct Work::Impl
 {
@@ -68,9 +125,31 @@ const Textures& Work::Outputs() const noexcept { return _impl->lease->outputs; }
 std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
                               const Textures& sources, const char** error) noexcept
 {
+    return Work::PrepareImpl(device, width, height, sources, {}, false, error);
+}
+
+std::shared_ptr<Work> PrepareInto(ID3D12Device* device, UINT width, UINT height,
+    const Textures& sources, const std::shared_ptr<Targets>& targets, const char** error) noexcept
+{
+    return Work::PrepareImpl(device, width, height, sources, targets, true, error);
+}
+
+std::shared_ptr<Work> Work::PrepareImpl(ID3D12Device* device, UINT width, UINT height,
+    const Textures& sources, const std::shared_ptr<Targets>& supplied, bool preallocated,
+    const char** error) noexcept
+{
     if (error) *error = "";
     try
     {
+        auto targets = supplied;
+        if (preallocated)
+        {
+            Require(bool(targets), "ray-copy target set absent");
+            Require(!targets->_impl->claimed.exchange(true), "ray-copy target set already claimed");
+            Require(device && width == targets->_impl->width && height == targets->_impl->height &&
+                    Identity(device).Get() == Identity(targets->_impl->device.Get()).Get(),
+                    "ray-copy target device or extent differs");
+        }
         Require(device && width && height && width <= MaxDimension && height <= MaxDimension,
                 "invalid ray-copy device or extent");
         auto data = std::make_unique<Work::Impl>();
@@ -80,7 +159,7 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
         data->width = width; data->height = height;
         UINT64 totalBytes = 0;
         std::array<ComPtr<IUnknown>, 2> identities;
-        std::array<D3D12_RESOURCE_DESC, 2> outputDescriptions {};
+        const auto outputDescriptions = OutputDescriptions(width, height);
         for (UINT i = 0; i < sources.size(); ++i)
         {
             Require(sources[i] && OnDevice(sources[i].Get(), device), "ray-copy source missing or on another device");
@@ -95,26 +174,23 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
             Require(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo))) &&
                     formatInfo.PlaneCount == 1, "ray-copy source must have exactly one native plane");
             Charge(device, source, totalBytes);
-            auto& output = outputDescriptions[i];
-            output.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            output.Width = width; output.Height = height;
-            output.DepthOrArraySize = 1; output.MipLevels = 1;
-            output.Format = source.Format;
-            output.SampleDesc.Count = 1;
-            output.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            output.Flags = D3D12_RESOURCE_FLAG_NONE;
+            const auto& output = outputDescriptions[i];
             Charge(device, output, totalBytes);
         }
         Require(identities[0].Get() != identities[1].Get(), "ray-copy source identities alias");
         // Allocate only after the entire source + destination budget/admission passes.
-        ScopedSkipHeapCapture skipHeapCapture {};
-        D3D12_HEAP_PROPERTIES heap {};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        heap.CreationNodeMask = 1; heap.VisibleNodeMask = 1;
-        for (UINT i = 0; i < lease.outputs.size(); ++i)
-            Require(SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &outputDescriptions[i],
-                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&lease.outputs[i]))) && lease.outputs[i],
-                    "private ray-copy destination creation failed");
+        if (!preallocated)
+        {
+            const char* allocationError = "";
+            targets = AllocateTargets(device, width, height, &allocationError);
+            Require(bool(targets), allocationError);
+            Require(!targets->_impl->claimed.exchange(true), "ray-copy target set already claimed");
+        }
+        lease.targets = targets;
+        lease.outputs = targets->_impl->outputs;
+        for (const auto& output : lease.outputs)
+            for (const auto& sourceIdentity : identities)
+                Require(Identity(output.Get()).Get() != sourceIdentity.Get(), "ray-copy source aliases private target");
         return std::shared_ptr<Work>(new Work(std::move(data)));
     }
     catch (const Refused& refused) { if (error) *error = refused.reason; }

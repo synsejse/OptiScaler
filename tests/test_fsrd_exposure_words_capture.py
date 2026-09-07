@@ -37,7 +37,14 @@ class ExposureWordsCapture(unittest.TestCase):
                       "batch->exposureWords->bytes > MaxBytes - totalBytes"):
             self.assertLess(record.index(guard), record.index("AllocateReadback(device, entry)"))
         self.assertIn("batch->exposureWords->bytes", record)
-        self.assertNotIn("exposureWords", body("Record"))
+        fog = body("Record")
+        # Fog may inspect any existing optional identity when rejecting aliases,
+        # but cannot admit or record an exposure producer through its API.
+        self.assertNotIn("exposureWords", HEADER.split("struct Layers", 1)[1].split("};", 1)[0])
+        for forbidden in ('batch->exposureWords =', '.role = "exposure_words"',
+                          'PrepareEntry(device, *batch->exposureWords',
+                          'RecordCopy(list, *batch->exposureWords)'):
+            self.assertNotIn(forbidden, fog)
         prepare = body("PrepareEntry")
         self.assertIn("boundCb12 || guideAlbedo ||", prepare)
         self.assertIn("else if (boundCb12)", prepare)

@@ -445,9 +445,13 @@ class FogProbe(unittest.TestCase):
         queue = (ROOT / "OptiScaler/resource_tracking/ResTrack_dx12.cpp").read_text()
         self.assertEqual(queue.count("FSRDCyberpunkFogProbe::PreparingSubmission(This, NumCommandLists, ppCommandLists)"), 2)
         self.assertEqual(queue.count("FSRDCyberpunkFogProbe::SubmittedSubmission(fogSubmission)"), 2)
-        pattern = (r"PreparingSubmission\(This, NumCommandLists, ppCommandLists\);\s*"
+        pattern = (r"const auto privateResetSubmission = FSRDCyberpunkFogProbe::AdmitPrivateResetSubmission"
+                   r"\(This, NumCommandLists, ppCommandLists\);\s*"
+                   r"const auto fogSubmission = FSRDCyberpunkFogProbe::PreparingSubmission"
+                   r"\(This, NumCommandLists, ppCommandLists\);\s*"
                    r"const auto fsrdSubmission = FSRDSubmission::Preparing\(NumCommandLists, ppCommandLists\);\s*"
                    r"o_ExecuteCommandLists\(This, NumCommandLists, ppCommandLists\);\s*"
+                   r"FSRDCyberpunkFogProbe::ReturnedPrivateResetSubmission\(privateResetSubmission\);\s*"
                    r"FSRDCyberpunkFogProbe::SubmittedSubmission\(fogSubmission\);")
         self.assertEqual(len(re.findall(pattern, queue)), 2)
 

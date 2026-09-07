@@ -45,8 +45,24 @@ class PrivateRayCopy(unittest.TestCase):
         self.assertNotIn('Work', lease)
         self.assertIn('Textures sources', lease)
         self.assertIn('Textures outputs', lease)
-        prepare = SOURCE.split('std::shared_ptr<Work> Prepare', 1)[1].split('bool Work::Record', 1)[0]
-        self.assertLess(prepare.index('Charge(device, output'), prepare.index('CreateCommittedResource'))
+        prepare = SOURCE.split('std::shared_ptr<Work> Work::PrepareImpl', 1)[1].split('bool Work::Record', 1)[0]
+        self.assertLess(prepare.index('Charge(device, output'), prepare.index('targets = AllocateTargets'))
+        factory = SOURCE.split('std::shared_ptr<Targets> AllocateTargets', 1)[1].split('struct Work::Impl', 1)[0]
+        self.assertLess(factory.index('Charge(device, output'), factory.index('CreateCommittedResource'))
+        self.assertIn('std::shared_ptr<Targets> targets', lease)
+
+    def test_preallocated_targets_are_opaque_fixed_and_single_claim(self):
+        target = HEADER.split('class Targets\n', 1)[1].split('class Work\n', 1)[0]
+        self.assertIn('Targets(const Targets&) = delete', target)
+        self.assertIn('private:', target)
+        self.assertGreater(target.index('explicit Targets('), target.index('private:'))
+        self.assertIn('const Textures& Outputs() const noexcept', target)
+        self.assertNotIn('Textures& outputs', HEADER)
+        self.assertIn('std::atomic<bool> claimed = false', SOURCE)
+        self.assertEqual(SOURCE.count('targets->_impl->claimed.exchange(true)'), 2)
+        self.assertIn('lease.outputs = targets->_impl->outputs', SOURCE)
+        self.assertIn('ray-copy source aliases private target', SOURCE)
+        self.assertIn('actual successful production and GPU ordering', HEADER)
 
     def test_actual_cpp_admission_copy_bits_failure_and_lifetime(self):
         compiler = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++')
@@ -56,11 +72,13 @@ class PrivateRayCopy(unittest.TestCase):
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 using UINT=unsigned; using UINT64=uint64_t; using HRESULT=int;
 using DXGI_FORMAT=int; using D3D12_RESOURCE_STATES=unsigned;
@@ -82,7 +100,7 @@ struct D3D12_RESOURCE_ALLOCATION_INFO {uint64_t SizeInBytes;};
 struct D3D12_FEATURE_DATA_FORMAT_INFO {DXGI_FORMAT Format{}; unsigned char PlaneCount{};};
 struct D3D12_HEAP_PROPERTIES {int Type{},CPUPageProperty{},MemoryPoolPreference{};
  UINT CreationNodeMask{},VisibleNodeMask{};};
-struct IUnknown {unsigned refs=0; IUnknown* canonical=nullptr; bool identityFail=false;
+struct IUnknown {std::atomic<unsigned> refs=0; IUnknown* canonical=nullptr; bool identityFail=false;
  virtual ~IUnknown()=default;
  void AddRef(){++refs;} void Release(){assert(refs); if(!--refs)delete this;}
  HRESULT QueryInterface(IUnknown** p){if(identityFail)return -1;
@@ -211,6 +229,50 @@ void invalidDescription(unsigned which){
  assert(f.device->creationCount==0 && Fake::events.empty());
 }
 int main(){
+ // Allocate first, expose stable references to an independent future consumer,
+ // then bind exactly one source producer without allocating/replacing targets.
+ {Fixture f;const char* error="old";auto targets=AllocateTargets(f.device.Get(),16,8,&error);
+  assert(targets && std::string(error).empty() && f.device->creationCount==2);
+  auto consumer=targets->Outputs();
+  for(unsigned i=0;i<2;++i){assert(consumer[i]->state==0x400);
+   assert(consumer[i]->desc.Width==16 && consumer[i]->desc.Height==8);}
+  auto w=PrepareInto(f.device.Get(),16,8,f.sources,targets,&error);
+  assert(w && std::string(error).empty() && f.device->creationCount==2 && !w->Recorded());
+  assert(w->Outputs()[0].Get()==consumer[0].Get() && w->Outputs()[1].Get()==consumer[1].Get());
+  assert(!PrepareInto(f.device.Get(),16,8,f.sources,targets,&error) && *error);
+  assert(w->Record(f.list.Get()) && consumer[0]->state==0xc0 && consumer[1]->state==0xc0);
+  w.reset();targets.reset();f.sources={};consumer={};assert(Fake::liveResources==4);
+  FSRDSubmission::pending.reset();assert(Fake::liveResources==0);
+ }
+ {Fixture f;const char* error="";
+  assert(!PrepareInto(f.device.Get(),16,8,f.sources,{},&error) && *error);
+  assert(f.device->creationCount==0);
+ }
+ // Every attempted PrepareInto consumes the claim even if source/device/extent
+ // admission fails. No output state or command changes occur on refusal.
+ for(unsigned bad=0;bad<5;++bad){Fixture f;auto targets=AllocateTargets(f.device.Get(),16,8);
+  auto sources=f.sources;ComPtr<ID3D12Device> other=new ID3D12Device;
+  if(bad==0)sources[0]=nullptr;
+  if(bad==1)sources[0]->desc.Format=41;
+  if(bad==2)sources[0]=targets->Outputs()[0];
+  const char* error="";
+  assert(!PrepareInto(bad==3?other.Get():f.device.Get(),bad==4?8:16,8,sources,targets,&error));
+  assert(*error && !PrepareInto(f.device.Get(),16,8,f.sources,targets));
+  assert(Fake::events.empty() && targets->Outputs()[0]->state==0x400 && f.device->creationCount==2);
+ }
+ {Fixture f;auto targets=AllocateTargets(f.device.Get(),16,8);
+  std::shared_ptr<Work> first,second;
+  std::thread a([&]{first=PrepareInto(f.device.Get(),16,8,f.sources,targets);});
+  std::thread b([&]{second=PrepareInto(f.device.Get(),16,8,f.sources,targets);});a.join();b.join();
+  assert(bool(first)!=bool(second) && f.device->creationCount==2 && Fake::events.empty());
+ }
+ {Fixture f;const char* error="";
+  assert(!AllocateTargets(nullptr,16,8,&error) && *error);
+  assert(!AllocateTargets(f.device.Get(),0,8,&error) && *error);
+  assert(!AllocateTargets(f.device.Get(),8193,8,&error) && *error);
+  f.device->forcedAllocation=uint64_t(-1);
+  assert(!AllocateTargets(f.device.Get(),16,8,&error) && *error && f.device->creationCount==0);
+ }
  for(unsigned i=0;i<9;++i)invalidDescription(i);
  {Fixture f;assert(!Prepare(nullptr,16,8,f.sources));assert(!Prepare(f.device.Get(),0,8,f.sources));
   assert(!Prepare(f.device.Get(),16,0,f.sources));assert(!Prepare(f.device.Get(),8193,8,f.sources));}
@@ -282,7 +344,7 @@ int main(){
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(contents)
             for flags in (['-O0'], ['-O3', '-ffast-math']):
-                result = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', *flags,
+                result = subprocess.run([compiler, '-std=c++20', '-Wall', '-Wextra', '-pthread', *flags,
                                          '-I', str(temp), '-I', str(BASE), str(temp / 'test.cpp'),
                                          '-o', str(temp / 'test')], text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

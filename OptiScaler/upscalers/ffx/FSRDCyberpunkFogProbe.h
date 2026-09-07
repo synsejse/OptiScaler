@@ -19,6 +19,16 @@ namespace FSRDCyberpunkFogProbe
 void Initialize(bool enabled);
 void HookDevice(ID3D12Device* device);
 void HookCommandList(ID3D12GraphicsCommandList* commandList);
+// Called on the initialized late RR feature's own thread. Only allocates a
+// one-shot packet for an explicit FSRRR-prefog-reset.request JSON marker; its
+// supplied extent is allocation metadata, never a future frame association.
+void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept;
+// Mandatory dependency veto BEFORE both native Execute branches and their
+// FSRDSubmission::Preparing calls. A refusal terminates this authenticated game
+// diagnostic, never drops a native list or pretends that submission succeeded.
+uint64_t AdmitPrivateResetSubmission(ID3D12CommandQueue* queue, UINT count,
+                                     ID3D12CommandList* const* lists) noexcept;
+void ReturnedPrivateResetSubmission(uint64_t token) noexcept;
 // Call before RR input conversion with the actual NGX resource pointers. No-op
 // except for eight endpoint observations after an explicitly requested fog capture.
 // At most two matching endpoints receive immutable immediate-capture candidates.

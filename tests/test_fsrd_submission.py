@@ -84,6 +84,7 @@ class SubmissionLifetime(unittest.TestCase):
         for section in source.split("FSRDSubmission::Submitted(")[:-1]:
             self.assertRegex(section, r"FSRDSubmission::Preparing\(NumCommandLists, ppCommandLists\);\s*"
                                      r"o_ExecuteCommandLists\(This, NumCommandLists, ppCommandLists\);\s*"
+                                     r"FSRDCyberpunkFogProbe::ReturnedPrivateResetSubmission\(privateResetSubmission\);\s*"
                                      r"FSRDCyberpunkFogProbe::SubmittedSubmission\(fogSubmission\);\s*"
                                      r"FSRDResearch::Submitted\(This, NumCommandLists, ppCommandLists\);\s*$")
 

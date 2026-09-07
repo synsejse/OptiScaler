@@ -65,8 +65,11 @@ class Work
 //   and intended frame; matrices/jitter/delta/settings are authenticated, not estimates.
 // - Borrow resources at a valid lifetime boundary. Prepare takes owning references.
 //   Earlier producer commands/descriptor storage must independently remain retained.
-// - Before Record, each consumed input is in native NON_PIXEL shader-readable state
-//   (a compatible read-only superset is fine), with required ordering/alias barriers.
+// - Each consumed input must be NON_PIXEL shader-readable at its GPU use, with
+//   required ordering/alias barriers. For predeclared PRIVATE producer targets,
+//   CPU Record may occur first only when an irrevocable pre-Execute obligation
+//   enforces the successful producer's exact recording, terminal barriers and
+//   same-queue dependency. Allocation alone establishes none of those facts.
 // - The direct list has known state excluding predication, queries, render passes and
 //   bundles. Restore all engine bindings after Record, including its failure paths.
 // - Serialize preparation/recording with other provider management as required by the

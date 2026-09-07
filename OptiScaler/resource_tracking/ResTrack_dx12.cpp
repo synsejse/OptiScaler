@@ -707,9 +707,11 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
         if (!found.empty())
         {
+            const auto privateResetSubmission = FSRDCyberpunkFogProbe::AdmitPrivateResetSubmission(This, NumCommandLists, ppCommandLists);
             const auto fogSubmission = FSRDCyberpunkFogProbe::PreparingSubmission(This, NumCommandLists, ppCommandLists);
             const auto fsrdSubmission = FSRDSubmission::Preparing(NumCommandLists, ppCommandLists);
             o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+            FSRDCyberpunkFogProbe::ReturnedPrivateResetSubmission(privateResetSubmission);
             FSRDCyberpunkFogProbe::SubmittedSubmission(fogSubmission);
             FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
             FSRDSubmission::Submitted(This, fsrdSubmission);
@@ -725,9 +727,11 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
     LOG_TRACK("Done NumCommandLists: {}", NumCommandLists);
 
+    const auto privateResetSubmission = FSRDCyberpunkFogProbe::AdmitPrivateResetSubmission(This, NumCommandLists, ppCommandLists);
     const auto fogSubmission = FSRDCyberpunkFogProbe::PreparingSubmission(This, NumCommandLists, ppCommandLists);
     const auto fsrdSubmission = FSRDSubmission::Preparing(NumCommandLists, ppCommandLists);
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+    FSRDCyberpunkFogProbe::ReturnedPrivateResetSubmission(privateResetSubmission);
     FSRDCyberpunkFogProbe::SubmittedSubmission(fogSubmission);
     FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
     FSRDSubmission::Submitted(This, fsrdSubmission);
@@ -780,7 +784,7 @@ HRESULT ResTrack_Dx12::hkCreateDescriptorHeap(ID3D12Device* This, D3D12_DESCRIPT
 {
     auto result = o_CreateDescriptorHeap(This, pDescriptorHeapDesc, riid, ppvHeap);
 
-    if (State::Instance().skipHeapCapture)
+    if (ScopedSkipHeapCapture::ShouldSkip())
         return result;
 
     // try to calculate handle ranges for heap

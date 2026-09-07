@@ -14,7 +14,7 @@ SOURCE = CPP.read_text()
 class EarlyGuides(unittest.TestCase):
     def test_observation_is_only_in_authenticated_capture_or_explicit_early_request(self):
         probe = (CPP.parent / "FSRDCyberpunkFogProbe.cpp").read_text()
-        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 8)
+        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 10)
         depth = probe.split("void PrepareFogDepth(", 1)[1].split("void RecordFogDepth(", 1)[0]
         self.assertEqual(depth.count("FSRDCyberpunkEarlyGuides::Describe("), 2)
         self.assertIn("!fogDepthAuthenticated.load()", depth)
@@ -34,6 +34,17 @@ class EarlyGuides(unittest.TestCase):
         for gate in ("lightingRequested.load()", "WantsEarlyGuideCapture()", "MatchesFinalLightingDraw(",
                      "!lightingAttempted.exchange(true)"):
             self.assertLess(draw.index(gate), draw.index("PrepareLightingCapture("))
+        ray = probe.split("std::shared_ptr<RayCopyBundle> PrepareRayCopy(", 1)[1].split("void FinishRayCopy(", 1)[0]
+        self.assertEqual(ray.count("FSRDCyberpunkEarlyGuides::Describe("), 1)
+        self.assertLess(ray.index("!lightingRequested.load()"), ray.index("FSRDCyberpunkEarlyGuides::Describe("))
+        self.assertLess(ray.index("privateResetPacket.load(std::memory_order_acquire)"),
+                        ray.index("FSRDCyberpunkEarlyGuides::Describe("))
+        reset = probe.split("void RecordPrivateReset(", 1)[1].split("std::shared_ptr<CapturePlan> PrepareCapture(", 1)[0]
+        self.assertEqual(reset.count("FSRDCyberpunkEarlyGuides::Describe("), 1)
+        self.assertLess(reset.index("if (!packet) return"), reset.index("FSRDCyberpunkEarlyGuides::Describe("))
+        self.assertLess(reset.index("FSRD::PrivateDenoise::Prepare("), reset.index("FSRDCyberpunkEarlyGuides::Describe("))
+        self.assertLess(reset.index("FSRDCyberpunkEarlyGuides::Describe("), reset.index("EmbedConsumer("))
+        self.assertIn("source.SameFrame(repeated)", reset)
 
     def test_read_only_and_no_persistent_engine_state(self):
         self.assertIn("ReadProcessMemory(GetCurrentProcess()", SOURCE)

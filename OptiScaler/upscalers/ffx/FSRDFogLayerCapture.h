@@ -34,6 +34,11 @@ struct Layers
     // Exact typed R32_FLOAT, mip0/slice0, single-mip/array/sample, scene extent,
     // state0xc0. This is not a linearized distance or the material stencil plane.
     Texture hardwareDepth;
+    // Optional all-or-none private independent RESET outputs. In order:
+    // converted radiance, AMD denoised radiance, production composed color.
+    // Exactly typed RGBA16_FLOAT, mip0/slice0, one mip/array/sample, scene extent,
+    // exact state0xc0. These are diagnostic copies, never scene replacements.
+    std::array<Texture, 3> privateReset;
 };
 
 struct Status
@@ -154,6 +159,17 @@ bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 // proves original graph/plane/binding, snapshot order and hardware-depth encoding;
 // no linearization, camera reconstruction, depth convention or same-frame relation
 // to a SEPARATE capture is inferred here. Shares the existing budget/fence/worker.
+// Optional privateReset requires all three private immutable RGBA16_FLOAT textures
+// described above, or none. Each must have a distinct canonical resource identity
+// from every scene layer and companion (including other private RESET outputs).
+// keepAlive is required and must retain the recording owners; it MUST NOT own the
+// submission ticket retaining this batch (no ownership cycle). Earlier GPU references
+// remain the caller's responsibility even if this helper refuses before retention.
+// Native files private_reset_{radiance,denoised,composed}.rgba16f share the existing
+// 256MiB budget and actual-list submission fence. No signal/alpha/exposure transform
+// is performed; provider input semantics, current-frame joins and RESET context
+// admission are caller evidence, not inferred from the three file layouts. These
+// companions do NOT enable a live correction or modify any original scene layer.
 // provenanceJson must be a JSON object; it is saved as caller-supplied evidence,
 // not treated as proof that the above draw constraints were satisfied.
 //

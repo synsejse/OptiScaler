@@ -13,6 +13,31 @@ namespace FSRD::PrivateRayCopy
 // Every channel/bit is copied, including motion Z/W, nonfinite values and signed zero.
 using Textures = std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2>;
 
+class Work;
+// Fixed, factory-owned destinations. Allocation is NOT recorded production, readable
+// state, completion or frame association. Only PrepareInto may claim a producer;
+// consumers require the host's producer/consumer submission-order admission.
+class Targets
+{
+  public:
+    ~Targets();
+    Targets(const Targets&) = delete;
+    Targets& operator=(const Targets&) = delete;
+    const Textures& Outputs() const noexcept;
+
+  private:
+    struct Impl;
+    explicit Targets(std::unique_ptr<Impl> implementation);
+    friend class Work;
+    friend std::shared_ptr<Targets> AllocateTargets(ID3D12Device*, UINT, UINT, const char**) noexcept;
+    std::unique_ptr<Impl> _impl;
+};
+
+// CPU-only allocation of exactly RGBA16_FLOAT/R32_FLOAT in COPY_DEST. No arbitrary
+// caller textures can be adopted. Extent/device/resources never change afterward.
+std::shared_ptr<Targets> AllocateTargets(ID3D12Device* device, UINT width, UINT height,
+                                       const char** error = nullptr) noexcept;
+
 class Work
 {
   public:
@@ -34,6 +59,10 @@ class Work
     struct Impl;
     explicit Work(std::unique_ptr<Impl> implementation);
     friend std::shared_ptr<Work> Prepare(ID3D12Device*, UINT, UINT, const Textures&, const char**) noexcept;
+    friend std::shared_ptr<Work> PrepareInto(ID3D12Device*, UINT, UINT, const Textures&,
+                                           const std::shared_ptr<Targets>&, const char**) noexcept;
+    static std::shared_ptr<Work> PrepareImpl(ID3D12Device*, UINT, UINT, const Textures&,
+                                            const std::shared_ptr<Targets>&, bool, const char**) noexcept;
     std::unique_ptr<Impl> _impl;
 };
 
@@ -64,4 +93,13 @@ class Work
 // error receives a static message when supplied, with no dangling exception string.
 std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
                               const Textures& sources, const char** error = nullptr) noexcept;
+
+// Same preparation/recording contract, with predeclared outputs. Exactly one atomic
+// attempt claims a nonnull Targets, including failed preparation; never retry/rebind
+// that set. Wrong device/extent, null targets and unsupported sources are refused.
+// Producer/consumer recording may occur in either CPU order, but the host MUST prove
+// actual successful production and GPU ordering before any consumer is submitted.
+std::shared_ptr<Work> PrepareInto(ID3D12Device* device, UINT width, UINT height,
+    const Textures& sources, const std::shared_ptr<Targets>& targets,
+    const char** error = nullptr) noexcept;
 } // namespace FSRD::PrivateRayCopy
