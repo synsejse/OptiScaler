@@ -781,6 +781,9 @@ std::string Describe(const void* context, uintptr_t authenticatedImageBase) noex
             {
                 settings["extra_specular_enabled"] = 0;
                 settings["extra_specular_scale"] = 0;
+                // The authored feature-disabled CB6 branch initializes this
+                // float word to +0. Preserve raw-bit provenance in both branches.
+                settings["extra_specular_scale_bits"] = uint32_t(0);
             }
             result["guide_settings"] = std::move(settings);
         }

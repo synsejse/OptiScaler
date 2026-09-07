@@ -312,6 +312,8 @@ int main()
     }
     assert(result["guide_settings"]["NoV_mode"] == -1);
     assert(result["guide_settings"]["extra_specular_enabled"] == 0);
+    assert(result["guide_settings"]["extra_specular_scale"] == 0);
+    assert(result["guide_settings"]["extra_specular_scale_bits"].get<uint32_t>() == 0);
     assert(result["graph_position"] == 11 && result["namespace"] == 3);
     assert(result["read_calls"].get<size_t>() < MaxReadCalls);
     assert(result["inputs"].size() == 8);
@@ -574,6 +576,7 @@ int main()
     put<float>(image + ExtraSpecularScaleRva, .75f);
     result = describe(); assert(result["inputs"][4]["handle"] == 900);
     assert(result["guide_settings"]["extra_specular_scale"] == .75);
+    assert(result["guide_settings"]["extra_specular_scale_bits"].get<uint32_t>() == 0x3f400000u);
     setup(); put<uintptr_t>(entries + 0x20, 0);
     put<uintptr_t>(entries + 0x28, 0xd00000); put<uint32_t>(entries + 0x34, 3);
     for (unsigned i = 0; i < 3; ++i) put<uintptr_t>(0xd00000 + i * 24, holders + i * 0x58);
@@ -602,6 +605,7 @@ int main()
     setup(); memory.erase(view + 0x17d0); result = describe();
     assert(result["guide_settings"]["extra_specular"] == "current view feature unavailable");
     assert(!result["guide_settings"].contains("extra_specular_enabled"));
+    assert(!result["guide_settings"].contains("extra_specular_scale_bits"));
     setup(); const auto refAddress = registry + TextureRefOffset + 99 * TextureSlotStride;
     const auto nativeAddress = registry + TextureNativeOffset + 99 * TextureSlotStride;
     for (const uint8_t format : {0x18, 0x19, 0xff})
