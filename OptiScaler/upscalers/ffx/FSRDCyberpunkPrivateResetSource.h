@@ -57,7 +57,9 @@ struct Source
     uintptr_t view = 0, object = 0;
     uint32_t frame = 0, width = 0, height = 0;
     Json camera; // Includes all repeated authored source evidence, not just dispatch fields.
-    CyberpunkResetCamera::Parameters parameters;
+    CyberpunkResetCamera::Snapshot rawSnapshot {}; // Actual current source words, not reconstructed history.
+    std::array<float, 2> motionScale {};
+    CyberpunkResetCamera::Parameters parameters; // Legacy independently RESET template, even in ParseTemporal.
     bool SameFrame(const Source& other) const
     {
         return view == other.view && object == other.object && frame == other.frame &&
@@ -87,7 +89,7 @@ inline Source Parse(const Json& metadata, float explicitResetDelta)
         frame.at("semantics") == "CPU_source_for_later_explicit_Streamline_frame_ID" &&
         Address(frame.at("source_address")) == result.object + 0x1b0);
     result.frame = Word(frame.at("source_value"));
-    CyberpunkResetCamera::Snapshot source;
+    auto& source = result.rawSnapshot;
     const auto& matrices = camera.at("matrices");
     source.nativeView = Words<4, 4>(matrices.at("native_view"), 0xc0);
     source.inverseNativeView = Words<4, 4>(matrices.at("inverse_native_view"), 0x180);
@@ -107,10 +109,37 @@ inline Source Parse(const Json& metadata, float explicitResetDelta)
         motion.at("value_rvas") == Json::array({ 0x3464dc0, 0x3464e10 }) &&
         motion.at("semantics") == "native_SL_normalized_motion_multiplier" &&
         motion.at("source_bits").is_array() && motion.at("source_bits").size() == 2);
-    const std::array<float, 2> scale { std::bit_cast<float>(Word(motion.at("source_bits")[0])),
-                                    std::bit_cast<float>(Word(motion.at("source_bits")[1])) };
-    Require(CyberpunkResetCamera::Build(source, scale, explicitResetDelta, result.frame, result.parameters));
+    result.motionScale = { std::bit_cast<float>(Word(motion.at("source_bits")[0])),
+                           std::bit_cast<float>(Word(motion.at("source_bits")[1])) };
+    Require(CyberpunkResetCamera::Build(source, result.motionScale, explicitResetDelta, result.frame, result.parameters));
     result.camera = camera;
+    return result;
+}
+
+struct TemporalSource
+{
+    Source current;
+    bool nativeResetRequested = false; // Valid only on a successfully returned ParseTemporal result.
+};
+
+// Additive stricter source access, NOT temporal dispatch/history admission.
+// Legacy Parse accepts old RESET captures without reset-byte repeat metadata.
+// The caller supplies this frame's measured duration with its explicit timing
+// provenance; no timing is recovered from the source or guessed here. Parameters
+// still hold the old RESET template. A temporal caller passes rawSnapshot and
+// motionScale to CyberpunkTemporalCamera with separately owned history/continuity.
+inline TemporalSource ParseTemporal(const Json& metadata, float explicitCurrentDelta)
+{
+    TemporalSource result { Parse(metadata, explicitCurrentDelta) };
+    const auto& history = result.current.camera.at("history");
+    Require(history.at("status") == "CPU_value_present" && Word(history.at("view_offset")) == 0xef0 &&
+        history.at("semantics") == "native_SL_reset_equals_zero" &&
+        history.at("repeated_source_fields_equal").is_boolean() &&
+        history.at("repeated_source_fields_equal").get<bool>() &&
+        history.at("producer_reset_candidate").is_boolean());
+    const auto byte = Word(history.at("source_byte"));
+    Require(byte <= 255 && history.at("producer_reset_candidate").get<bool>() == (byte == 0));
+    result.nativeResetRequested = byte == 0;
     return result;
 }
 } // namespace FSRD::CyberpunkPrivateResetSource

@@ -749,12 +749,14 @@ Json CameraProvenance(Reader& read, const GraphContext& context, uintptr_t image
         { "native_projection_jittered", FloatRowsField<4, 4>(read, context.view, 0x200) },
         { "inverse_native_projection_jittered", FloatRowsField<4, 4>(read, context.view, 0x1c0) },
         { "depth_converted_projection_jittered", FloatRowsField<4, 4>(read, context.view, 0x360) } };
-    Json history = { { "view_offset", 0xef0 }, { "status", "unavailable" } };
+    Json history = { { "view_offset", 0xef0 }, { "status", "unavailable" },
+        { "semantics", "native_SL_reset_equals_zero" }, { "repeated_source_fields_equal", nullptr } };
     try
     {
         const auto value = read.Read<uint8_t>(Address(context.view, 0xef0));
         history["source_byte"] = value;
         history["producer_reset_candidate"] = value == 0;
+        history["repeated_source_fields_equal"] = value == read.Read<uint8_t>(Address(context.view, 0xef0));
         history["status"] = "CPU_value_present";
     }
     catch (const std::exception& error) { history["reason"] = error.what(); }

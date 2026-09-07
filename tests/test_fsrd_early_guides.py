@@ -142,6 +142,14 @@ class EarlyGuides(unittest.TestCase):
         for forbidden in ("fov_radians", "XMMatrix", "XMVector", "std::tan", "std::atan"):
             self.assertNotIn(forbidden, SOURCE)
 
+    def test_reset_byte_repeat_is_observational_not_effective_ngx_reset(self):
+        history = SOURCE.split('Json history =', 1)[1].split('result["history"]', 1)[0]
+        self.assertIn('"native_SL_reset_equals_zero"', history)
+        self.assertIn('"repeated_source_fields_equal", nullptr', history)
+        self.assertEqual(history.count('read.Read<uint8_t>(Address(context.view, 0xef0))'), 2)
+        self.assertIn('history["producer_reset_candidate"] = value == 0', history)
+        self.assertIn('"effective_ngx_reset", "not_established"', SOURCE)
+
     def test_frame_id_getter_route_is_metadata_without_virtual_call(self):
         route = SOURCE.split("Json FrameIdVirtualRoute(", 1)[1].split("Json CameraProvenance(", 1)[0]
         for evidence in ('"virtual_call_performed", false', '"returned_object", "not_observed"',
@@ -184,6 +192,7 @@ class EarlyGuides(unittest.TestCase):
 static std::unordered_map<uintptr_t, unsigned char> memory;
 static bool partial = false;
 static uintptr_t mutateAfterRead = 0;
+static uintptr_t eraseAfterRead = 0;
 bool ReadProcessMemory(HANDLE, const void* source, void* destination, SIZE_T size, SIZE_T* actual)
 {
     const auto address = reinterpret_cast<uintptr_t>(source);
@@ -201,6 +210,11 @@ bool ReadProcessMemory(HANDLE, const void* source, void* destination, SIZE_T siz
         memory[address] ^= 1;
         mutateAfterRead = 0;
     }
+    if (eraseAfterRead == address)
+    {
+        memory.erase(address);
+        eraseAfterRead = 0;
+    }
     return true;
 }
 template<typename T> void put(uintptr_t address, T value)
@@ -217,7 +231,7 @@ constexpr uintptr_t holders = graph + 0x514a18;
 constexpr uint32_t keys[] = {0x63bcf380,0x64bcf513,0x65bcf6a6,0x61f178d4,0xdebf0c27,0x15eab19c};
 void setup()
 {
-    memory.clear(); partial = false; mutateAfterRead = 0;
+    memory.clear(); partial = false; mutateAfterRead = 0; eraseAfterRead = 0;
     put<uint8_t>(context + 0x30, 2); put<uint32_t>(context + 0x34, 3);
     put<uint8_t>(context + 0x38, 0); put<uintptr_t>(context + 0x18, view);
     put<uintptr_t>(context + 8, 0x30000); put<uintptr_t>(0x30000, graph);
@@ -400,6 +414,9 @@ int main()
     assert(result["inputs"][7]["status"] == "not_enabled_by_current_view");
     assert(result["camera_provenance"]["jitter_y"]["producer_candidate"] == .125);
     assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == false);
+    assert(result["camera_provenance"]["history"]["source_byte"] == 1);
+    assert(result["camera_provenance"]["history"]["repeated_source_fields_equal"] == true);
+    assert(result["camera_provenance"]["history"]["semantics"] == "native_SL_reset_equals_zero");
     const auto camera = result["camera_provenance"];
     assert(camera["schema"] == "optiscaler.fsr_rr.early_camera_sources.v2");
     assert(camera["snapshot_atomic"] == false && camera["view_pointer_unchanged"] == true);
@@ -451,6 +468,7 @@ int main()
     put<uint8_t>(view + 0xef0, 0); put<uint32_t>(view + 0x3e4, 0);
     result = describe();
     assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == true);
+    assert(result["camera_provenance"]["history"]["repeated_source_fields_equal"] == true);
     assert(result["camera_provenance"]["jitter_y"]["producer_candidate_bits"] == 0x80000000u);
     put<uint32_t>(view + 0x90, 0x7fc01234u); result = describe();
     assert(result["camera_provenance"]["fov_degrees"]["source_bits"] == 0x7fc01234u);
@@ -458,7 +476,21 @@ int main()
     memory.erase(view + 0xef0); memory.erase(view + 0xb0); result = describe();
     assert(!result.contains("read_failure"));
     assert(result["camera_provenance"]["history"]["status"] == "unavailable");
+    assert(result["camera_provenance"]["history"]["repeated_source_fields_equal"].is_null());
     assert(result["camera_provenance"]["near_plane"]["status"] == "unavailable");
+    setup(); mutateAfterRead = view + 0xef0; result = describe();
+    assert(result["camera_provenance"]["history"]["status"] == "CPU_value_present");
+    assert(result["camera_provenance"]["history"]["source_byte"] == 1);
+    assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == false);
+    assert(result["camera_provenance"]["history"]["repeated_source_fields_equal"] == false);
+    setup(); eraseAfterRead = view + 0xef0; result = describe();
+    assert(result["camera_provenance"]["history"]["status"] == "unavailable");
+    assert(result["camera_provenance"]["history"]["source_byte"] == 1);
+    assert(result["camera_provenance"]["history"]["repeated_source_fields_equal"].is_null());
+    setup(); put<uint8_t>(view + 0xef0, 255); result = describe();
+    assert(result["camera_provenance"]["history"]["source_byte"] == 255);
+    assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == false);
+    assert(result["camera_provenance"]["history"]["repeated_source_fields_equal"] == true);
     setup(); put<uint32_t>(view + 0x1c0, 0x7fc05678u);
     put<uint32_t>(view + 0x1c4, 0xff800000u); put<uint32_t>(view + 0x1c8, 0x80000000u);
     result = describe();

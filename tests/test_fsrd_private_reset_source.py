@@ -23,6 +23,17 @@ class PrivateResetSource(unittest.TestCase):
         self.assertIn("CyberpunkResetCamera::Build(", source)
         self.assertIn("explicitResetDelta", source)
 
+    def test_temporal_access_is_additive_and_does_not_invent_history_or_time(self):
+        source = (BASE / "FSRDCyberpunkPrivateResetSource.h").read_text()
+        self.assertIn('auto& source = result.rawSnapshot', source)
+        self.assertIn('TemporalSource ParseTemporal(const Json& metadata, float explicitCurrentDelta)', source)
+        self.assertIn('Parse(metadata, explicitCurrentDelta)', source)
+        self.assertIn('Parameters\n// still hold the old RESET template', source)
+        legacy = source.split('inline Source Parse(', 1)[1].split('struct TemporalSource', 1)[0]
+        self.assertNotIn('camera.at("history")', legacy)
+        for forbidden in ('MillisecondsNow', 'chrono::', '16.67', 'previous->', 'sessionEpoch'):
+            self.assertNotIn(forbidden, source)
+
     def test_compiled_sources_pairing_and_malformed_fields(self):
         compiler = os.environ.get("CXX") or shutil.which("c++")
         if not compiler:
@@ -97,6 +108,15 @@ int main(){
  assert(a.parameters.frameIndex==209225 && a.parameters.deltaMilliseconds==17.25f);
  assert(a.parameters.conversionFlags==69 && a.parameters.dispatchFlags==3);
  assert(a.parameters.motionScale[0]==1.25f && a.parameters.motionScale[1]==-.5f);
+ assert((a.motionScale==std::array<float,2>{1.25f,-.5f}));
+ assert(a.rawSnapshot.width==1280&&a.rawSnapshot.height==720&&a.rawSnapshot.jitterWidth==1280&&a.rawSnapshot.jitterHeight==720);
+ assert((a.rawSnapshot.projectionFlags==4&&a.rawSnapshot.lensOffset==std::array<uint32_t,2>{}));
+ assert((a.rawSnapshot.jitterPixels==std::array<uint32_t,2>{1053556736,1054048256}));
+ for(const auto& item:{std::pair{"native_view",&a.rawSnapshot.nativeView},
+                     std::pair{"inverse_native_view",&a.rawSnapshot.inverseNativeView},
+                     std::pair{"native_projection_jittered",&a.rawSnapshot.nativeProjection},
+                     std::pair{"depth_converted_projection_jittered",&a.rawSnapshot.depthProjection}})
+  for(unsigned i=0;i<16;++i)assert((*item.second)[i]==good["camera_provenance"]["matrices"][item.first]["source_uint32_rows"][i/4][i%4]);
  assert(std::bit_cast<uint32_t>(a.parameters.nearPlane)==1017370378);
  assert(std::bit_cast<uint32_t>(a.parameters.farPlane)==1182995065u);
  assert(a.SameFrame(Parse(good,18.25f))); // Explicit RESET timing is not native frame identity.
@@ -153,6 +173,50 @@ int main(){
  b=good;b["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"]["repeated_source_fields_equal"]=false;reject(b);
  b=good;b["camera_provenance"]["frame_id_virtual_route"]["explicit_frame_id_source"]["source_address"]=0x21b1;reject(b);
  reject(good,0);reject(good,-1);reject(good,std::bit_cast<float>(0x7f800000u));
+ // Old RESET captures have no new history requirement. Temporal access must
+ // reject that same missing observation, not turn it into native reset=false.
+ const auto temporalReject=[](const Json& input,float delta=17.25f){
+  bool failed=false;try{(void)ParseTemporal(input,delta);}catch(const std::exception&){failed=true;}assert(failed);};
+ temporalReject(good);
+ auto temporal=good;
+ temporal["camera_provenance"]["history"]={{"status","CPU_value_present"},{"view_offset",0xef0},
+  {"semantics","native_SL_reset_equals_zero"},{"source_byte",1},
+  {"producer_reset_candidate",false},{"repeated_source_fields_equal",true}};
+ for(unsigned byte:{0u,1u,2u,255u}){
+  auto sample=temporal;sample["camera_provenance"]["history"]["source_byte"]=byte;
+  sample["camera_provenance"]["history"]["producer_reset_candidate"]=byte==0;
+  const auto value=ParseTemporal(sample,18.25f);
+  assert(value.nativeResetRequested==(byte==0));assert(value.current.SameFrame(Parse(sample,18.25f)));
+  assert(value.current.rawSnapshot.nativeView==a.rawSnapshot.nativeView&&value.current.rawSnapshot.depthProjection==a.rawSnapshot.depthProjection);
+  assert(value.current.motionScale==a.motionScale);
+  assert(value.current.parameters.conversionFlags==69&&value.current.parameters.dispatchFlags==3);
+  assert(value.current.parameters.previousView==value.current.rawSnapshot.nativeView);
+  assert(value.current.parameters.deltaMilliseconds==18.25f); // Explicit caller time, not native timing.
+ }
+ for(const char* key:{"status","view_offset","semantics","source_byte","producer_reset_candidate","repeated_source_fields_equal"}){
+  auto sample=temporal;sample["camera_provenance"]["history"].erase(key);temporalReject(sample);
+  (void)Parse(sample,17.25f); // Malformed optional history never became a legacy RESET requirement.
+ }
+ for(const auto& invalid:{Json(-1),Json(256),Json(1.0),Json(true),Json("1"),Json(),Json(uint64_t(UINT32_MAX)+1)}){
+  auto sample=temporal;sample["camera_provenance"]["history"]["source_byte"]=invalid;temporalReject(sample);
+ }
+ for(const auto& invalid:{Json(false),Json(1),Json(1.0),Json("true"),Json()}){
+  auto sample=temporal;sample["camera_provenance"]["history"]["repeated_source_fields_equal"]=invalid;temporalReject(sample);
+ }
+ for(const auto& invalid:{Json(true),Json(0),Json(0.0),Json("false"),Json()}){
+  auto sample=temporal;sample["camera_provenance"]["history"]["producer_reset_candidate"]=invalid;temporalReject(sample);
+ }
+ for(const auto& invalid:{Json(0xef1),Json(3824.0),Json(true),Json()}){
+  auto sample=temporal;sample["camera_provenance"]["history"]["view_offset"]=invalid;temporalReject(sample);
+ }
+ b=temporal;b["camera_provenance"]["history"]["status"]="unavailable";temporalReject(b);
+ b=temporal;b["camera_provenance"]["history"]["semantics"]="effective_NGX_reset";temporalReject(b);
+ b=temporal;b["camera_provenance"]["history"]["source_byte"]=0;temporalReject(b); // Wrong exact reset expression.
+ b=temporal;b["camera_provenance"]["history"]=nullptr;temporalReject(b);
+ temporalReject(temporal,0);temporalReject(temporal,-1);temporalReject(temporal,std::bit_cast<float>(0x7fc00001u));
+ auto owned=ParseTemporal(temporal,17.25f);const auto snapshot=owned.current.rawSnapshot.nativeView;
+ temporal["camera_provenance"]["matrices"]["native_view"]["source_uint32_rows"][0][0]=0;
+ assert(owned.current.rawSnapshot.nativeView==snapshot); // Owned raw copy, not a JSON reference.
  std::cout<<"private RESET source tests passed\n";
 }
 '''
