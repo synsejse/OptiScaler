@@ -22,7 +22,7 @@ bool Validate(const void* bytes, size_t size, bool pixel)
         return false;
     D3D11_SHADER_DESC desc {};
     if (FAILED(reflection->GetDesc(&desc)) ||
-        D3D11_SHVER_GET_TYPE(desc.Version) != (pixel ? D3D11_SHVER_PIXEL_SHADER : D3D11_SHVER_VERTEX_SHADER) ||
+        D3D11_SHVER_GET_TYPE(desc.Version) != UINT(pixel ? D3D11_SHVER_PIXEL_SHADER : D3D11_SHVER_VERTEX_SHADER) ||
         D3D11_SHVER_GET_MAJOR(desc.Version) != 5 || D3D11_SHVER_GET_MINOR(desc.Version) != 0 ||
         bool(reflection->IsSampleFrequencyShader()) != pixel ||
         desc.InputParameters != 1 || desc.OutputParameters != (pixel ? 1u : 2u) ||
