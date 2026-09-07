@@ -20,6 +20,7 @@
 #include <ffx_upscale.h>
 
 #include <magic_enum.hpp>
+#include <mutex>
 
 // A mess to be able to import both
 #define FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_WAITCALLBACK FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_WAITCALLBACK_DX12
@@ -90,6 +91,30 @@ class FfxApiProxy
     inline static FfxModule main_vk_hooked;
 
     inline static ankerl::unordered_dense::map<ffxContext, FFXStructType> contextToType;
+    inline static std::mutex contextToTypeMutex;
+
+    // Protect only the routing registry, not provider execution. Distinct
+    // contexts may be created/configured/retired on different recording threads.
+    // Provider callbacks can reenter the proxy, so no provider call or logging
+    // belongs inside this lock. Module loading and each context's own lifetime
+    // still require caller synchronization; this is not a provider-wide lock.
+    static void RememberContextType(ffxContext context, FFXStructType type)
+    {
+        std::lock_guard lock(contextToTypeMutex);
+        contextToType[context] = type;
+    }
+
+    static FFXStructType FindContextType(ffxContext context, FFXStructType missing, bool remove = false)
+    {
+        std::lock_guard lock(contextToTypeMutex);
+        const auto found = contextToType.find(context);
+        if (found == contextToType.end())
+            return missing;
+        const auto type = found->second;
+        if (remove)
+            contextToType.erase(found);
+        return type;
+    }
 
     inline static bool _skipDestroyCalls = false;
 
@@ -1193,7 +1218,7 @@ class FfxApiProxy
         {
             LOG_DEBUG("Creating with fg_dx12");
             result = fg_dx12.CreateContext(context, desc, memCb);
-            contextToType[*context] = type;
+            RememberContextType(*context, type);
             LOG_DEBUG("Created with fg_dx12: {:X}", (size_t) *context);
             return result;
         }
@@ -1201,7 +1226,7 @@ class FfxApiProxy
         {
             LOG_DEBUG("Creating with upscaling_dx12");
             result = upscaling_dx12.CreateContext(context, desc, memCb);
-            contextToType[*context] = type;
+            RememberContextType(*context, type);
             LOG_DEBUG("Created with upscaling_dx12: {:X}", (size_t) *context);
             return result;
         }
@@ -1209,7 +1234,7 @@ class FfxApiProxy
         {
             LOG_DEBUG("Creating with denoiser_dx12");
             result = denoiser_dx12.CreateContext(context, desc, memCb);
-            contextToType[*context] = type;
+            RememberContextType(*context, type);
             LOG_DEBUG("Created with denoiser_dx12: {:X}", (size_t) *context);
             return result;
         }
@@ -1217,7 +1242,7 @@ class FfxApiProxy
         {
             LOG_DEBUG("Creating with radiance_dx12");
             result = radiance_dx12.CreateContext(context, desc, memCb);
-            contextToType[*context] = type;
+            RememberContextType(*context, type);
             LOG_DEBUG("Created with radiance_dx12: {:X}", (size_t) *context);
             return result;
         }
@@ -1250,13 +1275,13 @@ class FfxApiProxy
     static ffxReturnCode_t D3D12_DestroyContext(ffxContext* context, const ffxAllocationCallbacks* memCb)
     {
         ffxReturnCode_t result = FFX_API_RETURN_ERROR;
-        auto type = FFXStructType::Unknown;
+        // Preserve the existing take-before-provider-call behavior. Copy the
+        // routing type while locked, then release before destruction/reentry.
+        const auto type = FindContextType(*context, FFXStructType::Unknown, true);
 
-        if (contextToType.contains(*context))
+        if (type != FFXStructType::Unknown)
         {
-            type = contextToType[*context];
             LOG_DEBUG("Found context type mapping: {}", magic_enum::enum_name(type));
-            contextToType.erase(*context);
         }
         else
         {
@@ -1352,8 +1377,8 @@ class FfxApiProxy
     {
         auto type = GetType(desc->type);
 
-        if (type == FFXStructType::General && contextToType.contains(*context))
-            type = contextToType[*context];
+        if (type == FFXStructType::General)
+            type = FindContextType(*context, FFXStructType::General);
 
         auto isFg = type == FFXStructType::FG || type == FFXStructType::SwapchainDX12;
 
