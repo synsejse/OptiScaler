@@ -61,19 +61,16 @@ constexpr unsigned MaxNgxEndpoints = 8;
 constexpr UINT64 MaxEndpointResourceBytes = 256ull * 1024 * 1024;
 constexpr unsigned MaxCaptureCandidates = 2, MaxObservedSubmissions = 256, MaxListsPerSubmission = 512;
 constexpr ULONGLONG SubmissionWindowMs = 10000;
-// High fog PS and the authored guide CS both read exactly these shared cb12
-// registers. UINT loads/output preserve every bit, including special float bits.
-// No dynamic CB index can read past the original fog shader's proven accesses.
+// The authored guide CS reads these five registers, all also read by High fog.
+// One compile-time fixed register per draw avoids indexing by SV_Position, which
+// can identify a coarse pixel outside the selected column when VRS is active.
+// UINT loads/output preserve every bit, including special float bits.
+constexpr std::array<UINT, 5> BoundCb12Registers { 21, 22, 23, 24, 27 };
 constexpr char BoundCb12Shader[] = R"hlsl(
 cbuffer SharedPixelConsts : register(b12) { uint4 sharedWords[28]; };
-uint4 PSMain(float4 position : SV_Position) : SV_Target0
+uint4 PSMain() : SV_Target0
 {
-    uint pixel = (uint)position.x;
-    if (pixel == 0) return sharedWords[21];
-    if (pixel == 1) return sharedWords[22];
-    if (pixel == 2) return sharedWords[23];
-    if (pixel == 3) return sharedWords[24];
-    return sharedWords[27];
+    return sharedWords[BOUND_CB12_REGISTER];
 }
 )hlsl";
 
@@ -129,17 +126,22 @@ struct Hash
     }
 };
 
+struct BoundCb12Variant
+{
+    ComPtr<ID3D12PipelineState> pso;
+    std::string source, sourceSha256, bytecodeSha256;
+};
 struct TaggedPso
 {
     ComPtr<ID3D12PipelineState> pso;
     const char* shader;
     ComPtr<ID3D12PipelineState> authored;
-    ComPtr<ID3D12PipelineState> boundCb12;
+    std::array<BoundCb12Variant, BoundCb12Registers.size()> boundCb12;
     ComPtr<ID3D12RootSignature> root;
     std::vector<BYTE> vertexBytes, pixelBytes;
     D3D12_RENDER_TARGET_BLEND_DESC blend {};
     std::string pixelSha256;
-    std::string cb12SourceSha256, cb12BytecodeSha256;
+    std::string cb12TemplateSha256;
 };
 struct RtvSlot
 {
@@ -1003,7 +1005,8 @@ struct CapturePlan
 {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12Resource> main;
-    ComPtr<ID3D12PipelineState> originalPso, authoredPso, boundCb12Pso;
+    ComPtr<ID3D12PipelineState> originalPso, authoredPso;
+    std::array<ComPtr<ID3D12PipelineState>, BoundCb12Registers.size()> boundCb12Psos;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12DescriptorHeap> sourceHeap, privateHeap, boundCb12Heap;
     D3D12_CPU_DESCRIPTOR_HANDLE originalRtv {}, frozenOriginalRtv {}, authoredRtv {}, boundCb12Rtv {};
@@ -1015,9 +1018,15 @@ struct CapturePlan
     ListState drawState;
 };
 
+bool HasBoundCb12Psos(const CapturePlan& plan)
+{
+    return std::all_of(plan.boundCb12Psos.begin(), plan.boundCb12Psos.end(),
+                       [](const auto& pso) { return bool(pso); });
+}
+
 void PrepareBoundCb12Target(CapturePlan& plan, UINT64 remainingBytes)
 {
-    if (!plan.boundCb12Pso)
+    if (!HasBoundCb12Psos(plan))
         return;
     try
     {
@@ -1053,7 +1062,7 @@ void PrepareBoundCb12Target(CapturePlan& plan, UINT64 remainingBytes)
         // three-layer capture when compiler/device/format/allocation support fails.
         plan.layers.boundCb12 = {};
         plan.boundCb12Heap.Reset();
-        plan.boundCb12Pso.Reset();
+        for (auto& pso : plan.boundCb12Psos) pso.Reset();
         plan.provenance["bound_cb12_probe"]["status"] = "unavailable";
         plan.provenance["bound_cb12_probe"]["reason"] = error.what();
     }
@@ -1144,7 +1153,8 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         plan->originalView = bound.view;
         plan->originalPso = foundPso->pso;
         plan->authoredPso = foundPso->authored;
-        plan->boundCb12Pso = foundPso->boundCb12;
+        for (size_t i = 0; i < BoundCb12Registers.size(); ++i)
+            plan->boundCb12Psos[i] = foundPso->boundCb12[i].pso;
         plan->root = foundPso->root;
         plan->endpoint->list = identity;
         plan->endpoint->generation = state.generation;
@@ -1172,21 +1182,34 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
             { "rr_frame_association", "not_established" },
             { "private_clear", { 0, 0, 0, 0 } }, { "root_bindings_viewport_scissor", "inherited unchanged" },
             { "bound_cb12_probe", {
-                { "schema", "optiscaler.fsr_rr.bound_cb12_probe.v1" },
-                { "status", plan->boundCb12Pso ? "private_pso_ready" : "unavailable" },
+                { "schema", "optiscaler.fsr_rr.bound_cb12_probe.v2" },
+                { "status", HasBoundCb12Psos(*plan) ? "private_pso_ready" : "unavailable" },
                 { "scope", "High-only exact inherited graphics binding; no engine-frame assertion" },
                 { "shader_variant", foundPso->shader }, { "cb_register", 12 }, { "register_space", 0 },
                 { "register_indices", { 21, 22, 23, 24, 27 } }, { "output_size", { 5, 1 } },
                 { "output_format", UINT(DXGI_FORMAT_R32G32B32A32_UINT) },
-                { "generated_ps_source", BoundCb12Shader }, { "generated_ps_target", "ps_5_0" },
+                { "generated_ps_source_template", BoundCb12Shader }, { "generated_ps_target", "ps_5_0" },
                 { "generated_ps_entry", "PSMain" }, { "compiler_flags", "D3DCOMPILE_OPTIMIZATION_LEVEL3" },
-                { "generated_ps_source_sha256", foundPso->cb12SourceSha256 },
-                { "generated_ps_bytecode_sha256", foundPso->cb12BytecodeSha256 },
+                { "generated_ps_template_sha256", foundPso->cb12TemplateSha256 },
+                { "generated_ps_variants", Json::array() },
+                { "draw_count", BoundCb12Registers.size() },
+                { "selection", "fixed register per PS/draw; one-pixel scissor column" },
+                { "shading_rate", "inherited unchanged; output constant for every invocation in each draw" },
                 { "original_ps_sha256", foundPso->pixelSha256 }, { "original_vs_sha256", FogVertexSha256 },
                 { "inherited_bindings", true }, { "value_transform", "none; native uint32 bits" },
                 { "graphics_state_restore", "original PSO, frozen original RTV, exact viewport/scissor arrays" }
             } },
         };
+        for (size_t i = 0; i < BoundCb12Registers.size(); ++i)
+        {
+            const auto& variant = foundPso->boundCb12[i];
+            plan->provenance["bound_cb12_probe"]["generated_ps_variants"].push_back({
+                { "register_index", BoundCb12Registers[i] }, { "output_column", i },
+                { "scissor_rect", { i, 0, i + 1, 1 } },
+                { "source", variant.source }, { "source_sha256", variant.sourceSha256 },
+                { "bytecode_sha256", variant.bytecodeSha256 }
+            });
+        }
     }
     const auto desc = plan->main->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
@@ -1301,7 +1324,7 @@ void PublishFogEndpoint(const std::shared_ptr<CapturePlan>& plan) noexcept
 
 void CaptureBoundCb12(ID3D12GraphicsCommandList* list, CapturePlan& plan)
 {
-    if (!plan.boundCb12Pso || !plan.layers.boundCb12.resource)
+    if (!HasBoundCb12Psos(plan) || !plan.layers.boundCb12.resource)
         return;
     {
         struct RestoreConstantProbeState
@@ -1319,17 +1342,23 @@ void CaptureBoundCb12(ID3D12GraphicsCommandList* list, CapturePlan& plan)
         const FLOAT clear[] = { 0, 0, 0, 0 };
         list->ClearRenderTargetView(plan.boundCb12Rtv, clear, 0, nullptr);
         const D3D12_VIEWPORT viewport { 0, 0, 5, 1, 0, 1 };
-        const D3D12_RECT scissor { 0, 0, 5, 1 };
         // Keep both root signatures, all root arguments, heaps and input bindings
-        // untouched. The authenticated original VS remains part of this private PSO.
-        originalSetPso(list, plan.boundCb12Pso.Get());
+        // untouched. Every private PSO retains the authenticated original VS.
         originalSetRtv(list, 1, &plan.boundCb12Rtv, FALSE, nullptr);
         originalSetViewports(list, 1, &viewport);
-        originalSetScissors(list, 1, &scissor);
-        originalDraw(list, 3, 1, 0, 0);
+        for (size_t i = 0; i < BoundCb12Registers.size(); ++i)
+        {
+            // VRS changes invocation frequency, not scissor pixel coverage. Even
+            // if the invocation lies outside this column, its constant uint4 is
+            // correct for every covered sample. No VRS state changes are needed.
+            const D3D12_RECT scissor { LONG(i), 0, LONG(i + 1), 1 };
+            originalSetPso(list, plan.boundCb12Psos[i].Get());
+            originalSetScissors(list, 1, &scissor);
+            originalDraw(list, 3, 1, 0, 0);
+        }
     }
     // JSON/log allocations happen only after exact graphics state restoration.
-    plan.provenance["bound_cb12_probe"]["status"] = "private_draw_recorded";
+    plan.provenance["bound_cb12_probe"]["status"] = "private_draws_recorded";
     plan.provenance["bound_cb12_probe"]["recording_position"] = "same fog scope/list after original and private authored draw";
 }
 
@@ -1423,32 +1452,49 @@ void PrepareBoundCb12Pso(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STA
         if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
             !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
             return;
-        ComPtr<ID3DBlob> code, errors;
-        const auto compiled = D3DCompile(BoundCb12Shader, sizeof(BoundCb12Shader) - 1, nullptr, nullptr, nullptr,
-            "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
-        if (FAILED(compiled) || !code)
+        Hash templateHash(Data().crypto);
+        templateHash.Add(BoundCb12Shader, ULONG(sizeof(BoundCb12Shader) - 1));
+        const auto templateSha256 = templateHash.Finish();
+        if (templateSha256.empty()) return;
+        // Publish only a complete five-PSO set. Partial compilation/device failure
+        // leaves the existing three-layer capture intact and no companion active.
+        std::array<BoundCb12Variant, BoundCb12Registers.size()> variants;
+        for (size_t i = 0; i < BoundCb12Registers.size(); ++i)
         {
-            LOG_WARN("[FSRRR fog cb12] optional High companion shader compile failed: {:x}", UINT(compiled));
-            return;
+            auto& variant = variants[i];
+            variant.source = std::format("#define BOUND_CB12_REGISTER {}\n{}", BoundCb12Registers[i], BoundCb12Shader);
+            ComPtr<ID3DBlob> code, errors;
+            const auto compiled = D3DCompile(variant.source.data(), variant.source.size(), nullptr, nullptr, nullptr,
+                "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+            if (FAILED(compiled) || !code)
+            {
+                LOG_WARN("[FSRRR fog cb12] optional High companion shader compile failed register={}: {:x}",
+                         BoundCb12Registers[i], UINT(compiled));
+                return;
+            }
+            Hash sourceHash(Data().crypto), bytecodeHash(Data().crypto);
+            sourceHash.Add(variant.source.data(), ULONG(variant.source.size()));
+            bytecodeHash.Add(code->GetBufferPointer(), ULONG(code->GetBufferSize()));
+            variant.sourceSha256 = sourceHash.Finish();
+            variant.bytecodeSha256 = bytecodeHash.Finish();
+            if (variant.sourceSha256.empty() || variant.bytecodeSha256.empty()) return;
+            auto clone = compatible;
+            clone.PS = { code->GetBufferPointer(), code->GetBufferSize() };
+            clone.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_UINT;
+            clone.CachedPSO = {};
+            const auto created = originalCreateGraphics(device, &clone, IID_PPV_ARGS(&variant.pso));
+            LOG_INFO("[FSRRR fog cb12] optional High UINT companion PSO result={:x}; shader={} register={} column={}",
+                     UINT(created), variant.bytecodeSha256, BoundCb12Registers[i], i);
+            if (FAILED(created) || !variant.pso) return;
         }
-        Hash sourceHash(Data().crypto), bytecodeHash(Data().crypto);
-        sourceHash.Add(BoundCb12Shader, ULONG(sizeof(BoundCb12Shader) - 1));
-        bytecodeHash.Add(code->GetBufferPointer(), ULONG(code->GetBufferSize()));
-        tagged.cb12SourceSha256 = sourceHash.Finish();
-        tagged.cb12BytecodeSha256 = bytecodeHash.Finish();
-        if (tagged.cb12SourceSha256.empty() || tagged.cb12BytecodeSha256.empty())
-            return;
-        auto clone = compatible;
-        clone.PS = { code->GetBufferPointer(), code->GetBufferSize() };
-        clone.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_UINT;
-        clone.CachedPSO = {};
-        const auto created = originalCreateGraphics(device, &clone, IID_PPV_ARGS(&tagged.boundCb12));
-        LOG_INFO("[FSRRR fog cb12] optional High UINT companion PSO result={:x}; shader={} registers=21,22,23,24,27",
-                 UINT(created), tagged.cb12BytecodeSha256);
+        tagged.cb12TemplateSha256 = templateSha256;
+        tagged.boundCb12 = std::move(variants);
     }
     catch (...)
     {
-        tagged.boundCb12.Reset(); // Compilation/metadata failures must not disable the existing fog capture.
+        // Compilation/metadata failures must not disable the existing fog capture.
+        for (auto& variant : tagged.boundCb12) variant = {};
+        tagged.cb12TemplateSha256.clear();
     }
 }
 

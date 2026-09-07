@@ -650,10 +650,26 @@ it does not call an engine constant uploader, inspect a guessed GPU address, or
 use a global “latest camera” pointer. Its 80-byte companion uses the existing
 capture submission/fence and is not mixed with the three native float layers.
 
+Probe provenance v2 uses five compile-time fixed-register pixel shaders and
+five disjoint one-pixel scissor columns. The original screen-position-indexed
+v1 probe could repeat adjacent registers under inherited variable-rate shading;
+its readback completion alone was not sufficient evidence. V2 leaves shading
+rate untouched: each draw returns the same constant for every invocation, while
+native scissor coverage selects its output column. This avoids requiring a new
+VRS state tracker or changing the game's shading rate. See the official
+[VRS coverage semantics](https://microsoft.github.io/DirectX-Specs/d3d/VariableRateShading.html).
+
 Additional CPU metadata records the authored depth key, motion fallback/owner
 precedence, specular-hit-distance owner, and view-derived camera candidates.
 These candidates remain explicitly distinct from final NGX constants/reset.
 No early denoiser dispatch is enabled by this instrumentation.
+
+The metadata also records borrowed native resource addresses from the exact
+32,768-slot engine texture registry, bounded by the authenticated slot layout.
+Positive reference counts and repeated reads are required to emit an address,
+but they are not ownership or atomic-snapshot proofs. No native address is
+dereferenced, passed to COM or used for a GPU operation. The graph resource
+holder itself is non-owning; its resource-record pool has a separate lifetime.
 
 The correction still needs dedicated graphics/compute state preservation before
 an early compute insertion. A different command list cannot simply be inserted

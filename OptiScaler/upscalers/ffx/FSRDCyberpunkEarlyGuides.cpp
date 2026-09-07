@@ -21,6 +21,10 @@ constexpr size_t MaxReadCalls = 4096, MaxReadBytes = 128 * 1024;
 constexpr uint32_t MaxChain = 256, MaxVersions = 256, MaxTableElements = 1024 * 1024;
 constexpr uint32_t MaxStride = 256;
 constexpr uintptr_t ImageBytes = 0x04efc000;
+constexpr uintptr_t TextureRegistryRva = 0x3438a28;
+constexpr uint32_t TextureSlotCount = 0x8000;
+constexpr uintptr_t TextureSlotStride = 0xb0, TextureRefOffset = 0x2f1d0,
+                    TextureNativeOffset = 0x2f1d8;
 constexpr uintptr_t NoVModeRva = 0x38137f0, ExtraSpecularEnableRva = 0x3310670,
                     ExtraSpecularScaleRva = 0x3813840;
 
@@ -52,6 +56,45 @@ struct Reader
         return result;
     }
 };
+
+// RVA 0x20d268 only borrows a native address. RVA 0x21f980 establishes
+// the actual 32768-slot bound; 0x21c960/0x1fa164 increment/decrement the
+// signed slot refcount. Zero can already be queued for retirement. This
+// records addresses as integers only: never dereference them or invoke COM.
+// Repeated matching reads detect some mutations, not lifetime/ownership.
+Json RegistryMapping(Reader& read, uintptr_t image, uint32_t handle)
+{
+    Json result = { { "status", "unavailable" }, { "slot_capacity", TextureSlotCount },
+        { "native_address_borrowed", true }, { "native_address_dereferenced", false },
+        { "lifetime", "not_established" }, { "gpu_initialized", "not_established" },
+        { "resource_state", "not_observed" }, { "snapshot_atomic", false } };
+    try
+    {
+        if (!handle || handle > TextureSlotCount)
+            throw std::runtime_error("native handle outside authenticated texture pool");
+        const auto registry = read.Read<uintptr_t>(Address(image, TextureRegistryRva));
+        const auto index = uint64_t(handle - 1);
+        result["slot_index"] = index;
+        const auto refsAddress = Address(registry, TextureRefOffset + index * TextureSlotStride);
+        const auto nativeAddress = Address(registry, TextureNativeOffset + index * TextureSlotStride);
+        const auto refs = read.Read<int32_t>(refsAddress);
+        result["ref_status"] = refs;
+        if (refs <= 0)
+            throw std::runtime_error("texture slot has no observed positive reference count");
+        const auto native = read.Read<uintptr_t>(nativeAddress);
+        const auto refsAfter = read.Read<int32_t>(refsAddress);
+        result["ref_status_after"] = refsAfter;
+        if (refs != refsAfter || native != read.Read<uintptr_t>(nativeAddress) ||
+            registry != read.Read<uintptr_t>(Address(image, TextureRegistryRva)))
+            throw std::runtime_error("texture registry changed during metadata reads");
+        if (!native)
+            throw std::runtime_error("native resource address unavailable");
+        result["borrowed_native_address"] = native;
+        result["status"] = "borrowed_address_observed";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
 
 struct GraphContext
 {
@@ -417,6 +460,10 @@ std::string Describe(const void* context, uintptr_t authenticatedImageBase) noex
             inputs.push_back(std::move(depth));
             inputs.push_back(Motion(read, graph, features));
             inputs.push_back(SpecularHitDistance(read, graph, features));
+            for (auto& input : inputs)
+                if (input.contains("handle"))
+                    input["texture_registry"] = RegistryMapping(read, authenticatedImageBase,
+                                                                 input["handle"].get<uint32_t>());
             result["inputs"] = std::move(inputs);
             result["camera_provenance"] = CameraProvenance(read, graph);
             Json settings = { { "NoV_mode", read.Read<int32_t>(Address(authenticatedImageBase, NoVModeRva)) },

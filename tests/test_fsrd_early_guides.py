@@ -57,6 +57,16 @@ class EarlyGuides(unittest.TestCase):
         self.assertIn("std::isfinite(scale)", SOURCE)
         self.assertIn('"extra_specular_scale_bits"', SOURCE)
 
+    def test_registry_mapping_remains_borrowed_cpu_metadata(self):
+        for evidence in ("TextureRegistryRva = 0x3438a28", "TextureSlotCount = 0x8000",
+                         "TextureSlotStride = 0xb0", "TextureRefOffset = 0x2f1d0",
+                         "TextureNativeOffset = 0x2f1d8", "handle > TextureSlotCount", "refs <= 0",
+                         '"native_address_dereferenced", false', '"lifetime", "not_established"',
+                         '"resource_state", "not_observed"', "refs != refsAfter"):
+            self.assertIn(evidence, SOURCE)
+        for forbidden in ("AddRef(", "Release(", "GetDesc(", "reinterpret_cast<decltype"):
+            self.assertNotIn(forbidden, SOURCE)
+
     def test_observational_camera_and_exact_motion_precedence(self):
         for evidence in ('"streamline_producer_observed", false', '"frame_token", "not_observed"',
                          '"matrix_payload", "not_captured"', '"effective_ngx_reset", "not_established"',
@@ -88,6 +98,7 @@ class EarlyGuides(unittest.TestCase):
 #include <Windows.h>
 static std::unordered_map<uintptr_t, unsigned char> memory;
 static bool partial = false;
+static uintptr_t mutateAfterRead = 0;
 bool ReadProcessMemory(HANDLE, const void* source, void* destination, SIZE_T size, SIZE_T* actual)
 {
     const auto address = reinterpret_cast<uintptr_t>(source);
@@ -100,6 +111,11 @@ bool ReadProcessMemory(HANDLE, const void* source, void* destination, SIZE_T siz
         ++*actual;
     }
     if (partial && size) --*actual;
+    if (mutateAfterRead == address)
+    {
+        memory[address] ^= 1;
+        mutateAfterRead = 0;
+    }
     return true;
 }
 template<typename T> void put(uintptr_t address, T value)
@@ -111,10 +127,11 @@ PRODUCTION_INCLUDE
 using namespace FSRDCyberpunkEarlyGuides;
 constexpr uintptr_t context = 0x10000, view = 0x20000, graph = 0x40000;
 constexpr uintptr_t buckets = 0x800000, entries = 0x900000, image = 0x10000000;
+constexpr uintptr_t registry = 0x20000000;
 constexpr uint32_t keys[] = {0x63bcf380,0x64bcf513,0x65bcf6a6,0x61f178d4,0xdebf0c27,0x15eab19c};
 void setup()
 {
-    memory.clear(); partial = false;
+    memory.clear(); partial = false; mutateAfterRead = 0;
     put<uint8_t>(context + 0x30, 2); put<uint32_t>(context + 0x34, 3);
     put<uint8_t>(context + 0x38, 0); put<uintptr_t>(context + 0x18, view);
     put<uintptr_t>(context + 8, 0x30000); put<uintptr_t>(0x30000, graph);
@@ -141,6 +158,14 @@ void setup()
     }
     for (uint32_t i = 0; i < 13; ++i) put<uint32_t>(buckets + i * 4, heads[i]);
     put<int32_t>(image + NoVModeRva, -1);
+    put<uintptr_t>(image + TextureRegistryRva, registry);
+    for (uint32_t handle = 100; handle <= 105; ++handle)
+    {
+        put<int32_t>(registry + TextureRefOffset + (handle - 1) * TextureSlotStride, 1);
+        // The native address is intentionally NOT readable in mock memory.
+        put<uintptr_t>(registry + TextureNativeOffset + (handle - 1) * TextureSlotStride,
+                       0x30000000 + handle * 0x1000);
+    }
 }
 Json describe() { return Json::parse(Describe(reinterpret_cast<void*>(context), image)); }
 int main()
@@ -148,6 +173,15 @@ int main()
     setup(); auto result = describe();
     assert(!result.contains("read_failure"));
     for (int i = 0; i < 4; ++i) assert(result["inputs"][i]["handle"] == i + 100);
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto& mapping = result["inputs"][i]["texture_registry"];
+        assert(mapping["status"] == "borrowed_address_observed");
+        assert(mapping["borrowed_native_address"] == 0x30000000 + (i + 100) * 0x1000);
+        assert(mapping["ref_status"] == 1 && mapping["ref_status_after"] == 1);
+        assert(mapping["lifetime"] == "not_established");
+        assert(mapping["gpu_initialized"] == "not_established");
+    }
     assert(result["guide_settings"]["NoV_mode"] == -1);
     assert(result["guide_settings"]["extra_specular_enabled"] == 0);
     assert(result["graph_position"] == 11 && result["namespace"] == 3);
@@ -230,6 +264,46 @@ int main()
     setup(); memory.erase(view + 0x17d0); result = describe();
     assert(result["guide_settings"]["extra_specular"] == "current view feature unavailable");
     assert(!result["guide_settings"].contains("extra_specular_enabled"));
+    setup(); const auto refAddress = registry + TextureRefOffset + 99 * TextureSlotStride;
+    const auto nativeAddress = registry + TextureNativeOffset + 99 * TextureSlotStride;
+    for (const auto status : {0, -1, INT32_MIN})
+    {
+        put<int32_t>(refAddress, status); result = describe();
+        const auto& mapping = result["inputs"][0]["texture_registry"];
+        assert(mapping["status"] == "unavailable" && mapping["ref_status"] == status);
+        assert(!mapping.contains("borrowed_native_address"));
+    }
+    setup(); memory.erase(refAddress); result = describe();
+    assert(!result["inputs"][0]["texture_registry"].contains("ref_status"));
+    setup(); memory.erase(nativeAddress); result = describe();
+    assert(!result["inputs"][0]["texture_registry"].contains("borrowed_native_address"));
+    setup(); put<uintptr_t>(nativeAddress, 0); result = describe();
+    assert(result["inputs"][0]["texture_registry"]["reason"] == "native resource address unavailable");
+    setup(); mutateAfterRead = refAddress; result = describe();
+    assert(result["inputs"][0]["texture_registry"]["reason"] == "texture registry changed during metadata reads");
+    setup(); mutateAfterRead = nativeAddress; result = describe();
+    assert(result["inputs"][0]["texture_registry"]["status"] == "unavailable");
+    setup(); mutateAfterRead = image + TextureRegistryRva; result = describe();
+    assert(result["inputs"][0]["texture_registry"]["status"] == "unavailable");
+    for (const auto handle : {0u, TextureSlotCount + 1, uint32_t(INT32_MAX), UINT32_MAX})
+    {
+        Reader bounded;
+        const auto mapping = RegistryMapping(bounded, image, handle);
+        assert(mapping["status"] == "unavailable" && bounded.calls == 0);
+    }
+    for (const auto handle : {1u, TextureSlotCount})
+    {
+        setup();
+        put<int32_t>(registry + TextureRefOffset + (handle - 1) * TextureSlotStride, 1);
+        put<uintptr_t>(registry + TextureNativeOffset + (handle - 1) * TextureSlotStride, 0x12345678);
+        Reader bounded; const auto mapping = RegistryMapping(bounded, image, handle);
+        assert(mapping["status"] == "borrowed_address_observed");
+        assert(mapping["slot_index"] == handle - 1 && bounded.calls == 6);
+    }
+    setup(); put<uintptr_t>(image + TextureRegistryRva, 0); result = describe();
+    assert(result["inputs"][0]["texture_registry"]["status"] == "unavailable");
+    setup(); put<uintptr_t>(image + TextureRegistryRva, UINTPTR_MAX); result = describe();
+    assert(result["inputs"][0]["texture_registry"]["reason"] == "null or overflowing address");
     Reader read; read.calls = MaxReadCalls;
     try { read.Read<uint8_t>(context + 0x30); assert(false); } catch (const std::exception&) {}
     read.calls = 0; read.bytes = MaxReadBytes - 3;
