@@ -5093,6 +5093,13 @@ PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT cou
         caller != authenticatedImage.load() + FSRD::CyberpunkFogDepth::DrawReturnRva ||
         count != 3 || instances != 1 || start || firstInstance) return nullptr;
     if (window->stopped) return nullptr; // Missing producer roles may still drain through their own selectors.
+    {
+        std::lock_guard lock(window->mutex);
+        // Completed windows keep their submission evidence, but no longer
+        // collect fresh Fog bindings. Do not diagnose ordinary later frames as
+        // missing inputs for a test whose last consumer has already returned.
+        if (window->policy && window->policy->Complete()) return nullptr;
+    }
     const auto& s = *scope;
     if (!s.boundRtv.known)
     {

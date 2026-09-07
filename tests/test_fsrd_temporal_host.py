@@ -51,6 +51,7 @@ class TemporalHost(unittest.TestCase):
         self.assertIn('window.policy->ClaimRole(source.current.frame, role)', select)
         self.assertIn('created->policy.key = key', select)
         observe = section('PrivateResetPacket* ObserveTemporalFog(', 'void WINAPI HookDraw(')
+        self.assertLess(observe.index('window->policy->Complete()'), observe.index('s.boundRtv'))
         self.assertIn('ResTrack_Dx12::PrepareSubmission(', observe)
         self.assertIn('observed.Get() != identity.Get()', observe)
         self.assertIn('state->second.generation', observe)
