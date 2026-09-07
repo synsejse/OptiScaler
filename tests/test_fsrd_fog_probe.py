@@ -204,7 +204,7 @@ class FogProbe(unittest.TestCase):
         self.assertIn('"scissor_rects"', prepare)
 
     def test_descriptor_and_list_tracking_bounded_and_forwarded_once(self):
-        self.assertIn("MaxRtvHeaps = 64, MaxRtvSlots = 65536, MaxCommandLists = 128", SOURCE)
+        self.assertIn("MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 128", SOURCE)
         self.assertIn("captureTrackingValid.store(false)", function("Track"))
         copied = function("TrackDescriptorCopy")
         self.assertLess(copied.index("snapshot.push_back"), copied.index("*slot = snapshot[cursor]"))
@@ -217,6 +217,57 @@ class FogProbe(unittest.TestCase):
                                ("HookSetScissors", "originalSetScissors"), ("HookBeginRenderPass", "originalBeginRenderPass"),
                                ("HookEndRenderPass", "originalEndRenderPass")):
             self.assertEqual(function(hook).count(original + "("), 1)
+
+    def test_rtv_heap_budget_reports_exact_cause_counts_and_bounded_milestones(self):
+        create = function("HookCreateHeap")
+        self.assertIn("data.heaps.size() >= MaxRtvHeaps", create)
+        self.assertIn("RTV provenance budget exhausted: reason={}", create)
+        for field in ("retained_heaps={}/{}", "retained_slots={}/{}", "requested_heaps=1",
+                      "requested_heap_slots={}", "reserved_slots={}", "requested_metadata_slots=0",
+                      "slot_payload_bytes={}"):
+            self.assertIn(field, create)
+        for reason in ("zero-sized heap", "heap limit"):
+            self.assertIn('"' + reason + '"', create)
+        for count in (1, 64, 128, 256, 512):
+            self.assertIn("heapCount == " + str(count), create)
+
+    def test_sparse_rtv_storage_bounds_written_entries_not_reserved_heap_space(self):
+        self.assertIn("std::unordered_map<UINT, RtvSlot> slots", SOURCE)
+        create = function("HookCreateHeap")
+        self.assertIn("record.descriptorCount = desc->NumDescriptors", create)
+        self.assertNotIn("slots.resize", create)
+        self.assertNotIn("desc->NumDescriptors > MaxRtvSlots", create)
+        self.assertNotIn("data.slots += desc->NumDescriptors", create)
+        lookup = function("FindRtv")
+        self.assertIn("slot >= heap.descriptorCount", lookup)
+        self.assertIn("heap.slots.find(UINT(slot))", lookup)
+        self.assertLess(lookup.index("if (!createWrittenSlot)"), lookup.index("heap.slots.try_emplace"))
+        self.assertLess(lookup.index("if (data.slots >= MaxRtvSlots)"), lookup.index("heap.slots.try_emplace"))
+        self.assertIn("if (inserted) ++data.slots", lookup)
+        self.assertIn("requested_heaps=0 requested_slots=1", lookup)
+
+    def test_only_rtv_writes_allocate_sparse_entries_and_unknown_copy_invalidates(self):
+        self.assertIn("FindRtv(data, destination.ptr, nullptr, nullptr, true)", function("HookCreateRtv"))
+        copy = function("TrackDescriptorCopy")
+        self.assertIn("FindRtv(data, sources[range].ptr + SIZE_T(i) * increment)", copy)
+        self.assertIn("FindRtv(data, destinations[range].ptr + SIZE_T(i) * increment, nullptr, nullptr, true)", copy)
+        self.assertIn("snapshot.push_back(slot ? *slot : RtvSlot {})", copy)
+        self.assertIn("*slot = snapshot[cursor]", copy)
+        self.assertIn("FindRtv(data, rtvs[0].ptr, &heap, &index)", function("HookSetRtv"))
+
+    def test_default_rtv_is_only_documented_typed_single_slice_single_sample_rgba16f(self):
+        create = function("HookCreateRtv")
+        default = create.split("else if (resource)", 1)[1]
+        for requirement in ("resourceDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT",
+                            "resourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D",
+                            "resourceDesc.DepthOrArraySize == 1", "resourceDesc.SampleDesc.Count == 1"):
+            self.assertIn(requirement, default)
+        self.assertIn("slot->view.Texture2D.MipSlice = 0", default)
+        self.assertIn("slot->view.Texture2D.PlaneSlice = 0", default)
+        self.assertIn("slot->documentedDefault = true", default)
+        self.assertIn("Typeless, array, MSAA and other default views remain unknown", default)
+        self.assertIn("bound.documentedDefault = slot->documentedDefault", function("HookSetRtv"))
+        self.assertIn('"descriptor_source"', function("PrepareCapture"))
 
     def test_endpoint_observer_inactive_path_has_no_com_or_gpu_work(self):
         observe = function("ObserveNgxInput")

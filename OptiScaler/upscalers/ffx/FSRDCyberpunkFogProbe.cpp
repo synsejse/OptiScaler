@@ -50,7 +50,7 @@ constexpr unsigned MaxPsoLogs = 16;
 constexpr unsigned MaxRearms = 2;
 constexpr SIZE_T FogVertexBytes = 2361;
 constexpr std::string_view FogVertexSha256 = "174ce05e0a97ce65f80358b2a01bbadea4c314fb386cfac6064940a870f91a5a";
-constexpr size_t MaxRtvHeaps = 64, MaxRtvSlots = 65536, MaxCommandLists = 128;
+constexpr size_t MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 128;
 constexpr UINT64 MaxCaptureTextureBytes = 256ull * 1024 * 1024;
 constexpr unsigned MaxNgxEndpoints = 8;
 constexpr UINT64 MaxEndpointResourceBytes = 256ull * 1024 * 1024;
@@ -125,6 +125,7 @@ struct RtvSlot
     D3D12_RENDER_TARGET_VIEW_DESC view {};
     uint64_t generation = 0;
     bool known = false;
+    bool documentedDefault = false;
 };
 struct RtvHeap
 {
@@ -132,7 +133,10 @@ struct RtvHeap
     SIZE_T start = 0;
     UINT increment = 0;
     uint64_t generation = 0;
-    std::vector<RtvSlot> slots;
+    UINT descriptorCount = 0;
+    // Reserved descriptor address space is not populated metadata. Keep only
+    // slots whose creation/copy we actually observed, with one global entry cap.
+    std::unordered_map<UINT, RtvSlot> slots;
 };
 struct BoundRtv
 {
@@ -142,6 +146,7 @@ struct BoundRtv
     uint64_t heapGeneration = 0, slotGeneration = 0;
     UINT index = 0;
     bool known = false;
+    bool documentedDefault = false;
 };
 struct Query
 {
@@ -180,6 +185,7 @@ struct Registry
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
     size_t slots = 0;
+    uint64_t reservedRtvSlots = 0;
     uint64_t nextHeap = 0, nextSlot = 0, nextRecording = 0;
 };
 Registry& Data()
@@ -290,7 +296,8 @@ template <typename Fn> void Track(Fn&& fn) noexcept
     inMetadata = false;
 }
 
-RtvSlot* FindRtv(Registry& data, SIZE_T handle, RtvHeap** owner = nullptr, UINT* index = nullptr)
+RtvSlot* FindRtv(Registry& data, SIZE_T handle, RtvHeap** owner = nullptr, UINT* index = nullptr,
+                 bool createWrittenSlot = false)
 {
     for (auto& heap : data.heaps)
     {
@@ -298,11 +305,21 @@ RtvSlot* FindRtv(Registry& data, SIZE_T handle, RtvHeap** owner = nullptr, UINT*
             continue;
         const auto delta = handle - heap.start;
         const auto slot = delta / heap.increment;
-        if (delta % heap.increment || slot >= heap.slots.size())
+        if (delta % heap.increment || slot >= heap.descriptorCount)
             continue;
         if (owner) *owner = &heap;
         if (index) *index = UINT(slot);
-        return &heap.slots[slot];
+        if (auto found = heap.slots.find(UINT(slot)); found != heap.slots.end())
+            return &found->second;
+        if (!createWrittenSlot)
+            return nullptr; // Unobserved source/binding must stay unknown, not allocate.
+        if (data.slots >= MaxRtvSlots)
+            throw std::runtime_error(std::format(
+                "RTV provenance budget exhausted: reason=written slot limit retained_heaps={}/{} retained_slots={}/{} reserved_slots={} requested_heaps=0 requested_slots=1 heap_range_slots={}",
+                data.heaps.size(), MaxRtvHeaps, data.slots, MaxRtvSlots, data.reservedRtvSlots, heap.descriptorCount));
+        auto [written, inserted] = heap.slots.try_emplace(UINT(slot));
+        if (inserted) ++data.slots;
+        return &written->second;
     }
     return nullptr;
 }
@@ -321,17 +338,24 @@ HRESULT WINAPI HookCreateHeap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_
             for (const auto& known : data.heaps)
                 if (known.heap.Get() == heap.Get())
                     return;
-            if (!desc->NumDescriptors || data.heaps.size() >= MaxRtvHeaps ||
-                desc->NumDescriptors > MaxRtvSlots - data.slots)
-                throw std::runtime_error("RTV provenance budget exhausted");
+            if (!desc->NumDescriptors || data.heaps.size() >= MaxRtvHeaps)
+                throw std::runtime_error(std::format(
+                    "RTV provenance budget exhausted: reason={} retained_heaps={}/{} retained_slots={}/{} reserved_slots={} requested_heaps=1 requested_heap_slots={} requested_metadata_slots=0",
+                    !desc->NumDescriptors ? "zero-sized heap" : "heap limit", data.heaps.size(), MaxRtvHeaps,
+                    data.slots, MaxRtvSlots, data.reservedRtvSlots, desc->NumDescriptors));
             RtvHeap record;
             record.heap = heap;
             record.start = heap->GetCPUDescriptorHandleForHeapStart().ptr;
             record.increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
             record.generation = ++data.nextHeap;
-            record.slots.resize(desc->NumDescriptors);
-            data.slots += desc->NumDescriptors;
+            record.descriptorCount = desc->NumDescriptors;
             data.heaps.push_back(std::move(record));
+            data.reservedRtvSlots += desc->NumDescriptors;
+            const auto heapCount = data.heaps.size();
+            if (heapCount == 1 || heapCount == 64 || heapCount == 128 || heapCount == 256 || heapCount == 512)
+                LOG_INFO("[FSRRR fog capture] RTV provenance retained_heaps={}/{} retained_slots={}/{} reserved_slots={} requested_heaps=1 requested_heap_slots={} requested_metadata_slots=0 accepted; slot_payload_bytes={} (excludes map overhead)",
+                         heapCount, MaxRtvHeaps, data.slots, MaxRtvSlots, data.reservedRtvSlots,
+                         desc->NumDescriptors, data.slots * sizeof(RtvSlot));
         });
     return hr;
 }
@@ -343,16 +367,35 @@ void WINAPI HookCreateRtv(ID3D12Device* device, ID3D12Resource* resource,
     Track([&] {
         auto& data = Data();
         std::lock_guard lock(data.mutex);
-        if (auto* slot = FindRtv(data, destination.ptr))
+        if (auto* slot = FindRtv(data, destination.ptr, nullptr, nullptr, true))
         {
             *slot = {};
             slot->generation = ++data.nextSlot;
-            // Null/default descriptors are deliberately not reconstructed by guesswork.
             if (resource && desc)
             {
                 slot->resource = resource;
                 slot->view = *desc;
                 slot->known = true;
+            }
+            else if (resource)
+            {
+                // Documented pDesc=null: inherit typed format/dimension, first mip,
+                // all slices. This narrow single-slice/single-plane case is exact.
+                // https://learn.microsoft.com/windows/win32/api/d3d12/nf-d3d12-id3d12device-createrendertargetview
+                const auto resourceDesc = resource->GetDesc();
+                if (resourceDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                    resourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                    resourceDesc.DepthOrArraySize == 1 && resourceDesc.SampleDesc.Count == 1)
+                {
+                    slot->resource = resource;
+                    slot->view.Format = resourceDesc.Format;
+                    slot->view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                    slot->view.Texture2D.MipSlice = 0;
+                    slot->view.Texture2D.PlaneSlice = 0;
+                    slot->known = true;
+                    slot->documentedDefault = true;
+                }
+                // Typeless, array, MSAA and other default views remain unknown.
             }
         }
     });
@@ -386,7 +429,7 @@ void TrackDescriptorCopy(ID3D12Device* device, UINT destinationCount,
         if (count > snapshot.size() - cursor)
             throw std::runtime_error("RTV descriptor-copy counts disagree");
         for (UINT i = 0; i < count; ++i, ++cursor)
-            if (auto* slot = FindRtv(data, destinations[range].ptr + SIZE_T(i) * increment))
+            if (auto* slot = FindRtv(data, destinations[range].ptr + SIZE_T(i) * increment, nullptr, nullptr, true))
             {
                 *slot = snapshot[cursor]; // Unknown sources invalidate destinations too.
                 slot->generation = ++data.nextSlot;
@@ -709,6 +752,7 @@ void WINAPI HookSetRtv(ID3D12GraphicsCommandList* list, UINT count,
                 bound.slotGeneration = slot->generation;
                 bound.index = index;
                 bound.known = true;
+                bound.documentedDefault = slot->documentedDefault;
             });
     }
     originalSetRtv(list, count, rtvs, contiguous, dsv);
@@ -843,7 +887,7 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
             bound.view.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D || bound.view.Texture2D.MipSlice != 0 ||
             bound.view.Texture2D.PlaneSlice != 0)
         {
-            RefuseCapture("exact explicit mip0 RGBA16F RTV descriptor provenance unavailable");
+            RefuseCapture("exact mip0 RGBA16F RTV descriptor provenance unavailable");
             return {};
         }
         // Already owned since the original OM bind; do not resolve its CPU handle
@@ -867,6 +911,7 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
             { "source_rtv", { { "cpu_handle", s.rtvs[0].ptr }, { "heap_address", uintptr_t(bound.heap.Get()) },
                 { "heap_generation", bound.heapGeneration }, { "slot", bound.index }, { "slot_generation", bound.slotGeneration },
                 { "format", UINT(bound.view.Format) }, { "mip_slice", 0 }, { "array_slice", 0 },
+                { "descriptor_source", bound.documentedDefault ? "documented typed RGBA16F default" : "explicit RTV" },
                 { "ownership_acquired", "original OMSetRenderTargets" } } },
             { "shader", { { "ps_sha256", foundPso->pixelSha256 }, { "vs_sha256", FogVertexSha256 } } },
             { "draw", { { "vertex_count", count }, { "instance_count", instances },
