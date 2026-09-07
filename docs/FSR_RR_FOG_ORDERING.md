@@ -129,3 +129,32 @@ guessed reciprocal nor late scalar is promoted into current GPU evidence.
 
 No fitted haze, inferred diffuse/specular split, raw/denoised blend, history
 reset trick, or permanent removal of the game's authored fog is proposed.
+
+## Current integration boundary
+
+The original final lighting draw is a useful place to generate owned material
+guides, but its main-color output is **not established as the immediately-pre-fog
+color** used in the positive replay. Other authored passes, including a
+conditionally enabled SSS pass, can target the same main-color resource. The
+eventual scene correction therefore belongs before the original fog draw,
+using color at that boundary and correctly ordered current guide outputs.
+
+The ray node has the actual current motion and hit-distance uses; lighting's
+pixel register t4 is a different input. Neither a lingering descriptor nor a
+positive reference count extends a graph resource's alias lifetime. Preserving
+those ray inputs must happen while their actual original use remains valid,
+with explicit read-state transitions and producer/consumer ordering.
+
+A successful `685f4507` capture observed original ray CPU constants selecting
+absolute hit distance and enabling hit writes. Ray and lighting had matching
+native command-list/reset identities in that sample. This is promising bounded
+evidence, not proof of the selected GPU shader, immutable GPU constants, or a
+fog-stage handoff. The next observer records original t4/u0/u8 and b6 descriptor
+correspondence at the actual ray dispatch.
+
+`FSRDPrivateDenoise` is an independent, one-shot RESET helper with private
+outputs and explicit parameters. It passed local failure/lifetime tests and a
+Windows build, but is not yet invoked by the live host. RESET avoids borrowing
+late history for this first diagnostic; it does not excuse missing current
+motion, hit distance, camera, or resource ordering. No extra exposure or raw
+ray ×64 decoding is applied to already-composed main color.

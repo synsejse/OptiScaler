@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "FSRDCyberpunkEarlyGuides.h"
+#include "FSRDCyberpunkMotionScale.h"
 
 #include <Windows.h>
 #include <json.hpp>
@@ -654,6 +655,57 @@ Json FrameIdVirtualRoute(Reader& read, const GraphContext& context, uintptr_t im
     return result;
 }
 
+struct MotionScaleReader
+{
+    Reader& reader;
+    bool Read(uintptr_t address, void* output, size_t bytes)
+    {
+        // The pure observer has only four small read shapes. Keep the shared
+        // metadata budget and exact-read checks, with no native property calls.
+        if (bytes == 4)
+        {
+            const auto value = reader.Read<uint32_t>(address);
+            std::memcpy(output, &value, bytes);
+        }
+        else if (bytes == 5)
+        {
+            const auto value = reader.Read<std::array<char, 5>>(address);
+            std::memcpy(output, value.data(), bytes);
+        }
+        else if (bytes == 11)
+        {
+            const auto value = reader.Read<std::array<char, 11>>(address);
+            std::memcpy(output, value.data(), bytes);
+        }
+        else if (bytes == sizeof(std::array<uintptr_t, 3>))
+        {
+            const auto value = reader.Read<std::array<uintptr_t, 3>>(address);
+            std::memcpy(output, value.data(), bytes);
+        }
+        else return false;
+        return true;
+    }
+};
+
+Json MotionScaleProvenance(Reader& read, uintptr_t image)
+{
+    Json result = { { "status", "unavailable" }, { "snapshot_atomic", false },
+        { "semantics", "native_SL_normalized_motion_multiplier" },
+        { "gpu_binding_proven", false }, { "defaults_used", false },
+        { "section", "DLSS" }, { "names", { "MvecScaleX", "MvecScaleY" } },
+        { "value_rvas", { 0x3464dc0, 0x3464e10 } } };
+    MotionScaleReader host { read };
+    FSRD::CyberpunkMotionScale::Snapshot observed;
+    if (FSRD::CyberpunkMotionScale::Observe(host, image, observed))
+    {
+        result["source_bits"] = observed.words;
+        result["status"] = "current_property_CPU_values";
+        result["repeated_source_fields_equal"] = true;
+    }
+    else result["reason"] = "property identity, finite value or repeated snapshot refused";
+    return result;
+}
+
 // The later authored producer (RVA 0x788a9c, publishing through 0x78933c)
 // reads these view fields. We have NOT observed that producer or its frame token;
 // these are candidates, not an early-ready replacement for final NGX constants.
@@ -667,6 +719,7 @@ Json CameraProvenance(Reader& read, const GraphContext& context, uintptr_t image
         { "jitter_free_projection", "not_captured_or_reconstructed" },
         { "previous_camera", "not_observed" }, { "effective_ngx_reset", "not_established" } };
     result["frame_id_virtual_route"] = FrameIdVirtualRoute(read, context, image);
+    result["motion_scale"] = MotionScaleProvenance(read, image);
     result["near_plane"] = FloatField(read, context.view, 0xb0);
     result["far_plane"] = FloatField(read, context.view, 0xb4);
     // RVA 0x1e4338 multiplies this field by pi/180 before projection creation.

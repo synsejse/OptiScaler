@@ -10,6 +10,8 @@
 #include "FSRDCyberpunkExposureSource.h"
 #include "FSRDCyberpunkLightingSource.h"
 #include "FSRDCyberpunkRayConstants.h"
+#include "FSRDCyberpunkRayBindings.h"
+#include "FSRDCyberpunkResetCamera.h"
 #include "FSRDCyberpunkLightingConstants.h"
 
 #include <Util.h>
@@ -292,6 +294,9 @@ struct Registry
     std::shared_ptr<EarlyProducer> earlyProducer;
     // Bounded immutable CPU-upload snapshots, never live GPU/frame authority.
     std::vector<FSRD::CyberpunkRayConstants::Receipt> rayConstants;
+    // CPU descriptor correspondence at original DispatchRays only. These are
+    // not retained resource leases, GPU payloads, or a later-lighting frame join.
+    std::vector<Json> rayDispatches;
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
     std::shared_ptr<EndpointTrace> submissionTrace;
@@ -319,6 +324,7 @@ std::atomic<bool> earlyRequested { false }, earlyAttempted { false }, earlyHeapT
 std::atomic<bool> earlyFatalRecording { false };
 std::atomic<ULONGLONG> earlyRequestedAt { 0 };
 std::atomic<bool> lightingRequested { false }, lightingAttempted { false };
+std::atomic<bool> rayBindingsAuthenticated { false };
 std::atomic<ULONGLONG> lightingRequestedAt { 0 };
 std::atomic<bool> endpointActive { false };
 std::atomic<bool> submissionActive { false };
@@ -336,6 +342,8 @@ using FullscreenHelper = void(__fastcall*)(void*, uint32_t, uint8_t);
 FullscreenHelper originalFullscreenHelper = nullptr;
 using BindTextures = void(__fastcall*)(uint32_t, uint32_t, const uint32_t*, uint8_t);
 BindTextures originalBindTextures = nullptr;
+using BindUavs = void(__fastcall*)(uint32_t, uint32_t, const uint32_t*);
+BindUavs originalBindUavs = nullptr;
 using UploadLightingConstants = void(__fastcall*)(uint32_t, const void*);
 UploadLightingConstants originalUploadLightingConstants = nullptr;
 UploadLightingConstants originalUploadRayConstants = nullptr;
@@ -370,6 +378,7 @@ using SetViewports = rewrite_signature<decltype(&ID3D12GraphicsCommandList::RSSe
 using SetScissors = rewrite_signature<decltype(&ID3D12GraphicsCommandList::RSSetScissorRects)>::type;
 using BeginRenderPass = rewrite_signature<decltype(&ID3D12GraphicsCommandList4::BeginRenderPass)>::type;
 using EndRenderPass = rewrite_signature<decltype(&ID3D12GraphicsCommandList4::EndRenderPass)>::type;
+using DispatchRays = rewrite_signature<decltype(&ID3D12GraphicsCommandList4::DispatchRays)>::type;
 using ClearRtv = rewrite_signature<decltype(&ID3D12GraphicsCommandList::ClearRenderTargetView)>::type;
 using ClearDsv = rewrite_signature<decltype(&ID3D12GraphicsCommandList::ClearDepthStencilView)>::type;
 CreateHeap originalCreateHeap = nullptr;
@@ -387,6 +396,7 @@ SetViewports originalSetViewports = nullptr;
 SetScissors originalSetScissors = nullptr;
 BeginRenderPass originalBeginRenderPass = nullptr;
 EndRenderPass originalEndRenderPass = nullptr;
+DispatchRays originalDispatchRays = nullptr;
 ClearRtv originalClearRtv = nullptr;
 ClearDsv originalClearDsv = nullptr;
 
@@ -436,14 +446,39 @@ struct LightingScope
     FSRD::CyberpunkLightingConstants::Receipt lightingConstants;
 };
 thread_local LightingScope* lightingScope = nullptr;
+struct RayBindReceipt
+{
+    FSRD::CyberpunkRayConstants::Scope scope;
+    uintptr_t callerRva = 0;
+    uint32_t handle = 0, writes = 0;
+    bool expectedSeen = false, valid = false;
+};
+constexpr std::array<uint32_t, 3> RayBindingRegisters { 4, 0, 8 };
+constexpr std::array<uintptr_t, 3> RayBindingReturnRvas { 0xc6ae45, 0xc6bb56, 0xc6bb44 };
+constexpr unsigned MaxRayDispatches = 8;
 struct RayScope
 {
     RayScope* previous = nullptr;
     uint64_t serial = 0;
     void* context = nullptr;
-    FSRD::CyberpunkRayConstants::Receipt receipt;
+    FSRD::CyberpunkRayConstants::Receipt receipt {};
+    std::array<RayBindReceipt, 3> bindings {}; // Original t4 SRV, u0 UAV, u8 UAV.
+    unsigned dispatches = 0;
 };
 thread_local RayScope* rayScope = nullptr;
+
+void InvalidateRayBinding(RayBindReceipt& receipt) noexcept
+{
+    receipt.valid = false;
+    if (receipt.writes != UINT32_MAX) ++receipt.writes;
+    else receipt.expectedSeen = true; // Saturation cannot resurrect a pending receipt.
+}
+
+bool RayBindingsArmed() noexcept
+{
+    return rayScope && !inMetadata && rayBindingsAuthenticated.load() &&
+        captureTrackingValid.load() && lightingRequested.load() && !lightingAttempted.load();
+}
 
 bool ReadExactMemory(uintptr_t address, void* destination, size_t bytes) noexcept
 {
@@ -1336,7 +1371,10 @@ void __fastcall HookLightingNode(void* node, void* context)
 void __fastcall HookRayNode(void* node, void* context)
 {
     for (auto* parent = rayScope; parent; parent = parent->previous)
+    {
         FSRD::CyberpunkRayConstants::Invalidate(parent->receipt);
+        for (auto& binding : parent->bindings) InvalidateRayBinding(binding);
+    }
     RayScope current { rayScope, scopes.fetch_add(1) + 1, context };
     rayScope = &current;
     struct Restore { RayScope* previous; ~Restore() { rayScope = previous; } } restore { current.previous };
@@ -1373,6 +1411,40 @@ FSRD::CyberpunkRayConstants::Scope CurrentRayConstantScope()
         throw std::runtime_error("current ray list generation unavailable");
     result.recordingGeneration = found->second.generation;
     return result;
+}
+
+bool BeginRayBind(RayScope& current, size_t index, uintptr_t caller, uint32_t first, uint32_t count,
+                  const uint32_t* handles, RayBindReceipt& pending)
+{
+    pending = {};
+    if (index >= current.bindings.size()) return false;
+    const auto reg = RayBindingRegisters[index];
+    if (first > reg || uint64_t(first) + count <= reg) return false;
+    auto& receipt = current.bindings[index];
+    InvalidateRayBinding(receipt); // Any covering write, including unsupported/null binds.
+    const auto image = authenticatedImage.load();
+    if (receipt.expectedSeen || !image || first != reg || count != 1 ||
+        caller != image + RayBindingReturnRvas[index]) return false;
+    receipt.expectedSeen = true;
+    uint32_t handle = 0;
+    if (!ReadEarly(uintptr_t(handles), handle) || !handle || handle > FSRD::CyberpunkRayBindings::TextureSlots)
+        return false;
+    receipt.scope = CurrentRayConstantScope();
+    receipt.handle = handle;
+    receipt.callerRva = RayBindingReturnRvas[index];
+    pending = receipt;
+    return true;
+}
+
+void CompleteRayBind(RayScope* current, size_t index, const RayBindReceipt& pending, const uint32_t* handles)
+{
+    if (rayScope != current || !current || index >= current->bindings.size()) return;
+    auto& receipt = current->bindings[index];
+    uint32_t repeated = 0;
+    if (receipt.writes != pending.writes || receipt.writes == UINT32_MAX ||
+        !receipt.expectedSeen || !ReadEarly(uintptr_t(handles), repeated) || repeated != pending.handle ||
+        CurrentRayConstantScope() != pending.scope) return;
+    receipt.valid = true;
 }
 
 void __fastcall HookUploadRayConstants(uint32_t bytes, const void* source)
@@ -1493,6 +1565,11 @@ void __fastcall HookBindTextures(uint32_t first, uint32_t count, const uint32_t*
     auto* current = lightingScope;
     uint32_t selected = 0;
     bool admitted = false;
+    auto* ray = rayScope;
+    RayBindReceipt rayPending;
+    bool rayBegun = false;
+    if (RayBindingsArmed() && stage == 2)
+        Metadata([&] { rayBegun = BeginRayBind(*ray, 0, caller, first, count, handles, rayPending); });
     if (current && !inMetadata && lightingRequested.load() && !lightingAttempted.load() &&
         stage == 1 && first <= 8 && uint64_t(first) + count > 8)
     {
@@ -1505,6 +1582,8 @@ void __fastcall HookBindTextures(uint32_t first, uint32_t count, const uint32_t*
             ReadExactMemory(uintptr_t(handles) + 3 * sizeof(uint32_t), &selected, sizeof(selected));
     }
     originalBindTextures(first, count, handles, stage); // Exactly one untouched native call.
+    if (rayBegun)
+        Metadata([&] { CompleteRayBind(ray, 0, rayPending, handles); });
     if (admitted && current == lightingScope)
     {
         uint32_t repeated = 0;
@@ -1512,6 +1591,137 @@ void __fastcall HookBindTextures(uint32_t first, uint32_t count, const uint32_t*
             sizeof(repeated)) && selected == repeated && selected && selected <= 0x8000;
         current->t8Handle = selected; current->t8BindCount = count; current->t8BindCaller = caller;
     }
+}
+
+void __fastcall HookBindUavs(uint32_t first, uint32_t count, const uint32_t* handles)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = rayScope;
+    std::array<RayBindReceipt, 2> pending {};
+    std::array<bool, 2> begun {};
+    if (RayBindingsArmed())
+        for (size_t i = 0; i < begun.size(); ++i)
+            Metadata([&] {
+                begun[i] = BeginRayBind(*current, i + 1, caller, first, count, handles, pending[i]);
+            });
+    originalBindUavs(first, count, handles); // Exact three-argument native ABI, exactly once.
+    for (size_t i = 0; i < begun.size(); ++i)
+        if (begun[i]) Metadata([&] { CompleteRayBind(current, i + 1, pending[i], handles); });
+}
+
+Json DescribeRayBinding(const FSRD::CyberpunkRayBindings::Binding& binding)
+{
+    return { { "register", binding.shaderRegister }, { "cpu_descriptor", binding.descriptor },
+        { "descriptor_index", binding.descriptorIndex }, { "map_address", binding.mapAddress },
+        { "range_index", binding.rangeIndex }, { "root_parameter", binding.rootParameter },
+        { "range_bytes", binding.range } };
+}
+
+void WINAPI HookDispatchRays(ID3D12GraphicsCommandList4* list, const D3D12_DISPATCH_RAYS_DESC* description)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = rayScope;
+    if (RayBindingsArmed() && current->dispatches < MaxRayDispatches)
+    {
+        const auto ordinal = ++current->dispatches;
+        Metadata([&] {
+            Json observation { { "schema", "optiscaler.fsr_rr.ray_dispatch_bindings.v1" },
+                { "status", "refused" }, { "scope", current->serial }, { "dispatch_ordinal", ordinal },
+                { "native_list4", uintptr_t(list) }, { "native_caller", caller },
+                { "gpu_payload_proven", false }, { "resource_readiness_proven", false },
+                { "same_frame_pairing", "not_asserted" }, { "resource_ownership", "not_acquired" },
+                { "selected_state_object", "not_observed" }, { "gpu_commands_added", false } };
+            try
+            {
+                D3D12_DISPATCH_RAYS_DESC desc {};
+                static_assert(sizeof(desc) == 104);
+                if (!ReadEarly(uintptr_t(description), desc))
+                    throw std::runtime_error("native DispatchRays description unavailable");
+                // These are GPU virtual addresses only, NEVER CPU-dereferenced.
+                observation["dispatch"] = {
+                    { "extent", { desc.Width, desc.Height, desc.Depth } },
+                    { "ray_generation", { desc.RayGenerationShaderRecord.StartAddress, desc.RayGenerationShaderRecord.SizeInBytes } },
+                    { "miss", { desc.MissShaderTable.StartAddress, desc.MissShaderTable.SizeInBytes, desc.MissShaderTable.StrideInBytes } },
+                    { "hit_group", { desc.HitGroupTable.StartAddress, desc.HitGroupTable.SizeInBytes, desc.HitGroupTable.StrideInBytes } },
+                    { "callable", { desc.CallableShaderTable.StartAddress, desc.CallableShaderTable.SizeInBytes, desc.CallableShaderTable.StrideInBytes } } };
+                const auto observed = CurrentRayConstantScope();
+                observation["current_scope"] = { { "scope", observed.serial }, { "graph_context", observed.graphContext },
+                    { "view", observed.view }, { "tls", observed.tls }, { "engine", observed.engine },
+                    { "native_list", observed.list }, { "recording_generation", observed.recordingGeneration },
+                    { "frame_source_cpu", observed.frameSource } };
+                observation["b6_upload_receipt"] = { { "phase", uint32_t(current->receipt.phase) },
+                    { "scope", current->receipt.scope.serial }, { "native_list", current->receipt.scope.list },
+                    { "recording_generation", current->receipt.scope.recordingGeneration },
+                    { "frame_source_cpu", current->receipt.scope.frameSource },
+                    { "return_rva", current->receipt.callerRva }, { "cpu_descriptor", current->receipt.descriptor } };
+                observation["original_bind_receipts"] = Json::array();
+                bool receiptsMatch = rayScope == current;
+                for (size_t i = 0; i < current->bindings.size(); ++i)
+                {
+                    const auto& binding = current->bindings[i];
+                    const bool matches = binding.valid && binding.scope == observed;
+                    receiptsMatch &= matches;
+                    observation["original_bind_receipts"].push_back({ { "register", RayBindingRegisters[i] },
+                        { "kind", i ? "UAV" : "SRV" }, { "handle", binding.handle },
+                        { "caller_rva", binding.callerRva }, { "writes_observed", binding.writes },
+                        { "expected_call_seen", binding.expectedSeen }, { "matching_scope", matches },
+                        { "scope", binding.scope.serial }, { "native_list", binding.scope.list },
+                        { "recording_generation", binding.scope.recordingGeneration },
+                        { "frame_source_cpu", binding.scope.frameSource } });
+                }
+                if (!receiptsMatch)
+                    throw std::runtime_error("original t4/u0/u8 bind receipts unavailable, overwritten, or scope changed");
+                // Check only recording safety, not resource state or GPU completion.
+                const auto identity = ListIdentity(reinterpret_cast<ID3D12GraphicsCommandList*>(observed.list));
+                {
+                    auto& data = Data();
+                    std::lock_guard lock(data.mutex);
+                    const auto found = data.lists.find(identity.Get());
+                    if (!captureTrackingValid.load() || !originalBeginRenderPass || !originalEndRenderPass ||
+                        found == data.lists.end() || !found->second.known ||
+                        found->second.generation != observed.recordingGeneration || found->second.predicated ||
+                        found->second.renderPass || found->second.queryCount)
+                        throw std::runtime_error("native ray Reset/predication/query/render-pass metadata unavailable");
+                }
+                struct Reader { bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); } } reader;
+                FSRD::CyberpunkRayBindings::Snapshot snapshot;
+                FSRD::CyberpunkRayBindings::Failure reason {};
+                const FSRD::CyberpunkRayBindings::TextureHandles handles {
+                    current->bindings[0].handle, current->bindings[1].handle, current->bindings[2].handle };
+                if (!FSRD::CyberpunkRayBindings::Observe(reader, authenticatedImage.load(), caller, uintptr_t(list),
+                        observed, current->receipt, handles, snapshot, &reason))
+                    throw std::runtime_error(std::string(FSRD::CyberpunkRayBindings::FailureName(reason)));
+                if (rayScope != current || CurrentRayConstantScope() != observed)
+                    throw std::runtime_error("native ray scope changed after descriptor observation");
+                observation["native_caller_rva"] = snapshot.callerRva;
+                observation["cache"] = snapshot.cache; observation["layout"] = snapshot.layout;
+                observation["descriptor_array"] = snapshot.descriptorArray; observation["registry"] = snapshot.registry;
+                observation["b6"] = DescribeRayBinding(snapshot.b6);
+                observation["cpu_upload"] = { { "byte_count", FSRD::CyberpunkRayConstants::PayloadBytes },
+                    { "return_rva", current->receipt.callerRva }, { "words", current->receipt.words },
+                    { "gpu_cbv_bytes_immutable", false } };
+                observation["textures"] = Json::array();
+                for (size_t i = 0; i < snapshot.textures.size(); ++i)
+                {
+                    const auto& texture = snapshot.textures[i];
+                    observation["textures"].push_back({ { "kind", i ? "UAV" : "SRV" },
+                        { "handle", texture.handle }, { "slot", texture.slot }, { "borrowed_native_address", texture.native },
+                        { "refs", texture.refs }, { "compact", texture.compact },
+                        { "requested_srv_state_metadata", texture.requestedSrvState },
+                        { "extra", texture.extra }, { "uav_array", texture.uavArray },
+                        { "binding", DescribeRayBinding(texture.binding) } });
+                }
+                observation["status"] = "original_dispatch_cpu_binding_correspondence_observed";
+            }
+            catch (const std::exception& error) { observation["reason"] = error.what(); }
+            catch (...) { observation["reason"] = "CPU binding observation threw"; }
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            if (data.rayDispatches.size() == MaxRayDispatches) data.rayDispatches.erase(data.rayDispatches.begin());
+            data.rayDispatches.push_back(std::move(observation));
+        });
+    }
+    originalDispatchRays(list, description); // Exactly one original call, including all refusals/exceptions.
 }
 
 void WINAPI HookSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
@@ -2633,6 +2843,11 @@ std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsComman
                 { "hit_encoding_cpu_word", receipt.words[FSRD::CyberpunkRayConstants::EncodingByteOffset / 4] },
                 { "write_hit_cpu_word", receipt.words[FSRD::CyberpunkRayConstants::WriteHitByteOffset / 4] } });
         }
+        plan->provenance["ray_dispatch_candidates"] = data.rayDispatches;
+        plan->provenance["ray_dispatch_observer"] = {
+            { "authenticated", rayBindingsAuthenticated.load() },
+            { "api_hook_installed", originalDispatchRays != nullptr },
+            { "status", "CPU_binding_metadata_only_not_resource_readiness" } };
     }
     plan->provenance["current_inputs"] = plan->metadata;
     plan->provenance["actual_pixel_bindings"] = plan->bindings;
@@ -3762,6 +3977,15 @@ void Initialize(bool enabled)
             {
                 originalRayNode = reinterpret_cast<FogNode>(image + FSRD::CyberpunkRayConstants::NodeRva);
                 originalUploadRayConstants = reinterpret_cast<UploadLightingConstants>(image + FSRD::CyberpunkRayConstants::UploadRva);
+                // The ordinary texture binder below will be detoured too. All
+                // these body hashes must be checked BEFORE either patch exists.
+                if (originalBindTextures && std::all_of(std::begin(FSRD::CyberpunkRayBindings::Code),
+                    std::end(FSRD::CyberpunkRayBindings::Code),
+                    [&](const auto& code) { return MatchLiveCode(image, { code.rva, code.bytes, code.sha256 }); }))
+                {
+                    originalBindUavs = reinterpret_cast<BindUavs>(image + 0x153f94);
+                    rayBindingsAuthenticated.store(true);
+                }
             }
             originalFogNode = reinterpret_cast<FogNode>(entry);
             LONG error = DetourTransactionBegin();
@@ -3778,6 +4002,8 @@ void Initialize(bool enabled)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalFullscreenHelper), HookFullscreenHelper);
                 if (error == NO_ERROR && originalBindTextures)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalBindTextures), HookBindTextures);
+                if (error == NO_ERROR && originalBindUavs)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalBindUavs), HookBindUavs);
                 if (error == NO_ERROR && originalUploadLightingConstants)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalUploadLightingConstants), HookUploadLightingConstants);
                 if (error == NO_ERROR && originalRayNode)
@@ -3796,6 +4022,8 @@ void Initialize(bool enabled)
                 originalLightingNode = nullptr;
                 originalFullscreenHelper = nullptr;
                 originalBindTextures = nullptr;
+                originalBindUavs = nullptr;
+                rayBindingsAuthenticated.store(false);
                 originalUploadLightingConstants = nullptr;
                 originalRayNode = nullptr;
                 originalUploadRayConstants = nullptr;
@@ -3874,13 +4102,57 @@ void HookDevice(ID3D12Device* device)
     LOG_INFO("[FSRRR fog probe] graphics PSO metadata hooks result={}", error);
 }
 
+// Called only with hookMutex held. The first base list may not expose List4:
+// retry optional discovery on later lists even after Draw's hook is installed.
+// Query the actual interface; never assume the base and List4 pointers coincide.
+void HookOptionalList4Metadata(ID3D12GraphicsCommandList* list)
+{
+    if (!captureEnabled.load()) return;
+    const bool needBegin = !originalBeginRenderPass, needEnd = !originalEndRenderPass;
+    const bool needRays = rayBindingsAuthenticated.load() && !originalDispatchRays;
+    if (!needBegin && !needEnd && !needRays) return;
+    ComPtr<ID3D12GraphicsCommandList4> list4;
+    if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list4)))) return;
+    auto** table4 = *reinterpret_cast<void***>(list4.Get());
+    if (needBegin) originalBeginRenderPass = reinterpret_cast<BeginRenderPass>(table4[68]);
+    if (needEnd) originalEndRenderPass = reinterpret_cast<EndRenderPass>(table4[69]);
+    // ID3D12GraphicsCommandList4's SDK member ABI; authenticated native call uses
+    // vtable+0x260. The GPU-address-bearing description is read as 104 raw bytes.
+    if (needRays) originalDispatchRays = reinterpret_cast<DispatchRays>(table4[76]);
+    LONG error = DetourTransactionBegin();
+    if (error == NO_ERROR)
+    {
+        error = DetourUpdateThread(GetCurrentThread());
+        if (error == NO_ERROR && needBegin)
+            error = DetourAttach(reinterpret_cast<PVOID*>(&originalBeginRenderPass), HookBeginRenderPass);
+        if (error == NO_ERROR && needEnd)
+            error = DetourAttach(reinterpret_cast<PVOID*>(&originalEndRenderPass), HookEndRenderPass);
+        if (error == NO_ERROR && needRays)
+            error = DetourAttach(reinterpret_cast<PVOID*>(&originalDispatchRays), HookDispatchRays);
+        if (error == NO_ERROR) error = DetourTransactionCommit();
+        else DetourTransactionAbort();
+    }
+    if (error != NO_ERROR)
+    {
+        if (needBegin) originalBeginRenderPass = nullptr;
+        if (needEnd) originalEndRenderPass = nullptr;
+        if (needRays) { originalDispatchRays = nullptr; rayBindingsAuthenticated.store(false); }
+        if (needBegin || needEnd) captureTrackingValid.store(false);
+    }
+    LOG_INFO("[FSRRR ray bindings] optional List4 metadata hooks result={} DispatchRays={}", error,
+             originalDispatchRays != nullptr);
+}
+
 void HookCommandList(ID3D12GraphicsCommandList* list)
 {
     if (!active.load() || !list)
         return;
     std::lock_guard lock(hookMutex);
     if (originalDraw)
+    {
+        HookOptionalList4Metadata(list);
         return;
+    }
     auto** table = *reinterpret_cast<void***>(list);
     originalSetPso = reinterpret_cast<SetPso>(table[25]);
     originalSetRtv = reinterpret_cast<SetRtv>(table[46]);
@@ -3968,5 +4240,6 @@ void HookCommandList(ID3D12GraphicsCommandList* list)
         captureTrackingValid.store(false);
     }
     LOG_INFO("[FSRRR fog probe] command-list metadata hooks result={}", error);
+    if (error == NO_ERROR) HookOptionalList4Metadata(list);
 }
 } // namespace FSRDCyberpunkFogProbe

@@ -839,6 +839,12 @@
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayBindings.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkMotionScale.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkResetCamera.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\ffx\FSRDPrivateDenoise.h">
       <Filter>Header Files</Filter>
     </ClInclude>
