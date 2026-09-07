@@ -183,7 +183,43 @@ int main(){
   if(bad==3)q.direct=false;
   if(bad==4)f=UINT32_MAX-30;
   Window w(e,q,f);assert(w.Stopped()&&!w.Complete()&&!w.ClaimRole(f,Role::Ray).Valid());}
- std::cout<<"32-frame value routing, actual-return demux and durable tombstones passed\n";
+ // Long visual pass: one source sequence, no final dump, stable keys, bounded
+ // scanning only after BOTH authenticated newer list Resets and actual returns.
+ {Window w(epoch,queue,first,Window::VisualFrameCount);
+  for(unsigned i=0;i<Window::VisualFrameCount;++i){
+   const Recording p{100,10+uint64_t(i)*2},c{101,11+uint64_t(i)*2};
+   const auto key=producers(w,i,p);assert(key.frameCount==18000&&!key.CaptureFinal());fog(w,i,c);
+   assert(!w.RetireSubmissionWatch(key,{100,p.generation+2},{101,c.generation+2}));
+   auto s=submit(w,{p,c});assert(s.allowed);commit(w,key,s.receipt);
+   const auto count=w.SubmissionWatches();assert(count==1);
+   assert(!w.RetireSubmissionWatch(key,p,{101,c.generation+2})); // One Reset is insufficient.
+   assert(!w.RetireSubmissionWatch(key,{100,p.generation+2},c));
+   assert(!w.RetireSubmissionWatch(key,{100,0},{101,c.generation+2}));
+   assert(!w.RetireSubmissionWatch(key,{999,p.generation+2},{101,c.generation+2}));
+   auto forged=key;forged.frameCount=32;assert(!w.RetireSubmissionWatch(forged,{100,p.generation+2},{101,c.generation+2}));
+   assert(w.RetireSubmissionWatch(key,{100,p.generation+2},{101,c.generation+2}));
+   assert(!w.RetireSubmissionWatch(key,{100,p.generation+2},{101,c.generation+2}));
+   assert(w.SubmissionWatches()==0&&w.ConsumerReturned(key)&&w.ConsumerEmbedded(key));
+   assert(!w.Stopped()&&w.CommittedFrames()==i+1);
+  }
+  assert(w.Complete());
+ }
+ // Unknown/unreset lists never get evicted merely to keep a visual pass running.
+ {Window w(epoch,queue,first,Window::VisualFrameCount);
+  for(unsigned i=0;i<Window::MaxVisualWatches;++i){auto key=producers(w,i);fog(w,i);
+   auto s=submit(w,{producer(i),consumer(i)});assert(s.allowed);commit(w,key,s.receipt);}
+  assert(w.SubmissionWatches()==Window::MaxVisualWatches);
+  assert(!w.ClaimRole(first+Window::MaxVisualWatches,Role::Ray).Valid()&&w.Stopped());
+  auto duplicate=submit(w,{consumer(0)});assert(!duplicate.allowed); // Retained duplicate guard.
+ }
+ {Window w(epoch,queue,first,Window::VisualFrameCount);auto key=producers(w,0);fog(w,0);
+  auto s=submit(w,{producer(0),consumer(0)});commit(w,key,s.receipt);
+  assert(!submit(w,{producer(0)}).allowed); // Before either Reset, duplicates still refuse.
+ }
+ for(auto count:{0u,31u,33u,17999u,18001u,UINT32_MAX}){
+  Window w(epoch,queue,first,count);assert(w.Stopped()&&!w.ClaimRole(first,Role::Ray).Valid());}
+ {Window w(epoch,queue,UINT32_MAX-17998,18000);assert(w.Stopped());}
+ std::cout<<"32-frame control and 18000-frame visual routing, actual-return demux and guarded watch retirement passed\n";
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-temporal-window-") as directory:

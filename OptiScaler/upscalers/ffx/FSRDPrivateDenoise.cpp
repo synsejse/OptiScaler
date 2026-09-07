@@ -409,7 +409,7 @@ std::shared_ptr<Session> CreateSession(ID3D12Device* device, const SessionDesc& 
     if (error) *error = "";
     try
     {
-        Require(device && description.epoch && description.frameLimit && description.frameLimit <= 32,
+        Require(device && description.epoch && description.frameLimit && description.frameLimit <= SessionDesc::MaxFrames,
                 "invalid session device/epoch/frame limit");
         ValidateContext(description.maxRenderSize, description.settings);
         auto data = std::make_unique<Session::Impl>();

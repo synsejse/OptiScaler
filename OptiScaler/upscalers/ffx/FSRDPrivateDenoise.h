@@ -36,7 +36,8 @@ struct SessionDesc
     uint64_t providerId = 0;
     DenoiserSettings settings {};
     uint64_t epoch = 0; // Caller-owned, nonzero software-session epoch, not a native view identity.
-    uint32_t frameLimit = 32; // One through 32 successful acknowledgements; never wraps/restarts.
+    static constexpr uint32_t MaxFrames = 18000;
+    uint32_t frameLimit = 32; // Bounded visual pass; never wraps/restarts or periodically resets history.
 };
 
 struct FrameAdmission

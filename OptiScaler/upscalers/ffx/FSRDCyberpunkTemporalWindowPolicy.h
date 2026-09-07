@@ -4,6 +4,8 @@
 #include <array>
 #include <limits>
 #include <optional>
+#include <algorithm>
+#include <vector>
 
 namespace FSRD::CyberpunkTemporalWindowPolicy
 {
@@ -24,8 +26,10 @@ struct FrameKey
 {
     uint64_t epoch = 0;
     uint32_t index = 32, frame = 0;
-    constexpr bool Valid() const noexcept { return epoch && index < 32; }
-    constexpr bool CaptureFinal() const noexcept { return Valid() && index == 31; }
+    uint32_t frameCount = 32;
+    constexpr bool Valid() const noexcept { return epoch && (frameCount == 32 || frameCount == 18000) && index < frameCount; }
+    // The visual pass has no automatic readbacks, including at its last frame.
+    constexpr bool CaptureFinal() const noexcept { return Valid() && frameCount == 32 && index == 31; }
     bool operator==(const FrameKey&) const = default;
 };
 
@@ -53,7 +57,7 @@ struct ReturnDecision
     uint32_t producersReturned = 0;
 };
 
-// Value-only routing for ONE explicit 32-frame experiment. Host serializes every
+// Value-only routing for ONE explicit bounded experiment. Host serializes every
 // method with its window lock, never held across native Execute/provider calls.
 // The caller authenticates epoch, actual source frames, canonical same-device
 // DIRECT queue, list/Reset generations, full intra-frame camera equality, actual
@@ -65,19 +69,24 @@ class Window
 {
   public:
     static constexpr uint32_t FrameCount = 32;
+    static constexpr uint32_t VisualFrameCount = 18000;
+    static constexpr size_t MaxVisualWatches = 64;
     // Only current and one producer look-ahead frame can acquire roles. Four is
     // a conservative bound on outstanding related native calls, not a D3D limit.
     static constexpr size_t MaxPendingCalls = 4, MaxFramesPerCall = 2;
 
-    Window(uint64_t epoch, Queue queue, uint32_t observedFirstFrame) noexcept
-        : _epoch(epoch), _queue(queue), _first(observedFirstFrame)
+    Window(uint64_t epoch, Queue queue, uint32_t observedFirstFrame, uint32_t frameCount = FrameCount)
+        : _epoch(epoch), _queue(queue), _first(observedFirstFrame), _frameCount(frameCount)
     {
         if (!epoch || !queue.queue || !queue.device || !queue.direct ||
-            observedFirstFrame > std::numeric_limits<uint32_t>::max() - (FrameCount - 1))
+            (frameCount != FrameCount && frameCount != VisualFrameCount) ||
+            observedFirstFrame > std::numeric_limits<uint32_t>::max() - (frameCount - 1))
         {
             StopWith(Failure::InvalidWindow);
             return;
         }
+        _frames = std::vector<Frame>(frameCount); // Never resized: keys/receipts cannot refer to reused slots.
+        _watches.reserve(frameCount == FrameCount ? FrameCount : MaxVisualWatches);
         for (auto& frame : _frames) frame.policy.emplace(queue.device);
         _valid = true;
     }
@@ -89,7 +98,7 @@ class Window
     // current frame. New Fog consumers cannot enter the look-ahead slot.
     FrameKey ClaimRole(uint32_t actualFrame, Role role) noexcept
     {
-        if (!_valid || actualFrame < _first || uint64_t(actualFrame) - _first >= FrameCount)
+        if (!_valid || actualFrame < _first || uint64_t(actualFrame) - _first >= _frameCount)
         { StopWith(Failure::InvalidFrame); return {}; }
         const uint32_t index = actualFrame - _first;
         const auto bit = RoleBit(role);
@@ -104,6 +113,12 @@ class Window
         // roles of an already-started frame to close an existing obligation.
         // Never drop an embedded read merely because a later frame was refused.
         if (_stopped && (!frame.roles || role == Role::Fog)) return {};
+        if (!frame.roles)
+        {
+            if (_frameCount == VisualFrameCount && _watches.size() == MaxVisualWatches)
+            { StopWith(Failure::ReceiptCapacity); return {}; }
+            _watches.push_back(index); // Capacity reserved before any native recording.
+        }
         frame.roles |= bit;
         return Key(index);
     }
@@ -113,6 +128,7 @@ class Window
         auto* frame = Find(key);
         if (!frame || !(frame->roles & RoleBit(Role::Ray))) return MissingRole();
         if (!frame->policy->DeclareProducer(recording)) return RefuseFrame(*frame);
+        frame->producer = recording;
         return true;
     }
     bool SealProducer(FrameKey key, const ProducerSeal& seal) noexcept
@@ -129,6 +145,7 @@ class Window
         if (_stopped) return false;
         if (key.index != _committed) { StopWith(Failure::ConsumerNotCurrent); return false; }
         if (!frame->policy->EmbedConsumer(recording, firstReadOrdinal, ownersRetained)) return RefuseFrame(*frame);
+        frame->consumer = recording;
         return true;
     }
     bool SealConsumer(FrameKey key, Recording recording, uint64_t terminalOrdinal, bool succeeded,
@@ -151,7 +168,7 @@ class Window
         if (recordings.size() > FramePolicy::Policy::MaxExecuteLists)
             return RejectSubmission(Failure::FramePolicyRefused, FramePolicy::Failure::ArrayTooLarge);
         Call call;
-        for (uint32_t index = 0; index < FrameCount; ++index)
+        for (const uint32_t index : _watches)
         {
             auto& frame = _frames[index];
             if (!frame.roles) continue;
@@ -166,7 +183,7 @@ class Window
         for (auto& pending : _calls)
         {
             if (pending.receipt.Valid()) continue;
-            // At most two related submissions per each of32 non-reusable frame
+            // At most two related submissions per each bounded non-reusable frame
             // policies; serial cannot approach uint64 overflow in a valid window.
             call.receipt = { _epoch, ++_nextCall, _queue.queue };
             pending = call;
@@ -224,7 +241,7 @@ class Window
         StopWith(Failure::FrameFailed);
     }
     bool Stopped() const noexcept { return _stopped; }
-    bool Complete() const noexcept { return !_stopped && _committed == FrameCount; } // Not GPU completion.
+    bool Complete() const noexcept { return !_stopped && _committed == _frameCount; } // Not GPU completion.
     uint32_t CommittedFrames() const noexcept { return _committed; }
     Failure LastFailure() const noexcept { return _failure; }
     bool ConsumerEmbedded(FrameKey key) const noexcept
@@ -236,6 +253,31 @@ class Window
     bool FrameFailed(FrameKey key) const noexcept
     { const auto* frame = FindConst(key); return !frame || frame->policy->Failed(); }
 
+    // HOST ATTESTATION: both identities have a known, newer successful native
+    // Reset. Old commands no longer exist on either list. This only stops
+    // scanning an obsolete recording, never deletes a packet/policy or retires
+    // GPU resources. The host separately requires its final fence and preserves
+    // all CPU packet addresses for the bounded visual pass. Unknown generations,
+    // one-sided Reset and outstanding return receipts retain the watch.
+    bool RetireSubmissionWatch(FrameKey key, Recording producer, Recording consumer) noexcept
+    {
+        const auto* frame = FindConst(key);
+        if (_frameCount != VisualFrameCount || !frame || key.index >= _committed || frame->policy->Failed() ||
+            !frame->policy->ProducerReturned() || !frame->policy->ConsumerReturned() ||
+            !producer.Valid() || !consumer.Valid() || producer.list != frame->producer.list ||
+            consumer.list != frame->consumer.list || producer.generation <= frame->producer.generation ||
+            consumer.generation <= frame->consumer.generation) return false;
+        for (const auto& call : _calls)
+            if (call.receipt.Valid())
+                for (uint32_t i = 0; i < call.count; ++i)
+                    if (call.entries[i].index == key.index) return false;
+        const auto found = std::find(_watches.begin(), _watches.end(), key.index);
+        if (found == _watches.end()) return false;
+        _watches.erase(found);
+        return true;
+    }
+    size_t SubmissionWatches() const noexcept { return _watches.size(); }
+
   private:
     static constexpr uint8_t RoleBit(Role role) noexcept
     { return role == Role::Ray ? 1 : role == Role::Guides ? 2 : role == Role::Fog ? 4 : 0; }
@@ -243,6 +285,7 @@ class Window
     struct Frame
     {
         std::optional<FramePolicy::Policy> policy;
+        Recording producer {}, consumer {};
         uint8_t roles = 0;
     };
     struct Call
@@ -252,10 +295,10 @@ class Window
         std::array<Entry, MaxFramesPerCall> entries {};
         uint32_t count = 0;
     };
-    FrameKey Key(uint32_t index) const noexcept { return { _epoch, index, _first + index }; }
+    FrameKey Key(uint32_t index) const noexcept { return { _epoch, index, _first + index, _frameCount }; }
     const Frame* FindConst(FrameKey key) const noexcept
     {
-        return _valid && key.epoch == _epoch && key.index < FrameCount && key.frame == _first + key.index &&
+        return _valid && key.epoch == _epoch && key.frameCount == _frameCount && key.index < _frameCount && key.frame == _first + key.index &&
             _frames[key.index].roles ? &_frames[key.index] : nullptr;
     }
     Frame* Find(FrameKey key) noexcept
@@ -290,10 +333,11 @@ class Window
 
     uint64_t _epoch = 0, _nextCall = 0;
     Queue _queue {};
-    uint32_t _first = 0, _committed = 0;
+    uint32_t _first = 0, _committed = 0, _frameCount = FrameCount;
     bool _valid = false, _stopped = false;
     Failure _failure = Failure::None;
-    std::array<Frame, FrameCount> _frames {};
+    std::vector<Frame> _frames;
+    std::vector<uint32_t> _watches;
     std::array<Call, MaxPendingCalls> _calls {};
 };
 } // namespace FSRD::CyberpunkTemporalWindowPolicy

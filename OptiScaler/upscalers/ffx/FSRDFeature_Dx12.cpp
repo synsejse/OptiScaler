@@ -634,7 +634,14 @@ void FSRDFeatureDx12::PollPreFogExperiments()
         if (_denoiser.IsCreated())
             FSRDCyberpunkFogProbe::ArmRgbIdentity(Device, RenderWidth(), RenderHeight());
         if (_denoiser.IsCreated())
-            FSRDCyberpunkFogProbe::PollTemporalWindow(Device, RenderWidth(), RenderHeight());
+        {
+            const FSRD::DenoiserSettings settings {
+                cfg.FfxDenoiserCrossBlNormStr.value_or_default(), cfg.FfxDenoiserStabilityBias.value_or_default(),
+                cfg.FfxDenoiserMaxRadiance.value_or_default(), cfg.FfxDenoiserRadianceClip.value_or_default(),
+                cfg.FfxDenoiserGaussKernRelax.value_or_default(), cfg.FfxDenoiserDisocclusionThreshold.value_or_default()
+            };
+            FSRDCyberpunkFogProbe::PollTemporalWindow(Device, RenderWidth(), RenderHeight(), _denoiserProviderId, &settings);
+        }
     }
 }
 

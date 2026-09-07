@@ -76,7 +76,10 @@ class PrivateDenoise(unittest.TestCase):
     def test_compiled_persistent_session_order_lifetime_and_refusals(self):
         self._compile_work(temporal=True)
 
-    def _compile_work(self, temporal=False):
+    def test_compiled_visual_pass_one_context_18000_frames_no_periodic_reset(self):
+        self._compile_work(temporal=True, visual=True)
+
+    def _compile_work(self, temporal=False, visual=False):
         compiler = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++')
         if not compiler:
             self.skipTest('Set CXX for actual private Work mock compilation')
@@ -355,7 +358,7 @@ int main(){
  auto create=[&]{const char* error=nullptr;auto s=CreateSession(device.Get(),desc,&error);
   assert(s && error && !*error && !s->Stopped() && !s->Complete());return s;};
  for(unsigned kind=0;kind<6;++kind){auto d=desc;
-  if(kind==0)d.epoch=0;if(kind==1)d.frameLimit=0;if(kind==2)d.frameLimit=33;
+  if(kind==0)d.epoch=0;if(kind==1)d.frameLimit=0;if(kind==2)d.frameLimit=SessionDesc::MaxFrames+1;
   if(kind==3)d.maxRenderSize={};if(kind==4)d.settings.maxRadiance=0;if(kind==5)d.providerId=43;
   const char* error=nullptr;assert(!CreateSession(device.Get(),d,&error)&&error&&*error&&!Fake::contexts);
  }
@@ -364,7 +367,7 @@ int main(){
   const auto dispatches=Fake::dispatches,destroys=Fake::destroys;auto s=create();
   assert(Fake::creates==creations+1&&Fake::defaultQueries==queries+6&&Fake::configurationCalls==configs+1);
   std::shared_ptr<Work> previous;
-  for(unsigned i=0;i<32;++i){const auto q=parameters(i);const char* error=nullptr;
+  for(unsigned i=0;i<desc.frameLimit;++i){const auto q=parameters(i);const char* error=nullptr;
    auto w=PrepareFrame(s,q,admission,&error);assert(w&&error&&!*error);
    assert(w->EffectiveParameters().dispatch.flags==q.dispatch.flags&&w->EffectiveParameters().conversion.Flags==q.conversion.Flags);
    assert(w->EffectiveParameters().dispatch.frameIndex==q.dispatch.frameIndex);
@@ -383,9 +386,9 @@ int main(){
    assert(s->AcknowledgedFrames()==i+1&&!s->Stopped());
    previous.reset();previous=w;FSRDSubmission::pending.reset();
   }
-  assert(s->Complete()&&!PrepareFrame(s,parameters(32),admission)&&!s->Stopped());
+  assert(s->Complete()&&!PrepareFrame(s,parameters(desc.frameLimit),admission)&&!s->Stopped());
   assert(Fake::creates==creations+1&&Fake::defaultQueries==queries+6&&Fake::configurationCalls==configs+1);
-  assert(Fake::dispatches==dispatches+32);
+  assert(Fake::dispatches==dispatches+desc.frameLimit);
   for(auto* identity:Fake::dispatchedContexts)assert(identity==Fake::dispatchedContexts.front());
   previous.reset();assert(Fake::contexts==1);s.reset();assert(!Fake::contexts&&Fake::destroys==destroys+1);
  }
@@ -470,6 +473,11 @@ int main(){
 }
 '''
             harness = '#include <thread>\n' + harness
+            if visual:
+                # Same real Work/provider/ownership assertions, extended for the visual cap.
+                harness = harness.replace('SessionDesc desc{p.maxRenderSize,p.providerId,p.settings,77,32};',
+                                          'SessionDesc desc{p.maxRenderSize,p.providerId,p.settings,77,18000};')
+                harness = harness.replace('17.25f+float(ordinal)*.01f', '17.25f+float(ordinal%32)*.01f')
         with tempfile.TemporaryDirectory(prefix='fsrd-private-denoise-') as directory:
             tmp = Path(directory)
             files = {'pch.h': '#pragma once\n#include "d3d12.h"\n', 'd3d12.h': windows,

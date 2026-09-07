@@ -39,7 +39,7 @@ class TemporalHost(unittest.TestCase):
                                      ('void ArmRgbIdentity(', 'void ArmPrivateReset(')]:
             self.assertGreaterEqual(section(signature, following).count('TemporalRecordingRequested()'), 2)
         feature = (BASE / 'FSRDFeature_Dx12.cpp').read_text()
-        self.assertIn('FSRDCyberpunkFogProbe::PollTemporalWindow(Device, RenderWidth(), RenderHeight())', feature)
+        self.assertIn('FSRDCyberpunkFogProbe::PollTemporalWindow(Device, RenderWidth(), RenderHeight(), _denoiserProviderId, &settings)', feature)
 
     def test_raw_producers_real_fog_clock_and_owned_history(self):
         bind = section('void WINAPI HookSetRtv(', 'void LogDraw(')
@@ -124,7 +124,7 @@ class TemporalHost(unittest.TestCase):
         compiler = os.environ.get('CXX') or shutil.which('c++')
         if not compiler:
             self.skipTest('Set CXX for compiled temporal host checks')
-        functions = section('uint64_t AdmitTemporalSubmission(', '} // namespace\n\nvoid PollTemporalWindow(')
+        functions = section('uint64_t AdmitTemporalSubmission(', '} // namespace\n\nTemporalTestStatus GetTemporalTestStatus(')
         mocks = r'''
 #include "FSRDCyberpunkTemporalWindowPolicy.h"
 #include "FSRDCyberpunkTemporalCamera.h"
@@ -139,6 +139,8 @@ class TemporalHost(unittest.TestCase):
 #include <string>
 #include <unordered_map>
 using UINT=unsigned;using HRESULT=int;using Json=nlohmann::json;
+std::atomic<uint64_t> temporalLastReturn{0};
+uint64_t GetTickCount64(){return 1000;}
 #define FAILED(x) ((x)<0)
 #define IID_PPV_ARGS(x) (x)
 #define LOG_INFO(...) ((void)0)
@@ -177,6 +179,7 @@ struct PrivateResetPacket{
  std::optional<ResetSource::TemporalSource> timedSource;
  float delta=16;double fogTimestamp=100,previousFogTimestamp=84;};
 struct TemporalWindow{
+ bool visual=false;
  std::mutex mutex;uint64_t epoch=7,warmupSerial=0;bool warmupReturned=false;std::atomic<bool> stopped{false};
  ComPtr<IUnknown> deviceIdentity,queueIdentity;ResetPolicy::Recording warmupRecording{};
  WindowPolicy::Receipt pendingWarmup{};
@@ -310,6 +313,7 @@ struct PrivateResetPacket{explicit PrivateResetPacket(uintptr_t){}
 struct TemporalWindow{
  std::mutex mutex;ComPtr<ID3D12Device> device;ComPtr<IUnknown> deviceIdentity,queueIdentity;
  UINT width=1280,height=720;uint64_t epoch=8,provider=1;int settings=0;
+ uint32_t frameCount=32;std::vector<PrivateResetPacket*> liveFrames;
  uint32_t warmupSkippedThrough=0;
  bool warmupReturned=true,stopped=false,finalCaptureQueued=false;
  std::optional<ResetSource::RawSource> lastFog=ResetSource::RawSource{};

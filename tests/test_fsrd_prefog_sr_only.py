@@ -135,13 +135,18 @@ struct ID3D12GraphicsCommandList{};struct ID3D12Resource{};
 int memcpy_s(void* dst,size_t cap,const void* src,size_t size){assert(cap>=size);std::memcpy(dst,src,size);return 0;}
 template<class T>struct Option{T v{};T value_or_default()const{return v;}void set_volatile_value(T x){v=x;}};
 struct Config{
+ Option<float> FfxDenoiserCrossBlNormStr{1},FfxDenoiserStabilityBias{1},FfxDenoiserMaxRadiance{65504},
+ FfxDenoiserRadianceClip{50},FfxDenoiserGaussKernRelax{0},FfxDenoiserDisocclusionThreshold{.01f};
  Option<bool> FfxDenoiserCyberpunkFogProbe{true},FfxDenoiserCyberpunkFogCapture{true},FsrUseFsrInputValues{},RcasEnabled{true},OutputScalingEnabled{true};
  static Config* Instance(){static Config c;return &c;}
 };
 namespace Util{inline double now=100;double MillisecondsNow(){return now;}}
+namespace FSRD{struct DenoiserSettings{float crossBilateralNormalStrength,stabilityBias,maxRadiance,
+ radianceClipStdK,gaussianKernelRelaxation,disocclusionThreshold;};}
 namespace FSRDCyberpunkFogProbe{inline int resets=0,identities=0,temporal=0;
 void ArmPrivateReset(void*,unsigned,unsigned){++resets;}void ArmRgbIdentity(void*,unsigned,unsigned){++identities;}
-void PollTemporalWindow(void*,unsigned,unsigned){++temporal;}}
+void PollTemporalWindow(void*,unsigned,unsigned,uint64_t provider,const FSRD::DenoiserSettings* settings){
+ assert(provider==42&&settings&&settings->maxRadiance==65504);++temporal;}}
 struct NVSDK_NGX_Parameter{
  std::array<float,16> projection{1.3f,0,0,0,0,2.2f,0,0,0,0,1.000001f,1,0,0,-.02f,0};
  bool hasProjection=true,hasDelta=true,hasExplicit=false,failBefore=false,failAfter=false,throws=false;
@@ -166,6 +171,7 @@ struct FFXFeatureDx12{
  }
 };
 struct FSRDFeatureDx12:FFXFeatureDx12{
+ uint64_t _denoiserProviderId=42;
  FSRD::PreFogSession::LateSrHistory _preFogSrHistory;bool _preFogSrScalarOverride=false,_preFogSrGameReset=false;
  bool _loggedPreFogRoute=false,_loggedPreFogScalarFailure=false,_frameShowNativeDebug=true;
  bool _hasCameraHistory=true,_isInReset=false,_diagnosticUpscaleReset=false,inited=true;

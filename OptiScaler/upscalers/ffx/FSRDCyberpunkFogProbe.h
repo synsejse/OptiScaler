@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 
+namespace FSRD { struct DenoiserSettings; }
+
 // Research-only probe for one authenticated Cyberpunk executable. Metadata-only
 // unless the separate CyberpunkFogCapture INI opt-in AND an explicit one-shot
 // capture/control marker are present. FSRRR-fog-capture.request copies the original
@@ -35,11 +37,20 @@ void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept;
 // denoised scene substitution, or change to the ordinary late RR/SR route.
 void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept;
 // Explicit disabled-by-default FSRRR-prefog-temporal.request experiment: one
-// persistent Session, at most 32 consecutive native source frames, first RESET
+// persistent Session: 32-frame capture or 18000-frame visual pass, first RESET
 // then owned previous camera. Requires restart-fixed late SR. Timing is the
 // selected original Fog draw CPU interval, not an authenticated engine delta.
 // Poll also retires fence-complete owners; it never waits or enables a fallback.
-void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height) noexcept;
+void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t provider = 0,
+                        const FSRD::DenoiserSettings* settings = nullptr) noexcept;
+enum class TemporalTestPhase : uint8_t { Unavailable, Ready, Requested, Refused, Warmup, Active, Stalled, Stopped, Complete };
+struct TemporalTestStatus
+{
+    TemporalTestPhase phase = TemporalTestPhase::Unavailable;
+    uint32_t frames = 0, limit = 0;
+};
+TemporalTestStatus GetTemporalTestStatus() noexcept;
+bool RequestVisualTest() noexcept; // GUI requests only; native/provider work stays on the feature caller.
 // Mandatory dependency veto BEFORE both native Execute branches and their
 // FSRDSubmission::Preparing calls. A refusal terminates this authenticated game
 // diagnostic, never drops a native list or pretends that submission succeeded.

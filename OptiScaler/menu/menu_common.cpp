@@ -21,6 +21,7 @@
 #include <upscalers/ffx/FSRDResearchCapture.h>
 #include <upscalers/ffx/FSRDDiagnostics.h>
 #include <upscalers/ffx/FSRDPreFogSession.h>
+#include <upscalers/ffx/FSRDCyberpunkFogProbe.h>
 
 #include <imgui/imgui_internal.h>
 #include <imgui/ImGuiNotify.hpp>
@@ -2827,9 +2828,33 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
         {
             if (FSRD::PreFogSession::LateSrOnly())
             {
-                ImGui::TextWrapped("Pre-Fog experiment: late SR only. Early denoising runs only during explicit bounded tests.");
-                ShowHelpMarker("Outside the one-frame or 32-frame early test, frames remain noisy.\n"
-                               "No late denoiser fallback; RR debug controls are inactive. Restart to change this route.");
+                using Phase = FSRDCyberpunkFogProbe::TemporalTestPhase;
+                const auto test = FSRDCyberpunkFogProbe::GetTemporalTestStatus();
+                const char* text = "Not active - late SR only";
+                switch (test.phase)
+                {
+                case Phase::Requested: text = "Start requested - late SR only"; break;
+                case Phase::Warmup: text = "Waiting for native scene - late SR only"; break;
+                case Phase::Active: text = "ACTIVE - AMD denoising before original fog"; break;
+                case Phase::Stalled: text = "No recent denoised frame - paused or stalled"; break;
+                case Phase::Stopped: text = "STOPPED - late SR only; restart required"; break;
+                case Phase::Complete: text = "Test finished - late SR only"; break;
+                case Phase::Refused: text = "Start refused - check log; restart required"; break;
+                default: break;
+                }
+                const ImVec4 color = test.phase == Phase::Active ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) :
+                    (test.phase == Phase::Stopped || test.phase == Phase::Refused) ? ImVec4(1.0f, 0.4f, 0.3f, 1.0f) :
+                    ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
+                ImGui::TextColored(color, "Pre-Fog: %s", text);
+                if (test.limit) ImGui::Text("Denoised frames: %u / %u", test.frames, test.limit);
+                ImGui::BeginDisabled(test.phase != Phase::Ready);
+                if (ImGui::Button("Start pre-Fog visual test")) FSRDCyberpunkFogProbe::RequestVisualTest();
+                ImGui::EndDisabled();
+                ShowHelpMarker("Load a save first. Runs one AMD history for up to 18,000 frames (5 min at 60 FPS).\n"
+                               "No automatic buffer dumps. Current provider/settings are fixed when started.\n"
+                               "Scene loads, native resets, or size changes stop this experimental pass.\n"
+                               "Outside an ACTIVE test: late SR only, no AMD denoising or late RR fallback.\n"
+                               "RR debug controls do not change this test. Restart the game to test again.");
             }
             if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())
             {
