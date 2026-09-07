@@ -7,11 +7,12 @@
 
 namespace FSRD { struct DenoiserSettings; }
 
-// Research-only probe for one authenticated Cyberpunk executable. Metadata-only
+// Probe and pre-Fog insertion for one authenticated Cyberpunk executable. Metadata-only
 // unless the separate CyberpunkFogCapture INI opt-in AND an explicit one-shot
 // capture/control marker are present. FSRRR-fog-capture.request copies the original
 // target and repeats the authenticated shader only against a private RGBA target;
-// it does not implement a fog correction or change the normal RR input mapping.
+// The separate restart-fixed CyberpunkPreFog option enables continuous insertion
+// before original fog; it does not rewrite the normal NGX RR input mapping.
 // Initialize at device setup, never under DllMain's loader lock. Once installed,
 // the hooks remain until process exit; changing the opt-in requires a restart.
 // Creating FSRRR-fog-probe.request beside the game exe re-arms the first-32-draw
@@ -41,13 +42,17 @@ void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept;
 // then owned previous camera. Requires restart-fixed late SR. Timing is the
 // selected original Fog draw CPU interval, not an authenticated engine delta.
 // Poll also retires fence-complete owners; it never waits or enables a fallback.
+// In CyberpunkPreFog mode it starts automatically with 64 reusable CPU slots,
+// no frame limit/readbacks, and new histories only after a drained scene change.
 void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t provider = 0,
                         const FSRD::DenoiserSettings* settings = nullptr) noexcept;
-enum class TemporalTestPhase : uint8_t { Unavailable, Ready, Requested, Refused, Warmup, Active, Stalled, Stopped, Complete };
+enum class TemporalTestPhase : uint8_t { Unavailable, Ready, Requested, Refused, Warmup, Active, Stalled, Stopped, Complete, Restarting };
 struct TemporalTestStatus
 {
     TemporalTestPhase phase = TemporalTestPhase::Unavailable;
     uint32_t frames = 0, limit = 0;
+    uint64_t epoch = 0;
+    uint32_t retainedFrames = 0;
 };
 TemporalTestStatus GetTemporalTestStatus() noexcept;
 bool RequestVisualTest() noexcept; // GUI requests only; native/provider work stays on the feature caller.

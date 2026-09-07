@@ -6,6 +6,8 @@
 #include <memory>
 #include <string_view>
 
+namespace FSRDSubmission { struct Ticket; }
+
 namespace FSRD::PrivateRayCopy
 {
 // Index 0 is motion, index 1 is hit distance. The narrow supported native formats
@@ -54,6 +56,7 @@ class Work
     bool Recorded() const noexcept;
     std::string_view Error() const noexcept;
     const Textures& Outputs() const noexcept;
+    std::shared_ptr<FSRDSubmission::Ticket> CompletionTicket() const noexcept;
 
   private:
     struct Impl;

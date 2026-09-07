@@ -284,6 +284,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             FfxDenoiserCyberpunkFogProbe.set_from_config(readBool("FSR-RR", "CyberpunkFogProbe"));
             FfxDenoiserCyberpunkFogCapture.set_from_config(readBool("FSR-RR", "CyberpunkFogCapture"));
             FfxDenoiserCyberpunkPreFogExperiment.set_from_config(readBool("FSR-RR", "CyberpunkPreFogExperiment"));
+            FfxDenoiserCyberpunkPreFog.set_from_config(readBool("FSR-RR", "CyberpunkPreFog"));
             FfxDenoiserDisocclusionThreshold.set_from_config(
                 readFloat("FSR-RR", "DisocclusionThreshold"));
             FfxDenoiserCrossBlNormStr.set_from_config(readFloat("FSR-RR", "CrossBilateralNormalStrength"));
@@ -1148,6 +1149,8 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->FfxDenoiserCyberpunkFogCapture.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "CyberpunkPreFogExperiment",
                      GetBoolValue(Instance()->FfxDenoiserCyberpunkPreFogExperiment.value_for_config()).c_str());
+        ini.SetValue("FSR-RR", "CyberpunkPreFog",
+                     GetBoolValue(Instance()->FfxDenoiserCyberpunkPreFog.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "DisocclusionThreshold",
                      GetFloatValue(Instance()->FfxDenoiserDisocclusionThreshold.value_for_config()).c_str());
         ini.SetValue("FSR-RR", "CrossBilateralNormalStrength",

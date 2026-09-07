@@ -20,19 +20,19 @@ def section(first, following):
 
 class VisualTest(unittest.TestCase):
     def test_bounded_owners_final_fence_and_no_visual_disk_capture(self):
-        window = section('struct TemporalWindow\n', 'std::atomic<TemporalWindow*>')
-        self.assertIn('std::vector<std::unique_ptr<PrivateResetPacket>> frames', window)
+        window = section('struct TemporalWindow\n', 'auto& temporalWindow')
+        self.assertIn('std::vector<std::shared_ptr<PrivateResetPacket>> frames', window)
         self.assertIn('std::array<Json, 32> ledger', window)
         retirement = section('void RetireVisualWatch(', 'void MaintainTemporalWindow(')
         self.assertNotRegex(retirement, r'window\.frames\.(clear|erase|resize|reset)\(')
-        self.assertNotIn('.reset()', retirement)
+        self.assertIn('if (window.continuous) slot.reset()', retirement)
         self.assertIn('std::erase(window.liveFrames, &frame)', retirement)
-        self.assertIn('!frame.retired || !frame.returned', retirement)
+        self.assertIn('!frame.retired || (!frame.returned && !frame.unusedProducer)', retirement)
         self.assertIn('!window.returnEvidencePending', retirement)
         maintain = section('void MaintainTemporalWindow(', 'uint64_t AdmitTemporalSubmission(')
         self.assertLess(maintain.index('FSRDSubmission::Complete(ticket)'), maintain.index('frame->retired = true'))
         self.assertLess(maintain.index('frame->retired = true'), maintain.index('RetireVisualWatch(window, *frame)'))
-        self.assertIn('frames = window.liveFrames', maintain)
+        self.assertIn('frames.push_back(window.frames[frame->temporalKey.index % window.frames.size()])', maintain)
         self.assertIn('last_32_returned_frames_ring_not_full_history', maintain)
         policy = (BASE / 'FSRDCyberpunkTemporalWindowPolicy.h').read_text()
         self.assertIn('frameCount == 32 && index == 31', policy)
@@ -40,7 +40,7 @@ class VisualTest(unittest.TestCase):
         self.assertIn('_watches.size() == MaxVisualWatches', policy)
         poll = section('void PollTemporalWindow(', 'uint64_t AdmitPrivateResetSubmission(')
         self.assertIn('"visual_test_18000"', poll)
-        self.assertIn('window->frames.resize(window->frameCount)', poll)
+        self.assertIn('window->frames.resize(continuous ? WindowPolicy::Window::MaxVisualWatches : window->frameCount)', poll)
         self.assertIn('window->liveFrames.reserve(', poll)
         self.assertIn('window->epoch, window->frameCount', poll)
 
@@ -74,13 +74,13 @@ struct IUnknown{};
 namespace WindowPolicy=FSRD::CyberpunkTemporalWindowPolicy;
 namespace ResetPolicy=FSRD::CyberpunkPrivateResetPolicy;
 struct PrivateResetPacket{
- std::mutex mutex;bool retired=true,returned=true;
+ std::mutex mutex;bool retired=true,returned=true,unusedProducer=false;
  ResetPolicy::Recording producer{},consumer{};WindowPolicy::FrameKey temporalKey{};
 };
 struct TemporalWindow{
- std::mutex mutex;bool visual=true;unsigned returnEvidencePending=0,drainedFrames=0;
+ std::mutex mutex;bool visual=true,continuous=false;unsigned returnEvidencePending=0,drainedFrames=0;
  std::unique_ptr<WindowPolicy::Window> policy;
- std::vector<std::unique_ptr<PrivateResetPacket>> frames;
+ std::vector<std::shared_ptr<PrivateResetPacket>> frames;
  std::vector<PrivateResetPacket*> liveFrames;
 };
 std::atomic<bool> captureTrackingValid{true};
@@ -94,7 +94,7 @@ int main(){
   TemporalWindow window;IUnknown producer,consumer;
   const ResetPolicy::Queue queue{1,2,true};
   window.policy=std::make_unique<WindowPolicy::Window>(7,queue,100,18000);
-  auto owned=std::make_unique<PrivateResetPacket>();auto* frame=owned.get();
+  auto owned=std::make_shared<PrivateResetPacket>();auto* frame=owned.get();
   frame->producer={uintptr_t(&producer),10};frame->consumer={uintptr_t(&consumer),11};
   auto& policy=*window.policy;
   const auto key=policy.ClaimRole(100,WindowPolicy::Role::Ray);frame->temporalKey=key;

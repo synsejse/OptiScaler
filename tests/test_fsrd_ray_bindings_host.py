@@ -142,6 +142,7 @@ struct D3D12_DISPATCH_RAYS_DESC {
  AddressRange RayGenerationShaderRecord;AddressTable MissShaderTable,HitGroupTable,CallableShaderTable;
  uint32_t Width=1280,Height=720,Depth=1;
 };
+struct PrivateResetPacket;
 struct RayCopyBundle {
  struct { uintptr_t image=0; struct { uintptr_t list4=0; } dispatch; } input;
  bool invalidated=false,originalReturned=false; unsigned completedDispatches=0;

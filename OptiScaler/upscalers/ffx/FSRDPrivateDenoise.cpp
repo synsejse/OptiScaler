@@ -409,7 +409,7 @@ std::shared_ptr<Session> CreateSession(ID3D12Device* device, const SessionDesc& 
     if (error) *error = "";
     try
     {
-        Require(device && description.epoch && description.frameLimit && description.frameLimit <= SessionDesc::MaxFrames,
+        Require(device && description.epoch && description.frameLimit <= SessionDesc::MaxFrames,
                 "invalid session device/epoch/frame limit");
         ValidateContext(description.maxRenderSize, description.settings);
         auto data = std::make_unique<Session::Impl>();
@@ -440,6 +440,7 @@ std::shared_ptr<Work> PrepareFrame(const std::shared_ptr<Session>& session, cons
         {
             std::lock_guard lock(state.mutex);
             Require(state.phase == Session::Impl::Phase::Idle, "session stopped/complete or previous frame not acknowledged");
+            Require(state.acknowledged != UINT32_MAX, "session ordinal exhausted");
             const auto& fixed = state.description;
             Require(admission.epoch == fixed.epoch && admission.sameViewAndCoordinateOrigin &&
                     admission.canonicalDirectQueue && (!state.queue || state.queue == admission.canonicalDirectQueue),

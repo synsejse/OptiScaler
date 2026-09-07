@@ -2840,6 +2840,7 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                 case Phase::Stopped: text = "STOPPED - late SR only; restart required"; break;
                 case Phase::Complete: text = "Test finished - late SR only"; break;
                 case Phase::Refused: text = "Start refused - check log; restart required"; break;
+                case Phase::Restarting: text = "Draining previous scene - automatic history restart pending"; break;
                 default: break;
                 }
                 const ImVec4 color = test.phase == Phase::Active ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) :
@@ -2847,17 +2848,31 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
                     ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
                 ImGui::TextColored(color, "Pre-Fog: %s", text);
                 if (test.limit) ImGui::Text("Denoised frames: %u / %u", test.frames, test.limit);
-                ImGui::BeginDisabled(test.phase != Phase::Ready);
-                if (ImGui::Button("Start pre-Fog visual test")) FSRDCyberpunkFogProbe::RequestVisualTest();
-                ImGui::EndDisabled();
-                ShowHelpMarker("Load a save first. Runs one AMD history for up to 18,000 frames (5 min at 60 FPS).\n"
-                               "No automatic buffer dumps. Current provider/settings are fixed when started.\n"
-                               "Scene loads, native resets, or size changes stop this experimental pass.\n"
-                               "Outside an ACTIVE test: late SR only, no AMD denoising or late RR fallback.\n"
-                               "RR debug controls do not change this test. Restart the game to test again.");
+                if (FSRD::PreFogSession::Continuous())
+                    ImGui::Text("Denoised frames: %u | History: %llu | In flight: %u / 64",
+                                test.frames, static_cast<unsigned long long>(test.epoch), test.retainedFrames);
+                if (!FSRD::PreFogSession::Continuous())
+                {
+                    ImGui::BeginDisabled(test.phase != Phase::Ready);
+                    if (ImGui::Button("Start pre-Fog visual test")) FSRDCyberpunkFogProbe::RequestVisualTest();
+                    ImGui::EndDisabled();
+                    ShowHelpMarker("Load a save first. Runs one AMD history for up to 18,000 frames (5 min at 60 FPS).\n"
+                                   "No automatic buffer dumps. Current provider/settings are fixed when started.\n"
+                                   "Scene loads, native resets, or size changes stop this experimental pass.\n"
+                                   "Outside an ACTIVE test: late SR only, no AMD denoising or late RR fallback.\n"
+                                   "RR debug controls do not change this test. Restart the game to test again.");
+                }
             }
             if (auto ch = ScopedCollapsingHeader("FSR-RR Advanced Settings"); ch.IsHeaderOpen())
             {
+                if (bool enabled = config->FfxDenoiserCyberpunkPreFog.value_or_default();
+                    ImGui::Checkbox("Cyberpunk pre-fog ray regeneration (restart)", &enabled))
+                    config->FfxDenoiserCyberpunkPreFog = enabled;
+                ShowHelpMarker("Denoises surface lighting before Cyberpunk's original fog.\n"
+                               "Starts automatically; no frame limit or periodic denoiser resets.\n"
+                               "Scene/quality changes drain old work before creating a new history.\n"
+                               "Only the authenticated supported Cyberpunk executable is accepted.\n"
+                               "Save settings and restart to change this option.");
                 ImGui::TextUnformatted("Lighting: Fused");
                 ShowHelpMarker("Uses AMD's single-signal denoiser for the game's combined lighting.\n"
                                "Diffuse/specular albedo, normals, roughness and motion remain separate guides.\n"

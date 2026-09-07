@@ -77,6 +77,9 @@ using namespace FSRD::PreFogSession;
 int main(){
  RouteLatch off;assert(!off.LateSrOnly());assert(!off.Freeze(false));assert(!off.Freeze(true));
  RouteLatch on;assert(on.Freeze(true));assert(on.Freeze(false));
+ RouteLatch continuous;assert(continuous.Freeze(false,true));assert(continuous.Continuous());
+ assert(continuous.Freeze(false,false)&&continuous.Continuous());
+ assert(!off.Freeze(false,true)&&!off.Continuous());
  std::vector<std::thread> threads;
  for(int i=0;i<16;++i)threads.emplace_back([&,i]{for(int j=0;j<1000;++j){assert(on.Freeze(i&1));assert(!off.Freeze(i&1));}});
  for(auto& t:threads)t.join();

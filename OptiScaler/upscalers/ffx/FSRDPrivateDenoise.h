@@ -37,7 +37,7 @@ struct SessionDesc
     DenoiserSettings settings {};
     uint64_t epoch = 0; // Caller-owned, nonzero software-session epoch, not a native view identity.
     static constexpr uint32_t MaxFrames = 18000;
-    uint32_t frameLimit = 32; // Bounded visual pass; never wraps/restarts or periodically resets history.
+    uint32_t frameLimit = 32; // Zero: continuous history, still refuses native frame wrap/discontinuity.
 };
 
 struct FrameAdmission
@@ -128,7 +128,7 @@ class Work
 //   bundles. Restore all engine bindings after Record, including its failure paths.
 // - Serialize preparation/recording with other provider management as required by the
 //   existing FfxApiProxy. This primitive does not make that proxy globally thread-safe.
-// - Do not submit the same recorded list twice. No persistent/live temporal mode here.
+// - Do not submit the same recorded list twice. Session admission is separate below.
 //
 // GPU lifetime is an ACYCLIC lease retained before the first recorded command. It owns
 // provider context + inputs + private outputs, but NOT Work/converter/submission ticket.

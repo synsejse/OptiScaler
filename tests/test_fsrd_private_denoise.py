@@ -358,7 +358,7 @@ int main(){
  auto create=[&]{const char* error=nullptr;auto s=CreateSession(device.Get(),desc,&error);
   assert(s && error && !*error && !s->Stopped() && !s->Complete());return s;};
  for(unsigned kind=0;kind<6;++kind){auto d=desc;
-  if(kind==0)d.epoch=0;if(kind==1)d.frameLimit=0;if(kind==2)d.frameLimit=SessionDesc::MaxFrames+1;
+  if(kind==0)d.epoch=0;if(kind==1)d.frameLimit=UINT32_MAX;if(kind==2)d.frameLimit=SessionDesc::MaxFrames+1;
   if(kind==3)d.maxRenderSize={};if(kind==4)d.settings.maxRadiance=0;if(kind==5)d.providerId=43;
   const char* error=nullptr;assert(!CreateSession(device.Get(),d,&error)&&error&&*error&&!Fake::contexts);
  }
@@ -392,6 +392,15 @@ int main(){
   for(auto* identity:Fake::dispatchedContexts)assert(identity==Fake::dispatchedContexts.front());
   previous.reset();assert(Fake::contexts==1);s.reset();assert(!Fake::contexts&&Fake::destroys==destroys+1);
  }
+ // Continuous mode keeps a single context beyond the visual-test limit.
+ {auto continuous=desc;continuous.frameLimit=0;auto s=CreateSession(device.Get(),continuous);
+  assert(s);const auto contexts=Fake::creates;
+  for(unsigned i=0;i<20000;++i){auto q=parameters(i);q.dispatch.deltaTime=17.25f;
+   auto w=PrepareFrame(s,q,admission);assert(w&&w->Record(list.Get()));
+   assert(s->AcknowledgeExecuted(*w,admission.canonicalDirectQueue));
+   assert(!s->Complete()&&!s->Stopped()&&s->AcknowledgedFrames()==i+1);
+   w.reset();FSRDSubmission::pending.reset();}
+  assert(Fake::creates==contexts);s.reset();assert(!Fake::contexts);}
  // Admission refusals do not reserve/poison; accepted resource failures do.
  for(unsigned kind=0;kind<12;++kind){auto s=create();auto q=parameters(0);auto a=admission;
   if(kind==0)a.epoch=78;if(kind==1)a.canonicalDirectQueue=0;if(kind==2)a.sameViewAndCoordinateOrigin=false;

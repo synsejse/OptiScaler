@@ -452,6 +452,7 @@ struct PrivateResetPacket
     std::optional<ResetSource::TemporalSource> timedSource;
     double fogTimestamp = 0, previousFogTimestamp = 0;
     bool sceneRecorded = false, consumerSealed = false, returned = false, retired = false;
+    bool unusedProducer = false;
 };
 struct TemporalTargets
 {
@@ -467,12 +468,14 @@ struct TemporalWindow
     std::shared_ptr<FSRD::PrivateDenoise::Session> session;
     std::shared_ptr<TemporalBudget> budget = std::make_shared<TemporalBudget>();
     std::unique_ptr<WindowPolicy::Window> policy;
-    // Packet addresses are never deleted/reused during this bounded pass. Plans
-    // and callbacks can safely outlive removal of an obsolete submission watch.
-    std::vector<std::unique_ptr<PrivateResetPacket>> frames = std::vector<std::unique_ptr<PrivateResetPacket>>(32);
+    // Bounded captures retain all packets. Continuous mode uses 64 slots and
+    // reclaims only after final fences, newer list resets, and every CPU reader.
+    std::vector<std::shared_ptr<PrivateResetPacket>> frames = std::vector<std::shared_ptr<PrivateResetPacket>>(32);
     std::vector<PrivateResetPacket*> liveFrames;
     uint32_t frameCount = 32, drainedFrames = 0;
     bool visual = false;
+    bool continuous = false;
+    bool restartRequested = false;
     std::array<std::optional<TemporalTargets>, 2> freeTargets;
     std::optional<ResetSource::RawSource> lastFog;
     std::optional<TemporalCamera::PreviousFrame> previous;
@@ -493,7 +496,8 @@ struct TemporalWindow
     uint32_t returnEvidencePending = 0;
     bool ledgerEvidenceLost = false;
 };
-std::atomic<TemporalWindow*> temporalWindow { nullptr }; // One exclusive, explicit bounded window/process.
+// No provider/COM destruction during DLL teardown; runtime retirement is explicit.
+auto& temporalWindow = *new std::atomic<std::shared_ptr<TemporalWindow>>;
 std::atomic<uint64_t> nextTemporalEpoch { 0 };
 std::atomic<bool> visualTestRequested { false };
 std::atomic<bool> visualTestArmRefused { false };
@@ -709,6 +713,7 @@ struct RayScope
     unsigned dispatches = 0;
     unsigned nativeDispatchDepth = 0;
     std::shared_ptr<RayCopyBundle> pendingCopy {}; // Only this original invocation may record it before end-use.
+    std::shared_ptr<PrivateResetPacket> packetLease {}; // CPU scope only; never retained by a GPU ticket.
 };
 thread_local RayScope* rayScope = nullptr;
 
@@ -1052,7 +1057,7 @@ void ClaimPrivateReset(PrivateResetPacket& packet, const Json& metadata, ID3D12D
     role = true;
 }
 
-void StopTemporalWindow(TemporalWindow& window, const char* reason) noexcept
+void StopTemporalWindow(TemporalWindow& window, const char* reason, bool restart = false) noexcept
 {
     try
     {
@@ -1061,10 +1066,11 @@ void StopTemporalWindow(TemporalWindow& window, const char* reason) noexcept
             std::lock_guard lock(window.mutex);
             first = !window.stopped;
             window.stopped = true;
+            window.restartRequested |= window.continuous && restart;
             if (window.policy) window.policy->Stop(); // Existing obligations still drain.
             if (window.failure.empty()) window.failure = reason;
         }
-        if (first) LOG_WARN("[FSRRR temporal] window stopped: {}; late SR remains fixed, no fallback or reset retry", reason);
+        if (first) LOG_WARN("[FSRRR temporal] window stopped: {}; late SR remains fixed; restart requested={}", reason, restart);
     }
     catch (...) { window.stopped = true; }
 }
@@ -1077,15 +1083,17 @@ bool TemporalRecordingRequested() noexcept
 }
 
 PrivateResetPacket* SelectTemporalFrame(TemporalWindow& window, const Json& metadata,
-                                        ID3D12Device* device, WindowPolicy::Role role)
+                                        ID3D12Device* device, WindowPolicy::Role role,
+                                        std::shared_ptr<PrivateResetPacket>* lease = nullptr)
 {
     const auto source = ResetSource::ParseRawTemporal(metadata);
     ComPtr<IUnknown> identity;
     if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))) ||
         identity.Get() != window.deviceIdentity.Get() || source.current.width != window.width ||
         source.current.height != window.height)
-    { StopTemporalWindow(window, "current role device or extent changed"); return nullptr; }
+    { StopTemporalWindow(window, "current role device or extent changed", true); return nullptr; }
     std::lock_guard lock(window.mutex);
+    if (window.continuous && !lease) throw std::runtime_error("continuous frame requires a CPU reader lease");
     if (!window.warmupReturned || !window.queueIdentity || !window.lastFog)
     {
         // An actual producer may have already passed before the warm-up queue
@@ -1100,6 +1108,7 @@ PrivateResetPacket* SelectTemporalFrame(TemporalWindow& window, const Json& meta
     if (source.current.view != window.lastFog->view)
     {
         window.stopped = true;
+        window.restartRequested = window.continuous;
         if (window.policy) window.policy->Stop();
         return nullptr;
     }
@@ -1114,11 +1123,23 @@ PrivateResetPacket* SelectTemporalFrame(TemporalWindow& window, const Json& meta
             source.current.frame, window.frameCount);
     }
     if (window.policy->Complete()) return nullptr;
+    // A reset starts a new session, not a half-claimed producer obligation.
+    if (window.continuous && window.policy->CommittedFrames() && source.nativeResetRequested)
+    { window.policy->Stop(); window.stopped = true; window.restartRequested = true; return nullptr; }
     const auto key = window.policy->ClaimRole(source.current.frame, role);
-    if (!key.Valid()) { window.stopped = true; return nullptr; }
+    if (!key.Valid())
+    {
+        window.stopped = true;
+        window.restartRequested |= window.continuous &&
+            (window.policy->LastFailure() == WindowPolicy::Failure::InvalidFrame ||
+             window.policy->LastFailure() == WindowPolicy::Failure::OutsideLookAhead);
+        return nullptr;
+    }
     if (key.index && source.nativeResetRequested)
     { window.policy->Stop(); window.stopped = true; return nullptr; }
-    auto& frame = window.frames[key.index];
+    auto& frame = window.frames[key.index % window.frames.size()];
+    if (frame && frame->temporalKey != key)
+    { window.policy->Stop(); window.stopped = true; return nullptr; }
     if (!frame)
     {
         auto free = std::find_if(window.freeTargets.begin(), window.freeTargets.end(),
@@ -1138,7 +1159,7 @@ PrivateResetPacket* SelectTemporalFrame(TemporalWindow& window, const Json& meta
             }
             window.finalCaptureQueued = true;
         }
-        auto created = std::make_unique<PrivateResetPacket>(uintptr_t(window.deviceIdentity.Get()));
+        auto created = std::make_shared<PrivateResetPacket>(uintptr_t(window.deviceIdentity.Get()));
         created->device = window.device; created->deviceIdentity = window.deviceIdentity;
         created->width = window.width; created->height = window.height;
         created->provider = window.provider; created->settings = window.settings;
@@ -1150,6 +1171,7 @@ PrivateResetPacket* SelectTemporalFrame(TemporalWindow& window, const Json& meta
         frame = std::move(created);
         window.liveFrames.push_back(frame.get()); // Reserved before publication; no address reuse.
     }
+    if (lease) *lease = frame; // Acquired under the routing lock, before any slot can retire.
     return frame.get();
 }
 
@@ -2229,8 +2251,8 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
         }
         const char* failure = nullptr;
         const auto metadata = Json::parse(FSRDCyberpunkEarlyGuides::Describe(rayScope->context, authenticatedImage.load()));
-        auto* window = temporalWindow.load(std::memory_order_acquire);
-        auto* packet = window ? SelectTemporalFrame(*window, metadata, plan->device.Get(), WindowPolicy::Role::Ray) :
+        auto window = temporalWindow.load(std::memory_order_acquire);
+        auto* packet = window ? SelectTemporalFrame(*window, metadata, plan->device.Get(), WindowPolicy::Role::Ray, &rayScope->packetLease) :
             privateResetPacket.load(std::memory_order_acquire);
         if (window && !packet) return {}; // Warm-up/stopped/unadmitted frame: no private commands.
         plan->packet = packet;
@@ -2269,7 +2291,7 @@ std::shared_ptr<RayCopyBundle> PrepareRayCopy(const FSRD::CyberpunkRayBindings::
     catch (const std::exception& error) { plan->provenance["reason"] = error.what(); }
     catch (...) { plan->provenance["reason"] = "ray-copy preparation threw"; }
     if (plan->packet) FailPacket(plan->packet);
-    else if (auto* window = temporalWindow.load(std::memory_order_acquire))
+    else if (auto window = temporalWindow.load(std::memory_order_acquire))
         StopTemporalWindow(*window, "ray producer preparation refused");
     else FailPrivateReset();
     plan->provenance["status"] = "refused_before_state_requests";
@@ -3592,7 +3614,8 @@ std::shared_ptr<FSRD::CyberpunkGuidePass::Work> PrepareLightingGuideWork(Lightin
 }
 
 std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsCommandList* list,
-                                                           std::shared_ptr<LightingCapturePlan>& diagnostic)
+                                                           std::shared_ptr<LightingCapturePlan>& diagnostic,
+                                                           std::shared_ptr<PrivateResetPacket>& packetLease)
 {
     auto plan = std::make_shared<LightingCapturePlan>();
     diagnostic = plan; // Refusals retain bounded evidence even when this function throws.
@@ -3630,9 +3653,9 @@ std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsComman
     }
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&plan->device)))) throw std::runtime_error("lighting device unavailable");
     plan->metadata = Json::parse(FSRDCyberpunkEarlyGuides::Describe(current.context, authenticatedImage.load()));
-    if (auto* window = temporalWindow.load(std::memory_order_acquire))
+    if (auto window = temporalWindow.load(std::memory_order_acquire))
     {
-        plan->packet = SelectTemporalFrame(*window, plan->metadata, plan->device.Get(), WindowPolicy::Role::Guides);
+        plan->packet = SelectTemporalFrame(*window, plan->metadata, plan->device.Get(), WindowPolicy::Role::Guides, &packetLease);
         if (!plan->packet) return {};
         plan->charge = plan->packet->charge;
     }
@@ -5203,9 +5226,10 @@ bool MatchesFinalLightingDraw(bool scoped, bool finalHelper, uintptr_t nativeCal
 }
 
 PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT count, UINT instances,
-                                      UINT start, UINT firstInstance, uintptr_t caller, double timestamp)
+                                      UINT start, UINT firstInstance, uintptr_t caller, double timestamp,
+                                      std::shared_ptr<PrivateResetPacket>* lease = nullptr)
 {
-    auto* window = temporalWindow.load(std::memory_order_acquire);
+    auto window = temporalWindow.load(std::memory_order_acquire);
     if (!window || privateResetArming.load(std::memory_order_acquire) || !scope || !scope->fogHelper ||
         caller != authenticatedImage.load() + FSRD::CyberpunkFogDepth::DrawReturnRva ||
         count != 3 || instances != 1 || start || firstInstance) return nullptr;
@@ -5235,7 +5259,11 @@ PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT cou
     if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Width != window->width ||
         desc.Height != window->height || desc.MipLevels != 1 || desc.DepthOrArraySize != 1 ||
         desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality || !MatchLiveCode(authenticatedImage.load(), FogTopologyCode))
+    {
+        if (window->continuous && (desc.Width != window->width || desc.Height != window->height))
+            StopTemporalWindow(*window, "selected Fog render extent changed", true);
         throw std::runtime_error("temporal selected Fog target changed");
+    }
     uintptr_t tls = 0, engine = 0, nativeList = 0;
     uint8_t initialized = 0;
     uint32_t topology = 0;
@@ -5270,12 +5298,15 @@ PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT cou
         std::lock_guard lock(window->mutex);
         if (window->policy && window->policy->Complete()) return nullptr;
         if (window->lastFog && !raw.current.FollowsInView(*window->lastFog))
+        {
+            window->restartRequested = window->continuous;
             throw std::runtime_error(std::format(
                 "temporal selected Fog source cadence or view changed: frame {}->{} view {:#x}->{:#x} "
                 "object {:#x}->{:#x} list {:#x} generation {} committed {}",
                 window->lastFog->frame, raw.current.frame, window->lastFog->view, raw.current.view,
                 window->lastFog->object, raw.current.object, recording.list, recording.generation,
                 window->policy ? window->policy->CommittedFrames() : 0));
+        }
         if (window->lastFog && window->lastFog->object != raw.current.object)
         {
             static std::atomic<uint32_t> payloadChangeLogs { 0 };
@@ -5288,7 +5319,7 @@ PrivateResetPacket* ObserveTemporalFog(ID3D12GraphicsCommandList* list, UINT cou
         previousTime = window->lastFogTimestamp;
         ready = window->warmupReturned && window->lastFog.has_value();
     }
-    auto* packet = ready ? SelectTemporalFrame(*window, metadata, window->device.Get(), WindowPolicy::Role::Fog) : nullptr;
+    auto* packet = ready ? SelectTemporalFrame(*window, metadata, window->device.Get(), WindowPolicy::Role::Fog, lease) : nullptr;
     const double delta = timestamp - previousTime;
     if (packet)
     {
@@ -5317,6 +5348,9 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
     const auto temporalTimestamp = TemporalRecordingRequested() ? Util::MillisecondsNow() : 0.0;
     LogDraw(list, false, count, instances, start, 0, firstInstance);
     std::shared_ptr<LightingCapturePlan> lightingPlan;
+    // CPU reader pins cover preparation, original Draw, completion and errors.
+    // GPU-retained plans contain only raw routes, never packet/ticket cycles.
+    std::shared_ptr<PrivateResetPacket> lightingLease, fogLease;
     if (captureEnabled.load() && !inMetadata && !privateResetArming.load(std::memory_order_acquire) &&
         lightingRequested.load() && !lightingAttempted.load() &&
         (TemporalRecordingRequested() || FSRDFogLayerCapture::WantsEarlyGuideCapture()) &&
@@ -5329,12 +5363,12 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
             {
                 ++lightingScope->finalDraws;
                 if (lightingScope->finalDraws != 1) throw std::runtime_error("ambiguous repeated final lighting draw");
-                lightingPlan = PrepareLightingCapture(list, diagnostic);
+                lightingPlan = PrepareLightingCapture(list, diagnostic, lightingLease);
             }
             catch (const std::exception& error)
             {
                 if (diagnostic && diagnostic->packet) FailPacket(diagnostic->packet);
-                else if (auto* window = temporalWindow.load()) StopTemporalWindow(*window, error.what());
+                else if (auto window = temporalWindow.load()) StopTemporalWindow(*window, error.what());
                 FSRDFogLayerCapture::CancelEarlyGuideRequest();
                 if (diagnostic)
                 {
@@ -5349,13 +5383,13 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
     if (captureEnabled.load() && !inMetadata && scope)
         Metadata([&] {
             try {
-                auto* selected = ObserveTemporalFog(list, count, instances, start, firstInstance, nativeCaller, temporalTimestamp);
+                auto* selected = ObserveTemporalFog(list, count, instances, start, firstInstance, nativeCaller, temporalTimestamp, &fogLease);
                 plan = PrepareCapture(list, count, instances, start, firstInstance, nativeCaller, selected);
                 if (selected && !plan) FailPacket(selected);
             }
             catch (const std::exception& error)
             {
-                if (auto* window = temporalWindow.load()) StopTemporalWindow(*window, error.what());
+                if (auto window = temporalWindow.load()) StopTemporalWindow(*window, error.what());
                 else captureStarted.store(true);
                 FSRDFogLayerCapture::CancelRequest();
                 LOG_WARN("[FSRRR fog capture] preparation stopped: {}", error.what());
@@ -5694,6 +5728,7 @@ bool Authenticate(uintptr_t& entry)
 
 void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept
 {
+    if (FSRD::PreFogSession::Continuous()) return;
     if (!active.load() || !captureEnabled.load() || !captureTrackingValid.load() ||
         rgbIdentityPacket.load(std::memory_order_acquire) || privateResetPacket.load(std::memory_order_acquire) || TemporalRecordingRequested()) return;
     static std::atomic<ULONGLONG> nextPoll { 0 };
@@ -5761,6 +5796,7 @@ void ArmRgbIdentity(ID3D12Device* device, UINT width, UINT height) noexcept
 
 void ArmPrivateReset(ID3D12Device* device, UINT width, UINT height) noexcept
 {
+    if (FSRD::PreFogSession::Continuous()) return;
     if (!active.load() || !captureEnabled.load() || !captureTrackingValid.load() ||
         privateResetPacket.load(std::memory_order_acquire) || rgbIdentityPacket.load(std::memory_order_acquire) || TemporalRecordingRequested()) return;
     static std::atomic<ULONGLONG> nextPoll { 0 };
@@ -5884,7 +5920,7 @@ void RetireVisualWatch(TemporalWindow& window, PrivateResetPacket& frame)
     ResetPolicy::Recording producer, consumer;
     {
         std::lock_guard lock(frame.mutex);
-        if (!frame.retired || !frame.returned) return;
+        if (!frame.retired || (!frame.returned && !frame.unusedProducer)) return;
         producer = frame.producer; consumer = frame.consumer;
     }
     producer.generation = consumer.generation = 0;
@@ -5899,35 +5935,60 @@ void RetireVisualWatch(TemporalWindow& window, PrivateResetPacket& frame)
             }
     }
     std::lock_guard lock(window.mutex);
+    auto& slot = window.frames[frame.temporalKey.index % window.frames.size()];
+    // Registry plus this maintenance snapshot must be the only CPU readers.
+    // Plans, producer scopes and native return bookkeeping each pin the packet.
+    if (window.continuous && (slot.get() != &frame || slot.use_count() != 2)) return;
     if (!window.returnEvidencePending && window.policy &&
-        window.policy->RetireSubmissionWatch(frame.temporalKey, producer, consumer))
+        (frame.unusedProducer ? window.policy->RetireUnusedProducer(frame.temporalKey, producer, consumer) :
+                               window.policy->RetireSubmissionWatch(frame.temporalKey, producer, consumer)))
     {
-        std::erase(window.liveFrames, &frame); // Raw routing only; packet remains in window.frames.
+        std::erase(window.liveFrames, &frame);
         ++window.drainedFrames;
+        if (window.continuous) slot.reset(); // The maintenance snapshot destroys it outside the lock.
     }
 }
 
 void MaintainTemporalWindow(TemporalWindow& window)
 {
-    // No waits and no provider/native calls under the controller lock. Small
-    // immutable policy tombstones stay; only fence-complete heavy owners retire.
-    std::vector<PrivateResetPacket*> frames;
+    // No waits and no provider/native calls under the controller lock. Bounded
+    // controls retain tombstones; continuous mode also retires quiescent CPU packets.
+    std::vector<std::shared_ptr<PrivateResetPacket>> frames;
     uint32_t drained = 0;
     {
         std::lock_guard lock(window.mutex);
-        frames = window.liveFrames;
+        frames.reserve(window.liveFrames.size());
+        for (const auto* frame : window.liveFrames)
+            frames.push_back(window.frames[frame->temporalKey.index % window.frames.size()]);
         drained = window.drainedFrames;
     }
-    for (auto* frame : frames)
+    for (const auto& frame : frames)
     {
         if (!frame) continue;
         std::shared_ptr<FSRDSubmission::Ticket> ticket;
+        std::shared_ptr<FSRDSubmission::Ticket> producerTicket;
+        bool unusedProducer = false;
+        if (window.continuous)
+        {
+            std::lock_guard lock(window.mutex);
+            unusedProducer = window.stopped && window.policy &&
+                !window.policy->FrameFailed(frame->temporalKey) &&
+                !window.policy->ConsumerEmbedded(frame->temporalKey) &&
+                window.policy->ProducerReturned(frame->temporalKey);
+        }
         {
             std::lock_guard lock(frame->mutex);
-            if (frame->retired || !frame->returned) continue;
+            if (frame->retired || (!frame->returned && !unusedProducer)) continue;
             ticket = frame->finalTicket;
+            if (unusedProducer && frame->rayCopy && frame->rayCopy->work)
+                producerTicket = frame->rayCopy->work->CompletionTicket();
         }
-        if (!ticket || !FSRDSubmission::Complete(ticket)) continue;
+        if (unusedProducer)
+        {
+            if (!producerTicket || !FSRDSubmission::Complete(producerTicket) ||
+                (ticket && !FSRDSubmission::Complete(ticket))) continue;
+        }
+        else if (!ticket || !FSRDSubmission::Complete(ticket)) continue;
         TemporalTargets targets;
         std::shared_ptr<FSRD::PrivateDenoise::Work> work;
         std::shared_ptr<RayCopyBundle> rays;
@@ -5935,6 +5996,7 @@ void MaintainTemporalWindow(TemporalWindow& window)
             std::lock_guard lock(frame->mutex);
             if (frame->retired) continue;
             frame->retired = true;
+            frame->unusedProducer = unusedProducer;
             targets = { std::move(frame->guides), std::move(frame->rays), std::move(frame->charge) };
             work = std::move(frame->denoise); rays = std::move(frame->rayCopy);
             frame->finalTicket.reset(); // ticket local keeps COM-backed storage out of this lock.
@@ -5942,10 +6004,9 @@ void MaintainTemporalWindow(TemporalWindow& window)
         // Locals release here, outside controller/frame locks. A ticket-owned
         // leaf may outlive them until the registry's next completed collection.
     }
-    // The bounded visual pass retains every small packet/CPU reader, but only
-    // scans recordings which could still contain our commands. A newer native
-    // Reset is NOT a GPU fence. Both are required here, independently.
-    for (auto* frame : frames) RetireVisualWatch(window, *frame);
+    // A newer native Reset is NOT a GPU fence. Both are required here,
+    // independently, before removing a submission watch or reusing a CPU slot.
+    for (const auto& frame : frames) RetireVisualWatch(window, *frame);
     for (size_t pass = 0; pass < 2; ++pass)
     {
         size_t slot = window.freeTargets.size();
@@ -5988,8 +6049,9 @@ void MaintainTemporalWindow(TemporalWindow& window)
     }
     // Moved leaf owners are released outside the window lock; no COM backed
     // destructor participates in policy ordering or holds up original Execute.
+    if (window.continuous) return; // No per-session disk ledger or full camera JSON ring in normal operation.
     uint32_t preparedCount = drained, sceneCount = drained, returnedCount = drained, completeCount = drained;
-    for (auto* frame : frames)
+    for (const auto& frame : frames)
         if (frame)
         {
             std::lock_guard lock(frame->mutex);
@@ -6074,6 +6136,7 @@ uint64_t AdmitTemporalSubmission(TemporalWindow& window, ID3D12CommandQueue* que
     std::lock_guard lock(window.mutex);
     if (!window.warmupReturned)
     {
+        if (window.stopped) return 0; // No new warm-up receipt may race a drained session replacement.
         unsigned matched = 0;
         for (UINT i = 0; i < count; ++i)
             if (window.warmupRecording.list && recordings[i] == window.warmupRecording) ++matched;
@@ -6106,7 +6169,7 @@ void ReturnedTemporalSubmission(TemporalWindow& window, uint64_t token)
         return;
     }
     WindowPolicy::ReturnDecision returned;
-    PrivateResetPacket* frame = nullptr;
+    std::shared_ptr<PrivateResetPacket> frame;
     {
         std::lock_guard lock(window.mutex);
         const auto found = std::find_if(window.pendingCalls.begin(), window.pendingCalls.end(),
@@ -6116,7 +6179,7 @@ void ReturnedTemporalSubmission(TemporalWindow& window, uint64_t token)
         if (!returned.allowed) PrivateResetFatal();
         if (!returned.consumer.Valid()) return; // Producer-only return never advances AMD or camera history.
         ++window.returnEvidencePending;
-        frame = window.frames[returned.consumer.index].get();
+        frame = window.frames[returned.consumer.index % window.frames.size()];
     }
     if (!frame) PrivateResetFatal();
     std::shared_ptr<FSRD::PrivateDenoise::Work> work;
@@ -6136,9 +6199,21 @@ void ReturnedTemporalSubmission(TemporalWindow& window, uint64_t token)
             !window.session->AcknowledgeExecuted(*work, uintptr_t(window.queueIdentity.Get()))) PrivateResetFatal();
         window.previous = TemporalCamera::PreviousFrame { current->current.rawSnapshot, current->current.motionScale,
                                                           frame->delta, current->current.frame, window.epoch };
-        if (!window.stopped && !window.policy->CommitConsumer(returned.consumer)) PrivateResetFatal();
+        if ((!window.stopped || window.continuous) &&
+            !window.policy->CommitConsumer(returned.consumer, window.continuous)) PrivateResetFatal();
     }
     { std::lock_guard lock(frame->mutex); frame->returned = true; }
+    if (window.continuous)
+    {
+        temporalLastReturn.store(GetTickCount64());
+        try {
+            if (!returned.consumer.index || (returned.consumer.index + 1) % 600 == 0)
+                LOG_INFO("[FSRRR continuous] history committed ordinal={} frame={} epoch={}",
+                         returned.consumer.index + 1, returned.consumer.frame, window.epoch);
+        } catch (...) {}
+        { std::lock_guard lock(window.mutex); --window.returnEvidencePending; }
+        return;
+    }
     // Ledger/logging allocation cannot unwind or retroactively change the
     // successful native return and CPU acknowledgement above.
     try {
@@ -6174,15 +6249,15 @@ void ReturnedTemporalSubmission(TemporalWindow& window, uint64_t token)
 
 TemporalTestStatus GetTemporalTestStatus() noexcept
 {
-    if (auto* window = temporalWindow.load(std::memory_order_acquire))
+    if (auto window = temporalWindow.load(std::memory_order_acquire))
     {
         std::lock_guard lock(window->mutex);
         const auto frames = window->policy ? window->policy->CommittedFrames() : 0;
-        const auto phase = window->stopped ? TemporalTestPhase::Stopped :
+        const auto phase = window->stopped ? (window->restartRequested ? TemporalTestPhase::Restarting : TemporalTestPhase::Stopped) :
             window->policy && window->policy->Complete() ? TemporalTestPhase::Complete :
             !frames ? TemporalTestPhase::Warmup :
             GetTickCount64() - temporalLastReturn.load() > 2000 ? TemporalTestPhase::Stalled : TemporalTestPhase::Active;
-        return { phase, frames, window->frameCount };
+        return { phase, frames, window->frameCount, window->epoch, uint32_t(window->liveFrames.size()) };
     }
     if (visualTestRequested.load()) return { TemporalTestPhase::Requested };
     if (visualTestArmRefused.load()) return { TemporalTestPhase::Refused };
@@ -6194,20 +6269,55 @@ TemporalTestStatus GetTemporalTestStatus() noexcept
 
 bool RequestVisualTest() noexcept
 {
+    if (FSRD::PreFogSession::Continuous()) return false;
     if (GetTemporalTestStatus().phase != TemporalTestPhase::Ready) return false;
     return !visualTestRequested.exchange(true);
+}
+
+bool CanRestartTemporalWindow(TemporalWindow& window)
+{
+    std::lock_guard lock(window.mutex);
+    return window.continuous && window.stopped && window.restartRequested && !window.allocating &&
+        window.liveFrames.empty() && !window.returnEvidencePending && !window.pendingWarmup.Valid() &&
+        (!window.policy || !window.policy->SubmissionWatches()) &&
+        std::none_of(window.frames.begin(), window.frames.end(), [](const auto& frame) { return bool(frame); }) &&
+        std::none_of(window.pendingCalls.begin(), window.pendingCalls.end(), [](const auto& value) { return value.Valid(); });
 }
 
 void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t provider,
                         const FSRD::DenoiserSettings* visualSettings) noexcept
 {
-    if (auto* window = temporalWindow.load(std::memory_order_acquire))
+    if (auto window = temporalWindow.load(std::memory_order_acquire))
     {
         Metadata([&] {
-            try { MaintainTemporalWindow(*window); }
+            try {
+                if (window->continuous && visualSettings)
+                {
+                    const auto& a = window->settings;
+                    const auto& b = *visualSettings;
+                    const std::array<float, 6> oldValues { a.crossBilateralNormalStrength, a.stabilityBias, a.maxRadiance,
+                        a.radianceClipStdK, a.gaussianKernelRelaxation, a.disocclusionThreshold };
+                    const std::array<float, 6> newValues { b.crossBilateralNormalStrength, b.stabilityBias, b.maxRadiance,
+                        b.radianceClipStdK, b.gaussianKernelRelaxation, b.disocclusionThreshold };
+                    if (device != window->device.Get() || width != window->width || height != window->height ||
+                        provider != window->provider || std::bit_cast<std::array<uint32_t, 6>>(oldValues) !=
+                                                       std::bit_cast<std::array<uint32_t, 6>>(newValues))
+                        StopTemporalWindow(*window, "active device, render extent or denoiser settings changed", true);
+                }
+                MaintainTemporalWindow(*window);
+            }
             catch (const std::exception& error) { StopTemporalWindow(*window, error.what()); }
         });
-        return;
+        // Never replace a controller with an embedded command, outstanding
+        // native return, CPU packet reader, or unretired submission watch.
+        std::unique_lock requestLock(captureRequestMutex, std::try_to_lock);
+        if (!requestLock) return;
+        if (!CanRestartTemporalWindow(*window)) return;
+        auto expected = window;
+        if (!temporalWindow.compare_exchange_strong(expected, {}, std::memory_order_acq_rel)) return;
+        lightingRequested.store(false); lightingAttempted.store(false);
+        visualTestArmRefused.store(false);
+        // This local shared owner releases the old context outside both locks.
     }
     if (!active.load() || !captureEnabled.load() || !captureTrackingValid.load() || !FSRD::PreFogSession::LateSrOnly() ||
         privateResetPacket.load() || rgbIdentityPacket.load()) return;
@@ -6220,7 +6330,8 @@ void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t 
         const auto path = Util::ExePath().parent_path() / L"FSRRR-prefog-temporal.request";
         const auto attributes = GetFileAttributesW(path.c_str());
         const bool guiRequest = visualTestRequested.exchange(false);
-        if (!guiRequest && (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))) return;
+        const bool continuous = FSRD::PreFogSession::Continuous();
+        if (!guiRequest && !continuous && (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))) return;
         if (privateResetArming.exchange(true, std::memory_order_acq_rel)) return;
         struct Finish { ~Finish() { privateResetArming.store(false, std::memory_order_release); } } finish;
         try {
@@ -6231,14 +6342,16 @@ void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t 
                 fog.queued || fog.busy || fog.attempted || guides.queued || guides.busy || guides.attempted ||
                 !rayBindingsAuthenticated.load() || !fogDepthAuthenticated.load() ||
                 authenticatedImage.load() != uintptr_t(GetModuleHandleW(nullptr)) ||
-                !MatchLiveCode(authenticatedImage.load(), FogTopologyCode) || (!guiRequest && std::filesystem::file_size(path) > 4096))
+                !MatchLiveCode(authenticatedImage.load(), FogTopologyCode) ||
+                (!guiRequest && !continuous && std::filesystem::file_size(path) > 4096))
                 throw std::runtime_error("temporal window requires an unused authenticated fixed-SR session");
             Json controls;
-            if (guiRequest)
+            if (guiRequest || continuous)
             {
                 if (!provider || !visualSettings || attributes != INVALID_FILE_ATTRIBUTES)
                     throw std::runtime_error("visual provider/settings unavailable or conflicting disk request");
-                controls = { { "mode", "visual_test_18000" }, { "frame_count", WindowPolicy::Window::VisualFrameCount },
+                controls = { { "mode", continuous ? "continuous" : "visual_test_18000" },
+                    { "frame_count", continuous ? 0 : WindowPolicy::Window::VisualFrameCount },
                     { "provider_id", provider }, { "delta_source", "selected_Fog_draw_CPU_interval_not_native_delta" },
                     { "continuity", "experimental_software_epoch_stable_view_no_native_origin_proof" },
                     { "settings", { { "1", visualSettings->crossBilateralNormalStrength }, { "2", visualSettings->stabilityBias },
@@ -6248,15 +6361,16 @@ void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t 
             else { std::ifstream file(path, std::ios::binary); file >> controls; } // Closed before DeleteFileW.
             const bool visual = controls.at("mode") == "visual_test_18000" &&
                                 controls.at("frame_count") == WindowPolicy::Window::VisualFrameCount;
-            if ((!visual && (controls.at("mode") != "temporal_window_32" || controls.at("frame_count") != 32)) ||
+            if ((!continuous && !visual && (controls.at("mode") != "temporal_window_32" || controls.at("frame_count") != 32)) ||
                 controls.at("delta_source") != "selected_Fog_draw_CPU_interval_not_native_delta" ||
                 controls.at("continuity") != "experimental_software_epoch_stable_view_no_native_origin_proof")
                 throw std::runtime_error("temporal window requires explicit CPU-clock/software-continuity experiment controls");
-            auto window = std::make_unique<TemporalWindow>();
-            window->visual = visual;
-            window->frameCount = visual ? WindowPolicy::Window::VisualFrameCount : WindowPolicy::Window::FrameCount;
-            window->frames.resize(window->frameCount);
-            window->liveFrames.reserve(visual ? WindowPolicy::Window::MaxVisualWatches : WindowPolicy::Window::FrameCount);
+            auto window = std::make_shared<TemporalWindow>();
+            window->visual = visual || continuous;
+            window->continuous = continuous;
+            window->frameCount = continuous ? 0 : visual ? WindowPolicy::Window::VisualFrameCount : WindowPolicy::Window::FrameCount;
+            window->frames.resize(continuous ? WindowPolicy::Window::MaxVisualWatches : window->frameCount);
+            window->liveFrames.reserve(window->visual ? WindowPolicy::Window::MaxVisualWatches : WindowPolicy::Window::FrameCount);
             window->device = device; window->width = width; window->height = height;
             if (FAILED(device->QueryInterface(IID_PPV_ARGS(&window->deviceIdentity))))
                 throw std::runtime_error("temporal device identity unavailable");
@@ -6274,13 +6388,15 @@ void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t 
                 { { width, height }, window->provider, window->settings, window->epoch, window->frameCount }, &error);
             if (!window->session) throw std::runtime_error(error && *error ? error : "temporal Session preparation refused");
             for (auto& free : window->freeTargets) free = AllocateTemporalTargets(*window);
-            if (!guiRequest && !DeleteFileW(path.c_str())) throw std::runtime_error("temporal marker consumption refused");
-            temporalWindow.store(window.release(), std::memory_order_release);
+            if (!guiRequest && !continuous && !DeleteFileW(path.c_str())) throw std::runtime_error("temporal marker consumption refused");
+            temporalWindow.store(std::move(window), std::memory_order_release);
             lightingRequestedAt.store(GetTickCount64()); lightingRequested.store(true);
+            visualTestArmRefused.store(false);
             LOG_INFO("[FSRRR temporal] armed warm-up {}x{}; {}-frame bound, one Session, first RESET only, capture={}; no native timing/origin proof",
-                     width, height, visual ? WindowPolicy::Window::VisualFrameCount : 32, visual ? "none" : "final-only");
+                     width, height, continuous ? 0 : visual ? WindowPolicy::Window::VisualFrameCount : 32,
+                     (visual || continuous) ? "none" : "final-only");
         } catch (const std::exception& error) {
-            if (guiRequest) visualTestArmRefused.store(true);
+            if (guiRequest || continuous) visualTestArmRefused.store(true);
             LOG_WARN("[FSRRR temporal] arm refused: {}", error.what());
         }
     });
@@ -6289,7 +6405,7 @@ void PollTemporalWindow(ID3D12Device* device, UINT width, UINT height, uint64_t 
 uint64_t AdmitPrivateResetSubmission(ID3D12CommandQueue* queue, UINT count,
                                       ID3D12CommandList* const* lists) noexcept
 {
-    if (auto* window = temporalWindow.load(std::memory_order_acquire))
+    if (auto window = temporalWindow.load(std::memory_order_acquire))
     {
         try { return AdmitTemporalSubmission(*window, queue, count, lists); }
         catch (...) { PrivateResetFatal(); }
@@ -6355,7 +6471,7 @@ void ReturnedPrivateResetSubmission(uint64_t token) noexcept
     if (!token) return;
     if (token & TemporalToken)
     {
-        auto* window = temporalWindow.load(std::memory_order_acquire);
+        auto window = temporalWindow.load(std::memory_order_acquire);
         if (!window) PrivateResetFatal();
         try { ReturnedTemporalSubmission(*window, token); }
         catch (...) { PrivateResetFatal(); }
@@ -6620,7 +6736,8 @@ void Initialize(bool enabled)
             }
             const auto image = entry - FogNodeRva;
             authenticatedImage.store(image);
-            const bool captures = Config::Instance()->FfxDenoiserCyberpunkFogCapture.value_or_default();
+            const bool captures = Config::Instance()->FfxDenoiserCyberpunkFogCapture.value_or_default() ||
+                                  Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default();
             // These bodies include the Fog node and texture binder: authenticate
             // all of them before this initialization transaction patches either.
             if (captures && std::all_of(std::begin(FSRD::CyberpunkFogDepth::Code), std::end(FSRD::CyberpunkFogDepth::Code),

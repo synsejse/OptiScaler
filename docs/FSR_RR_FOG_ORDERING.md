@@ -1,8 +1,11 @@
 # FSR RR: the observed fog-ordering failure
 
-Status, 2026-09-07: a corrective ordering works in a captured-frame AMD GPU
-replay. **The live game still uses the existing late denoiser.** The early
-guide work is an opt-in diagnostic, not a completed rendering correction.
+Status, 2026-09-07: the pre-Fog correction passed matched GPU controls and a
+live **18,000-frame single-history visual run** in build `b1fcdb09`, including
+camera/player movement. The user also played during that run and reported the
+image looked correct. The separate continuous option is being validated; see
+[continuous operation](FSR_RR_CONTINUOUS.md). Historical controls below describe
+the evidence that led to the fix, not the current runtime activation mode.
 
 ## Why identity denoising passes
 

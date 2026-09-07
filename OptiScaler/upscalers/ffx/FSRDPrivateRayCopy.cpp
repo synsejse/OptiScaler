@@ -109,6 +109,7 @@ std::shared_ptr<Targets> AllocateTargets(ID3D12Device* device, UINT width, UINT 
 
 struct Work::Impl
 {
+    std::shared_ptr<FSRDSubmission::Ticket> ticket;
     std::shared_ptr<Lease> lease;
     UINT width = 0, height = 0;
     const char* error = "";
@@ -121,6 +122,7 @@ Work::~Work() = default;
 bool Work::Recorded() const noexcept { return _impl->recorded; }
 std::string_view Work::Error() const noexcept { return _impl->error; }
 const Textures& Work::Outputs() const noexcept { return _impl->lease->outputs; }
+std::shared_ptr<FSRDSubmission::Ticket> Work::CompletionTicket() const noexcept { return _impl->ticket; }
 
 std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
                               const Textures& sources, const char** error) noexcept
@@ -208,6 +210,7 @@ bool Work::Record(ID3D12GraphicsCommandList* originalDirectList) noexcept
                 OnDevice(originalDirectList, lease.device.Get()), "ray-copy requires the original same-device direct list");
         const auto retained = FSRDSubmission::Retain(lease.device.Get(), originalDirectList, _impl->lease);
         Require(bool(retained), "ray-copy submission retention unavailable");
+        _impl->ticket = retained;
 
         // Native source COPY_SOURCE admission is exclusively the caller's contract.
         // No source StateBefore, binding changes, shader arithmetic or engine calls.

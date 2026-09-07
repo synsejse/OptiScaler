@@ -543,8 +543,9 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
     // A nested NGX evaluation may copy this scalar-only token while the ORIGINAL SL
     // call is active. No process-global latest-token fallback and no Fog pairing claim.
     const auto& cfg = *Config::Instance();
-    const bool observeFsrFogToken = cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
-                                   cfg.FfxDenoiserCyberpunkFogCapture.value_or_default();
+    const bool observeFsrFogToken = cfg.FfxDenoiserCyberpunkPreFog.value_or_default() ||
+                                  (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
+                                   cfg.FfxDenoiserCyberpunkFogCapture.value_or_default());
     FSRD::SlEvaluationProvenance::Scope tokenScope(observeFsrFogToken, feature, frame,
                                                   inputs, numInputs, cmdBuffer);
     auto result = o_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);

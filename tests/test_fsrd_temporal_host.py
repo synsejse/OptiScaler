@@ -184,13 +184,13 @@ struct PrivateResetPacket{
  std::optional<ResetSource::TemporalSource> timedSource;
  float delta=16;double fogTimestamp=100,previousFogTimestamp=84;};
 struct TemporalWindow{
- bool visual=false;
+ bool visual=false,continuous=false;
  std::mutex mutex;uint64_t epoch=7,warmupSerial=0;bool warmupReturned=false;std::atomic<bool> stopped{false};
  ComPtr<IUnknown> deviceIdentity,queueIdentity;ResetPolicy::Recording warmupRecording{};
  WindowPolicy::Receipt pendingWarmup{};
  std::array<WindowPolicy::Receipt,WindowPolicy::Window::MaxPendingCalls> pendingCalls{};
  std::unique_ptr<WindowPolicy::Window> policy;
- std::array<std::unique_ptr<PrivateResetPacket>,32> frames;
+ std::array<std::shared_ptr<PrivateResetPacket>,32> frames;
  std::shared_ptr<FSRD::PrivateDenoise::Session> session=std::make_shared<FSRD::PrivateDenoise::Session>();
  std::optional<TemporalCamera::PreviousFrame> previous;std::array<Json,32> ledger;
  uint32_t returnEvidencePending=0;bool ledgerEvidenceLost=false;
@@ -226,7 +226,7 @@ int main(int argc,char**argv){
   assert(window.policy->DeclareProducer(key,p));
   assert(window.policy->SealProducer(key,{p,p,1,2,3,4,true,true,true,true,true,true,true,true}));
   assert(window.policy->EmbedConsumer(key,c,1,true));assert(window.policy->SealConsumer(key,c,2,true,true));
-  auto packet=std::make_unique<PrivateResetPacket>();packet->denoise=std::make_shared<FSRD::PrivateDenoise::Work>();
+  auto packet=std::make_shared<PrivateResetPacket>();packet->denoise=std::make_shared<FSRD::PrivateDenoise::Work>();
   packet->denoise->frame=frame;packet->timedSource.emplace();packet->timedSource->current.frame=frame;
   packet->timedSource->current.rawSnapshot.width=1280;packet->timedSource->current.motionScale={1,1};
   window.frames[index]=std::move(packet);ID3D12CommandList* both[]{&producer,&consumer};
@@ -325,12 +325,12 @@ struct TemporalWindow{
  UINT width=1280,height=720;uint64_t epoch=8,provider=1;int settings=0;
  uint32_t frameCount=32;std::vector<PrivateResetPacket*> liveFrames;
  uint32_t warmupSkippedThrough=0;
- bool warmupReturned=true,stopped=false,finalCaptureQueued=false;
+ bool warmupReturned=true,stopped=false,finalCaptureQueued=false,continuous=false,restartRequested=false;
  std::optional<ResetSource::RawSource> lastFog=ResetSource::RawSource{};
  std::unique_ptr<WindowPolicy::Window> policy;std::array<std::optional<Targets>,2> freeTargets;
- std::array<std::unique_ptr<PrivateResetPacket>,32> frames;
+ std::array<std::shared_ptr<PrivateResetPacket>,32> frames;
 };
-void StopTemporalWindow(TemporalWindow& value,const char*){value.stopped=true;}
+void StopTemporalWindow(TemporalWindow& value,const char*,bool=false){value.stopped=true;}
 namespace FSRDFogLayerCapture{
  unsigned guideRequests=0,fogRequests=0,cancels=0;bool guides=true,fog=true;
  bool RequestEarlyGuides(){++guideRequests;return guides;}bool Request(){++fogRequests;return fog;}

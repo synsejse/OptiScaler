@@ -287,7 +287,8 @@ FSRDFeatureDx12::FSRDFeatureDx12(uint32_t InHandleId, NVSDK_NGX_Parameter* InPar
       _upscaleColorOverride(nullptr),
       _upscaleFovVertical(0.0f), _upscaleDeltaTime(0.0f)
 {
-    FSRD::PreFogSession::Freeze(Config::Instance()->FfxDenoiserCyberpunkPreFogExperiment.value_or_default());
+    FSRD::PreFogSession::Freeze(Config::Instance()->FfxDenoiserCyberpunkPreFogExperiment.value_or_default(),
+                              Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default());
     _lastDenoiserFrameTime = Util::MillisecondsNow();
     _preFogSrLastFrameTime = _lastDenoiserFrameTime;
     _moduleLoaded = FfxApiProxy::IsDenoiserReady();
@@ -624,8 +625,8 @@ void FSRDFeatureDx12::OverrideUpscaleDispatch(ffxDispatchDescUpscale& params)
 void FSRDFeatureDx12::PollPreFogExperiments()
 {
     const auto& cfg = *Config::Instance();
-    if (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
-        cfg.FfxDenoiserCyberpunkFogCapture.value_or_default())
+    if (FSRD::PreFogSession::Continuous() || (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
+        cfg.FfxDenoiserCyberpunkFogCapture.value_or_default()))
     {
         // Provider/context startup remains unchanged. Both routes can arm the
         // explicit controls; this polling does not run the late denoiser.
@@ -820,8 +821,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         const bool& started;
         ~FogCandidateCompletion() { FSRDCyberpunkFogProbe::CandidateCaptureResult(candidate, started); }
     } fogCandidateCompletion { fogCandidate, fogCandidateStarted };
-    if (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
-        cfg.FfxDenoiserCyberpunkFogCapture.value_or_default())
+    if (FSRD::PreFogSession::Continuous() || (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
+        cfg.FfxDenoiserCyberpunkFogCapture.value_or_default()))
     {
         PollPreFogExperiments();
         ID3D12Resource* color = nullptr;

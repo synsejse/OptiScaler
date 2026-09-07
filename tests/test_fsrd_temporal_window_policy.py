@@ -216,7 +216,44 @@ int main(){
   auto s=submit(w,{producer(0),consumer(0)});commit(w,key,s.receipt);
   assert(!submit(w,{producer(0)}).allowed); // Before either Reset, duplicates still refuse.
  }
- for(auto count:{0u,31u,33u,17999u,18001u,UINT32_MAX}){
+ // Continuous history reuses only retired slots; stale keys never alias a new frame.
+ {Window w(epoch,queue,first,Window::ContinuousFrameCount);FrameKey stale{};
+  assert(w.Continuous()&&w.StorageFrames()==64);
+  for(unsigned i=0;i<100000;++i){
+   const Recording p{100,10+uint64_t(i)*2},c{101,11+uint64_t(i)*2};
+   const auto key=producers(w,i,p);fog(w,i,c);if(i==0)stale=key;
+   auto s=submit(w,{p,c});assert(s.allowed);commit(w,key,s.receipt);
+   assert(!w.Complete()&&!key.CaptureFinal());
+   assert(!w.RetireSubmissionWatch(key,p,{101,c.generation+2}));
+   assert(w.RetireSubmissionWatch(key,{100,p.generation+2},{101,c.generation+2}));
+   assert(w.FrameFailed(stale)&&!w.ConsumerReturned(stale));
+   assert(w.StorageFrames()==64&&w.SubmissionWatches()==0&&!w.Stopped());
+  }
+  assert(w.CommittedFrames()==100000&&!w.Complete());
+ }
+ // A stopped continuous controller can drain an already sealed consumer, but
+ // the same opt-in does not weaken the existing bounded experiment contract.
+ {Window w(epoch,queue,first,0);const auto key=producers(w,0);fog(w,0);
+  auto s=submit(w,{producer(0),consumer(0)});w.Stop();
+  auto r=w.AfterExecute(s.receipt);assert(r.consumer==key);
+  assert(w.CommitConsumer(key,true)&&w.CommittedFrames()==1&&w.Stopped());}
+ // Submitted look-ahead work with no consumer can retire only after its actual
+ // return and a newer producer Reset; this never commits denoiser history.
+ {Window w(epoch,queue,first,0);const auto key=producers(w,0);w.Stop();
+  assert(!w.RetireUnusedProducer(key,{producer(0).list,producer(0).generation+1}));
+  auto s=submit(w,{producer(0)});assert(s.allowed);assert(w.AfterExecute(s.receipt).allowed);
+  assert(!w.RetireUnusedProducer(key,producer(0)));
+  assert(!w.RetireUnusedProducer(key,{producer(0).list,0}));
+  assert(w.RetireUnusedProducer(key,{producer(0).list,producer(0).generation+1}));
+  assert(w.CommittedFrames()==0&&w.SubmissionWatches()==0);}
+ {Window w(epoch,queue,first,0);const auto key=producers(w,0);fog(w,0);w.Stop();
+  auto s=submit(w,{producer(0)});assert(s.allowed);assert(w.AfterExecute(s.receipt).allowed);
+  assert(!w.RetireUnusedProducer(key,{producer(0).list,producer(0).generation+1}));}
+ {Window w(epoch,queue,first,0);
+  for(unsigned i=0;i<64;++i){auto key=producers(w,i);fog(w,i);
+   auto s=submit(w,{producer(i),consumer(i)});commit(w,key,s.receipt);}
+  assert(!w.ClaimRole(first+64,Role::Ray).Valid()&&w.Stopped());}
+ for(auto count:{31u,33u,17999u,18001u,UINT32_MAX}){
   Window w(epoch,queue,first,count);assert(w.Stopped()&&!w.ClaimRole(first,Role::Ray).Valid());}
  {Window w(epoch,queue,UINT32_MAX-17998,18000);assert(w.Stopped());}
  std::cout<<"32-frame control and 18000-frame visual routing, actual-return demux and guarded watch retirement passed\n";

@@ -27,7 +27,9 @@ struct FrameKey
     uint64_t epoch = 0;
     uint32_t index = 32, frame = 0;
     uint32_t frameCount = 32;
-    constexpr bool Valid() const noexcept { return epoch && (frameCount == 32 || frameCount == 18000) && index < frameCount; }
+    constexpr bool Valid() const noexcept
+    { return epoch && ((frameCount == 0 && index != UINT32_MAX) ||
+                      ((frameCount == 32 || frameCount == 18000) && index < frameCount)); }
     // The visual pass has no automatic readbacks, including at its last frame.
     constexpr bool CaptureFinal() const noexcept { return Valid() && frameCount == 32 && index == 31; }
     bool operator==(const FrameKey&) const = default;
@@ -57,7 +59,7 @@ struct ReturnDecision
     uint32_t producersReturned = 0;
 };
 
-// Value-only routing for ONE explicit bounded experiment. Host serializes every
+// Value-only routing for one history session, bounded or continuous. Host serializes every
 // method with its window lock, never held across native Execute/provider calls.
 // The caller authenticates epoch, actual source frames, canonical same-device
 // DIRECT queue, list/Reset generations, full intra-frame camera equality, actual
@@ -70,6 +72,7 @@ class Window
   public:
     static constexpr uint32_t FrameCount = 32;
     static constexpr uint32_t VisualFrameCount = 18000;
+    static constexpr uint32_t ContinuousFrameCount = 0;
     static constexpr size_t MaxVisualWatches = 64;
     // Only current and one producer look-ahead frame can acquire roles. Four is
     // a conservative bound on outstanding related native calls, not a D3D limit.
@@ -79,13 +82,16 @@ class Window
         : _epoch(epoch), _queue(queue), _first(observedFirstFrame), _frameCount(frameCount)
     {
         if (!epoch || !queue.queue || !queue.device || !queue.direct ||
-            (frameCount != FrameCount && frameCount != VisualFrameCount) ||
-            observedFirstFrame > std::numeric_limits<uint32_t>::max() - (frameCount - 1))
+            (frameCount != FrameCount && frameCount != VisualFrameCount && frameCount != ContinuousFrameCount) ||
+            (frameCount && observedFirstFrame > std::numeric_limits<uint32_t>::max() - (frameCount - 1)))
         {
             StopWith(Failure::InvalidWindow);
             return;
         }
-        _frames = std::vector<Frame>(frameCount); // Never resized: keys/receipts cannot refer to reused slots.
+        // Continuous slots are reused only after both native Reset generations
+        // advanced and every exact return receipt drained. A key also contains
+        // its absolute ordinal, so an old key cannot bind a reused slot.
+        _frames = std::vector<Frame>(frameCount ? frameCount : MaxVisualWatches);
         _watches.reserve(frameCount == FrameCount ? FrameCount : MaxVisualWatches);
         for (auto& frame : _frames) frame.policy.emplace(queue.device);
         _valid = true;
@@ -98,12 +104,15 @@ class Window
     // current frame. New Fog consumers cannot enter the look-ahead slot.
     FrameKey ClaimRole(uint32_t actualFrame, Role role) noexcept
     {
-        if (!_valid || actualFrame < _first || uint64_t(actualFrame) - _first >= _frameCount)
+        if (!_valid || actualFrame < _first || actualFrame - _first == UINT32_MAX ||
+            (_frameCount && uint64_t(actualFrame) - _first >= _frameCount))
         { StopWith(Failure::InvalidFrame); return {}; }
         const uint32_t index = actualFrame - _first;
         const auto bit = RoleBit(role);
         if (!bit) { StopWith(Failure::InvalidRole); return {}; }
-        auto& frame = _frames[index];
+        auto& frame = At(index);
+        if (frame.roles && frame.index != index)
+        { StopWith(Failure::ReceiptCapacity); return {}; }
         if (frame.roles & bit) { StopWith(Failure::RepeatedRole); return {}; }
         if (index < _committed || index > _committed + 1)
         { StopWith(Failure::OutsideLookAhead); return {}; }
@@ -115,8 +124,10 @@ class Window
         if (_stopped && (!frame.roles || role == Role::Fog)) return {};
         if (!frame.roles)
         {
-            if (_frameCount == VisualFrameCount && _watches.size() == MaxVisualWatches)
+            if (_frameCount != FrameCount && _watches.size() == MaxVisualWatches)
             { StopWith(Failure::ReceiptCapacity); return {}; }
+            frame.index = index;
+            if (!frame.policy) frame.policy.emplace(_queue.device);
             _watches.push_back(index); // Capacity reserved before any native recording.
         }
         frame.roles |= bit;
@@ -170,7 +181,7 @@ class Window
         Call call;
         for (const uint32_t index : _watches)
         {
-            auto& frame = _frames[index];
+            auto& frame = At(index);
             if (!frame.roles) continue;
             const auto decision = frame.policy->BeforeExecute(actualQueue, recordings);
             if (!decision.Allowed()) return RejectSubmission(Failure::FramePolicyRefused, decision.failure);
@@ -204,7 +215,8 @@ class Window
             for (uint32_t i = 0; i < pending.count; ++i)
             {
                 const auto entry = pending.entries[i];
-                auto& policy = *_frames[entry.index].policy;
+                if (At(entry.index).index != entry.index || !At(entry.index).policy) return RejectReturn();
+                auto& policy = *At(entry.index).policy;
                 const bool producerBefore = policy.ProducerReturned(), consumerBefore = policy.ConsumerReturned();
                 if (!policy.AfterExecute(entry.token)) return RejectReturn();
                 result.producersReturned += !producerBefore && policy.ProducerReturned();
@@ -224,10 +236,10 @@ class Window
     // and publish its OWN previous camera under the window lock before calling.
     // Producer return, scene recording alone and a fence guess cannot commit.
     // This policy deliberately does not own/call Session or manufacture camera data.
-    bool CommitConsumer(FrameKey key) noexcept
+    bool CommitConsumer(FrameKey key, bool drainStopped = false) noexcept
     {
         auto* frame = Find(key);
-        if (!frame || _stopped) return false;
+        if (!frame || (_stopped && !(Continuous() && drainStopped))) return false;
         if (key.index != _committed || !frame->policy->ConsumerReturned())
         { StopWith(Failure::ConsumerNotReturned); return false; }
         ++_committed;
@@ -241,13 +253,17 @@ class Window
         StopWith(Failure::FrameFailed);
     }
     bool Stopped() const noexcept { return _stopped; }
-    bool Complete() const noexcept { return !_stopped && _committed == _frameCount; } // Not GPU completion.
+    bool Complete() const noexcept { return _frameCount && !_stopped && _committed == _frameCount; } // Not GPU completion.
+    bool Continuous() const noexcept { return _frameCount == ContinuousFrameCount; }
+    size_t StorageFrames() const noexcept { return _frames.size(); }
     uint32_t CommittedFrames() const noexcept { return _committed; }
     Failure LastFailure() const noexcept { return _failure; }
     bool ConsumerEmbedded(FrameKey key) const noexcept
     { const auto* frame = FindConst(key); return frame && frame->policy->ConsumerEmbedded(); }
     bool ConsumerReturned(FrameKey key) const noexcept
     { const auto* frame = FindConst(key); return frame && frame->policy->ConsumerReturned(); }
+    bool ProducerReturned(FrameKey key) const noexcept
+    { const auto* frame = FindConst(key); return frame && frame->policy->ProducerReturned(); }
     // A soft window stop must not poison a previously embedded valid frame.
     // Invalid keys fail closed without changing any existing frame obligation.
     bool FrameFailed(FrameKey key) const noexcept
@@ -257,12 +273,13 @@ class Window
     // Reset. Old commands no longer exist on either list. This only stops
     // scanning an obsolete recording, never deletes a packet/policy or retires
     // GPU resources. The host separately requires its final fence and preserves
-    // all CPU packet addresses for the bounded visual pass. Unknown generations,
+    // all CPU packet addresses for the bounded visual pass; continuous mode
+    // separately requires every CPU reader to release before slot reuse. Unknown generations,
     // one-sided Reset and outstanding return receipts retain the watch.
     bool RetireSubmissionWatch(FrameKey key, Recording producer, Recording consumer) noexcept
     {
         const auto* frame = FindConst(key);
-        if (_frameCount != VisualFrameCount || !frame || key.index >= _committed || frame->policy->Failed() ||
+        if (_frameCount == FrameCount || !frame || key.index >= _committed || frame->policy->Failed() ||
             !frame->policy->ProducerReturned() || !frame->policy->ConsumerReturned() ||
             !producer.Valid() || !consumer.Valid() || producer.list != frame->producer.list ||
             consumer.list != frame->consumer.list || producer.generation <= frame->producer.generation ||
@@ -274,6 +291,27 @@ class Window
         const auto found = std::find(_watches.begin(), _watches.end(), key.index);
         if (found == _watches.end()) return false;
         _watches.erase(found);
+        if (Continuous()) Clear(key.index); // Old immutable key can no longer match this slot.
+        return true;
+    }
+    // A scene change may leave one successfully submitted look-ahead producer
+    // with no denoiser consumer. This does NOT acknowledge denoiser history.
+    // Host separately proves all producer/private-copy fences and no CPU readers.
+    bool RetireUnusedProducer(FrameKey key, Recording producer, Recording consumer = {}) noexcept
+    {
+        const auto* frame = FindConst(key);
+        if (!Continuous() || !_stopped || !frame || frame->policy->Failed() ||
+            frame->policy->ConsumerEmbedded() || !frame->policy->ProducerReturned() ||
+            !producer.Valid() || producer.list != frame->producer.list ||
+            producer.generation <= frame->producer.generation || frame->consumer.Valid()) return false;
+        if (consumer.list) return false; // No untracked consumer recording is accepted.
+        for (const auto& call : _calls)
+            if (call.receipt.Valid())
+                for (uint32_t i = 0; i < call.count; ++i)
+                    if (call.entries[i].index == key.index) return false;
+        const auto found = std::find(_watches.begin(), _watches.end(), key.index);
+        if (found == _watches.end()) return false;
+        _watches.erase(found); Clear(key.index);
         return true;
     }
     size_t SubmissionWatches() const noexcept { return _watches.size(); }
@@ -287,6 +325,7 @@ class Window
         std::optional<FramePolicy::Policy> policy;
         Recording producer {}, consumer {};
         uint8_t roles = 0;
+        uint32_t index = UINT32_MAX;
     };
     struct Call
     {
@@ -296,10 +335,19 @@ class Window
         uint32_t count = 0;
     };
     FrameKey Key(uint32_t index) const noexcept { return { _epoch, index, _first + index, _frameCount }; }
+    Frame& At(uint32_t index) noexcept { return _frames[index % _frames.size()]; }
+    const Frame& At(uint32_t index) const noexcept { return _frames[index % _frames.size()]; }
+    void Clear(uint32_t index) noexcept
+    {
+        auto& frame = At(index);
+        frame.policy.reset(); frame.producer = {}; frame.consumer = {};
+        frame.roles = 0; frame.index = UINT32_MAX;
+    }
     const Frame* FindConst(FrameKey key) const noexcept
     {
-        return _valid && key.epoch == _epoch && key.frameCount == _frameCount && key.index < _frameCount && key.frame == _first + key.index &&
-            _frames[key.index].roles ? &_frames[key.index] : nullptr;
+        return _valid && key.Valid() && key.epoch == _epoch && key.frameCount == _frameCount &&
+            key.index <= UINT32_MAX - _first && key.frame == _first + key.index &&
+            At(key.index).index == key.index && At(key.index).roles ? &At(key.index) : nullptr;
     }
     Frame* Find(FrameKey key) noexcept
     {

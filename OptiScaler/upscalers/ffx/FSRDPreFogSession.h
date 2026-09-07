@@ -14,26 +14,30 @@ namespace FSRD::PreFogSession
 // Before the first FSRD feature freezes configuration, scene insertion is refused.
 class RouteLatch
 {
-    enum class Route : uint8_t { Uninitialized, LateRr, LateSrOnly };
+    enum class Route : uint8_t { Uninitialized, LateRr, LateSrOnly, ContinuousPreFog };
     std::atomic<Route> _route { Route::Uninitialized };
 
   public:
-    bool Freeze(bool requested) noexcept
+    bool Freeze(bool requested, bool continuous = false) noexcept
     {
         auto expected = Route::Uninitialized;
-        _route.compare_exchange_strong(expected, requested ? Route::LateSrOnly : Route::LateRr,
+        _route.compare_exchange_strong(expected, continuous ? Route::ContinuousPreFog : requested ? Route::LateSrOnly : Route::LateRr,
                                        std::memory_order_acq_rel, std::memory_order_acquire);
         return LateSrOnly();
     }
-    bool LateSrOnly() const noexcept { return _route.load(std::memory_order_acquire) == Route::LateSrOnly; }
+    bool LateSrOnly() const noexcept
+    { const auto route = _route.load(std::memory_order_acquire); return route == Route::LateSrOnly || route == Route::ContinuousPreFog; }
+    bool Continuous() const noexcept { return _route.load(std::memory_order_acquire) == Route::ContinuousPreFog; }
 };
 
 inline RouteLatch processRoute;
-inline bool Freeze(bool requested) noexcept { return processRoute.Freeze(requested); }
+inline bool Freeze(bool requested, bool continuous = false) noexcept { return processRoute.Freeze(requested, continuous); }
 inline bool LateSrOnly() noexcept { return processRoute.LateSrOnly(); }
+inline bool Continuous() noexcept { return processRoute.Continuous(); }
 inline std::string_view StatusText() noexcept
 {
-    return LateSrOnly()
+    return Continuous() ? "Cyberpunk pre-Fog ray regeneration: automatic continuous denoising; original fog and late super-resolution. Check ACTIVE status; incomplete early inputs remain noisy, never late-denoised."
+        : LateSrOnly()
         ? "Pre-Fog experiment: late SR only; early scene denoising uses explicit bounded tests and is NOT guaranteed for this frame. Missing early work remains noisy; no late RR fallback."
         : "Ordinary late ray regeneration; pre-Fog scene experiment disabled.";
 }

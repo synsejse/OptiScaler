@@ -2,6 +2,10 @@
 
 This remains a Cyberpunk-oriented adapter, not a lossless translation of every NGX RR integration.
 
+The [Cyberpunk pre-Fog correction](FSR_RR_CONTINUOUS.md) moves denoising before
+the game's original fog. It is a separate restart-required option, not a
+generic change to the late NGX input conversion described below.
+
 See the [follow-up research and runtime validation](FSR_RR_POLISH_RESULTS.md) for measured input fidelity, build links and test limitations.
 
 - Only AMD's fused single-signal mode is supported. The albedo-weighted diffuse/specular split has been removed from the converter, denoiser dispatch, composition, GUI and configuration. Old `DenoiserMode` entries are ignored and deleted when saving settings; they cannot restore the guessed split.

@@ -1042,7 +1042,8 @@ static void hkSetGraphicsRootUnorderedAccessViewLate(ID3D12GraphicsCommandList* 
 void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
 {
     ID3D12GraphicsCommandList* probeList = nullptr;
-    if (commandList && Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default())
+    if (commandList && (Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
+                        Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default()))
     {
         if (!Util::CheckForRealObject(__FUNCTION__, commandList, (IUnknown**) &probeList))
             probeList = commandList;
@@ -1308,7 +1309,8 @@ static void HookToCommandList(ID3D12Device* InDevice)
                 LOG_WARN("Early hooks into RootSignature are nullptr");
             }
 
-            if (Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default())
+            if (Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
+                Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default())
             {
                 ID3D12GraphicsCommandList* probeList = nullptr;
                 if (!Util::CheckForRealObject(__FUNCTION__, commandList, (IUnknown**) &probeList))
@@ -2150,7 +2152,8 @@ static void HookToDevice(ID3D12Device* InDevice)
     if (Util::CheckForRealObject(__FUNCTION__, InDevice, (IUnknown**) &realDevice))
         pVTable = *(PVOID**) realDevice;
 
-    FSRDCyberpunkFogProbe::Initialize(Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default());
+    FSRDCyberpunkFogProbe::Initialize(Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
+                                     Config::Instance()->FfxDenoiserCyberpunkPreFog.value_or_default());
     FSRDCyberpunkFogProbe::HookDevice(realDevice ? realDevice : InDevice);
 
     // hudless
