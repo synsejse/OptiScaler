@@ -664,6 +664,28 @@ precedence, specular-hit-distance owner, and view-derived camera candidates.
 These candidates remain explicitly distinct from final NGX constants/reset.
 No early denoiser dispatch is enabled by this instrumentation.
 
+The v2 probe completed in live build `4209c1d6`, capture
+`fog-20260907-044320-648Z-324`. All five native UINT register loads were
+recorded; cb27 exactly contains float32 `[1280,720,1/1280,1/720]`. The direction
+matrix has positive homogeneous W at the fixed 221 sample positions. This
+validates a usable GPU observation, not the as-yet-uncaptured CPU matrix source.
+The early depth, motion and specular-hit-distance native addresses match both
+subsequent NGX candidates. The four material-buffer addresses were also present.
+Only 6.27% / 5.72% of candidate RGB pixels match native post-fog color, so neither
+candidate is accepted as the same frame. Address equality and submission order
+must not be substituted for image/frame identity.
+
+Static tracing identifies the bound ray-matrix recipe: current jittered inverse
+native projection (view+0x1c0) times inverse native view (view+0x180), with the
+entire inverse-view fourth row replaced by `[0,0,0,1]`. The source helper uses
+separate float32 multiplies/adds, not fused multiply-add. The next CPU-only
+observation records raw source rows for an independent 80-byte comparison.
+Jitter-free projection is a different matrix: it must retain authored lens
+offsets, not blindly zero all projection offsets. The source FOV at view+0x90
+is in degrees; the earlier `fov_radians` diagnostic label was incorrect. The
+production AMD dispatch still derives its FOV from projection coefficients,
+so correcting the label does not change that dispatch.
+
 The metadata also records borrowed native resource addresses from the exact
 32,768-slot engine texture registry, bounded by the authenticated slot layout.
 Positive reference counts and repeated reads are required to emit an address,

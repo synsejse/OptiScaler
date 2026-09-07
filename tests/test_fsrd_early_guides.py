@@ -67,9 +67,20 @@ class EarlyGuides(unittest.TestCase):
         for forbidden in ("AddRef(", "Release(", "GetDesc(", "reinterpret_cast<decltype"):
             self.assertNotIn(forbidden, SOURCE)
 
+    def test_intervals_are_bounded_compiler_metadata_not_gpu_proof(self):
+        for evidence in ("HolderArenaOffset = 0x514a18", "HolderStride = 0x58", "HolderCapacity = 320",
+                         '"inclusive_compiler_reservation_only"', '"producer_completion", "not_established"',
+                         '"alias_lifetime", "not_established"', '"holder_end_event_position"',
+                         "ranges[0] <= context.position && context.position <= ranges[1]",
+                         "ranges[0] > ranges[2] || ranges[2] > ranges[1]",
+                         "(holder - arena) % HolderStride", "count > HolderCapacity",
+                         "phase != 2 || !context.counter || used != 1"):
+            self.assertIn(evidence, SOURCE)
+
     def test_observational_camera_and_exact_motion_precedence(self):
         for evidence in ('"streamline_producer_observed", false', '"frame_token", "not_observed"',
-                         '"matrix_payload", "not_captured"', '"effective_ngx_reset", "not_established"',
+                         '"matrix_payload", "current_view_CPU_source_rows_only"',
+                         '"effective_ngx_reset", "not_established"',
                          '"final_ngx_constants", "not_established"', "0x3e4, 0x80000000u",
                          "value == 0", "if (overrideHandle)", "SetHandle(result, overrideHandle)",
                          "features.Test(0x5a)", "features.Test(0x37)", "features.Test(0x46)"):
@@ -77,6 +88,34 @@ class EarlyGuides(unittest.TestCase):
         self.assertNotIn("overrideHandle <= INT32_MAX", SOURCE)
         self.assertIn("bit / 64", SOURCE)
         self.assertIn("bit & 63", SOURCE)
+
+    def test_raw_camera_rows_are_sources_not_reconstructed_gpu_constants(self):
+        for evidence in ('"optiscaler.fsr_rr.early_camera_sources.v2"',
+                         '"bound_shared_cb12_match", "not_validated"',
+                         '"camera_position_binding", "not_observed"',
+                         '"jitter_free_projection", "not_captured_or_reconstructed"',
+                         '"previous_camera", "not_observed"', '"source_uint32_rows"',
+                         '"source_float_rows"', '"repeated_source_words_equal"',
+                         '"fov_degrees"', '"producer_scale_bits", 0x37000000u',
+                         '"source_int32_xyz"', '"view_pointer_unchanged"'):
+            self.assertIn(evidence, SOURCE)
+        for offset in ("0xc0", "0x180", "0x200", "0x1c0", "0x360"):
+            self.assertIn(f"FloatRowsField<4, 4>(read, context.view, {offset})", SOURCE)
+        for offset in ("0x2c0", "0x2e0", "0x2d0"):
+            self.assertIn(f"FloatRowsField<1, 3>(read, context.view, {offset})", SOURCE)
+        self.assertIn("FloatRowsField<1, 2>(read, context.view, 0xa0)", SOURCE)
+        for forbidden in ("fov_radians", "XMMatrix", "XMVector", "std::tan", "std::atan"):
+            self.assertNotIn(forbidden, SOURCE)
+
+    def test_frame_id_getter_route_is_metadata_without_virtual_call(self):
+        route = SOURCE.split("Json FrameIdVirtualRoute(", 1)[1].split("Json CameraProvenance(", 1)[0]
+        for evidence in ('"virtual_call_performed", false', '"returned_object", "not_observed"',
+                         '"frame_id", "not_observed"', '"target_executable", "not_established"',
+                         "Address(context.context, 0)", "Address(object, 0)", "Address(vtable, 0x20)",
+                         "target < image || target > imageLast", '"target_rva"] = target - image'):
+            self.assertIn(evidence, route)
+        for forbidden in ("reinterpret_cast", "std::function", "GetProcAddress", "Address(object, 0x1a0)"):
+            self.assertNotIn(forbidden, route)
 
     def test_project_contains_standalone_files(self):
         for project in ("OptiScaler.vcxproj", "OptiScaler.vcxproj.filters"):
@@ -128,6 +167,7 @@ using namespace FSRDCyberpunkEarlyGuides;
 constexpr uintptr_t context = 0x10000, view = 0x20000, graph = 0x40000;
 constexpr uintptr_t buckets = 0x800000, entries = 0x900000, image = 0x10000000;
 constexpr uintptr_t registry = 0x20000000;
+constexpr uintptr_t holders = graph + 0x514a18;
 constexpr uint32_t keys[] = {0x63bcf380,0x64bcf513,0x65bcf6a6,0x61f178d4,0xdebf0c27,0x15eab19c};
 void setup()
 {
@@ -136,15 +176,32 @@ void setup()
     put<uint8_t>(context + 0x38, 0); put<uintptr_t>(context + 0x18, view);
     put<uintptr_t>(context + 8, 0x30000); put<uintptr_t>(0x30000, graph);
     put<uint32_t>(graph + 0x40, 12);
+    put<uint8_t>(graph + 2, 2); put<uint32_t>(graph + 0x514a10, 6);
     put<uint32_t>(view + 0x34, 1280); put<uint32_t>(view + 0x38, 720);
     put<uint64_t>(view + 0x17d0, 0);
     put<uint64_t>(view + 0x17d8, 0);
     put<uintptr_t>(view + 0x1d70, 0xc00000);
     put<uint32_t>(0xc00268, 0); put<uint32_t>(0xc00274, 0);
     put<float>(view + 0xb0, .1f); put<float>(view + 0xb4, 1000.f);
-    put<float>(view + 0x90, 1.2f); put<float>(view + 0x98, 1.777f);
+    put<float>(view + 0x90, 70.f); put<float>(view + 0x98, 1.777f);
+    put<float>(view + 0x9c, 1.25f);
+    put<std::array<float,2>>(view + 0xa0, {.03125f, -.0625f});
+    put<std::array<int32_t,3>>(view + 0x70, {-131072, 262144, INT32_MIN});
+    put<std::array<float,3>>(view + 0x2c0, {1.f, 2.f, 3.f});
+    put<std::array<float,3>>(view + 0x2e0, {4.f, 5.f, 6.f});
+    put<std::array<float,3>>(view + 0x2d0, {7.f, 8.f, 9.f});
+    for (const auto offset : {0xc0u, 0x180u, 0x1c0u, 0x200u, 0x360u})
+    {
+        std::array<uint32_t,16> words;
+        for (size_t i = 0; i < words.size(); ++i) words[i] = 0x3f000000u + offset * 16 + i;
+        put(view + offset, words);
+    }
     put<float>(view + 0x3e0, .25f); put<float>(view + 0x3e4, -.125f);
+    put<uint32_t>(view + 0x3e8, 1280); put<uint32_t>(view + 0x3ec, 720);
+    put<uint32_t>(view + 0x3f0, 17); put<uint8_t>(view + 0x3f4, 0x84);
     put<uint8_t>(view + 0xef0, 1);
+    put<uintptr_t>(context, 0xe00000); put<uintptr_t>(0xe00000, 0xf00000);
+    put<uintptr_t>(0xf00020, image + 0x123450); // Function target deliberately has no readable mock memory.
     put<TableHeader>(graph + 0x51b848, {buckets, 6, 13, entries, 0, 0x40});
     std::array<uint32_t,13> heads; heads.fill(UINT32_MAX);
     for (uint32_t i = 0; i < 6; ++i)
@@ -152,9 +209,13 @@ void setup()
         const auto key = keys[i] ^ (3u << 24), bucket = key % 13;
         put<std::array<uint32_t,3>>(entries + i * 0x40, {heads[bucket], key, key});
         heads[bucket] = i;
-        put<uintptr_t>(entries + i * 0x40 + 0x20, 0xa00000 + i * 0x100);
-        put<uintptr_t>(0xa00050 + i * 0x100, 0xb00000 + i * 0x100);
+        put<uintptr_t>(entries + i * 0x40 + 0x20, holders + i * 0x58);
+        put<std::array<uint64_t,3>>(holders + i * 0x58, {2, 30, 20});
+        put<uintptr_t>(holders + i * 0x58 + 0x50, 0xb00000 + i * 0x100);
+        put<std::array<uint64_t,2>>(0xb00000 + i * 0x100, {2, 30});
+        put<uint8_t>(0xb00010 + i * 0x100, 1);
         put<uint32_t>(0xb00014 + i * 0x100, i + 100);
+        put<uint8_t>(0xb0003c + i * 0x100, 0); put<uint8_t>(0xb00040 + i * 0x100, 1);
     }
     for (uint32_t i = 0; i < 13; ++i) put<uint32_t>(buckets + i * 4, heads[i]);
     put<int32_t>(image + NoVModeRva, -1);
@@ -168,6 +229,11 @@ void setup()
     }
 }
 Json describe() { return Json::parse(Describe(reinterpret_cast<void*>(context), image)); }
+Json intervalOnly(uintptr_t selectedHolder = holders)
+{
+    Reader read;
+    return LogicalInterval(read, ReadContext(read, context), selectedHolder, 0xb00000, 100);
+}
 int main()
 {
     setup(); auto result = describe();
@@ -181,28 +247,201 @@ int main()
         assert(mapping["ref_status"] == 1 && mapping["ref_status_after"] == 1);
         assert(mapping["lifetime"] == "not_established");
         assert(mapping["gpu_initialized"] == "not_established");
+        const auto& interval = result["inputs"][i]["logical_interval"];
+        assert(interval["status"] == "compiler_interval_observed");
+        assert(interval["holder_index"] == i && interval["holder_capacity"] == 320);
+        assert(interval["inclusive_contains_position"] == true);
+        assert(interval["holder_reservation_end"] == 30 && interval["holder_end_event_position"] == 20);
+        assert(interval["end_event_relation"] == "before" && interval["repeated_metadata_equal"] == true);
+        assert(interval["producer_completion"] == "not_established" && interval["alias_lifetime"] == "not_established");
     }
     assert(result["guide_settings"]["NoV_mode"] == -1);
     assert(result["guide_settings"]["extra_specular_enabled"] == 0);
     assert(result["graph_position"] == 11 && result["namespace"] == 3);
     assert(result["read_calls"].get<size_t>() < MaxReadCalls);
     assert(result["inputs"].size() == 8);
+    // Closed reservation endpoints are inclusive, but the separately retained
+    // end event can already precede the reservation end. Neither is GPU proof.
+    for (const uint32_t position : {1, 2, 19, 20, 21, 30, 31})
+    {
+        put<uint32_t>(graph + 0x40, position + 1);
+        const auto interval = intervalOnly();
+        assert(interval["status"] == "compiler_interval_observed");
+        assert(interval["inclusive_contains_position"] == (position >= 2 && position <= 30));
+        assert(interval["end_event_relation"] == (position < 20 ? "before" : position == 20 ? "at" : "after"));
+    }
+    setup(); put<uint8_t>(context + 0x38, 3); put<uint32_t>(graph + 3*0x5e00 + 0x40, 12);
+    put<std::array<uint64_t,3>>(holders, {0x30002, 0x3001e, 0x30014});
+    auto interval = intervalOnly();
+    assert(interval["current_position"] == 0x3000b && interval["inclusive_contains_position"] == true);
+    // A physical record can be reused later; its last assigned range must not
+    // replace the selected logical holder range in the coverage conclusion.
+    setup(); put<std::array<uint64_t,2>>(0xb00000, {40, 50});
+    interval = intervalOnly();
+    assert(interval["record_range_begin"] == 40 && interval["inclusive_contains_position"] == true);
+    for (const uint32_t count : {0, 321})
+    {
+        setup(); put<uint32_t>(graph + 0x514a10, count); interval = intervalOnly();
+        assert(interval["status"] == "unavailable" && !interval.contains("inclusive_contains_position"));
+    }
+    setup();
+    for (const uintptr_t holder : {holders - 1, holders + 1, holders + 6*0x58, holders + 320*0x58})
+    {
+        interval = intervalOnly(holder);
+        assert(interval["reason"] == "holder outside current bounded graph arena");
+        assert(!interval.contains("holder_first_use"));
+    }
+    for (const auto ranges : {std::array<uint64_t,3>{21,30,20}, {2,19,20},
+                              {2,UINT64_MAX,20}, {2,0x01000000,20}})
+    {
+        setup(); put(holders, ranges); interval = intervalOnly();
+        assert(interval["reason"] == "unsupported or unordered compiler interval");
+        assert(!interval.contains("inclusive_contains_position"));
+    }
+    for (const auto address : {graph + 2, graph + 0x40, uintptr_t(0xb00010)})
+    {
+        setup(); put<uint8_t>(address, 0); interval = intervalOnly();
+        assert(interval["reason"] == "executing operation and assigned record not established");
+        assert(!interval.contains("inclusive_contains_position"));
+    }
+    for (const auto address : {holders, holders + 0x50, graph + 0x514a10, uintptr_t(0xb00000)})
+    {
+        setup(); mutateAfterRead = address; result = describe();
+        const auto& changed = result["inputs"][0]["logical_interval"];
+        assert(changed["repeated_metadata_equal"] == false);
+        assert(!changed.contains("inclusive_contains_position"));
+        assert(result["inputs"][0]["status"] == "handle_present"); // Still CPU handle metadata only.
+    }
+    setup(); memory.erase(holders + 23); interval = intervalOnly();
+    assert(interval["status"] == "unavailable" && !interval.contains("inclusive_contains_position"));
+    setup(); partial = true;
+    Reader intervalRead;
+    GraphContext intervalContext; intervalContext.context = context; intervalContext.graph = graph;
+    interval = LogicalInterval(intervalRead, intervalContext, holders, 0xb00000, 100);
+    assert(interval["status"] == "unavailable");
+    partial = false; intervalRead.calls = MaxReadCalls;
+    assert(LogicalInterval(intervalRead, intervalContext, holders, 0xb00000, 100)["reason"] ==
+           "CPU metadata read budget exhausted");
+    setup(); result = describe();
     assert(result["inputs"][5]["handle"] == 104 && result["inputs"][5]["streamline_tag"] == 0);
     assert(result["inputs"][6]["handle"] == 0 && result["inputs"][6]["status"] == "unavailable");
     assert(result["inputs"][7]["status"] == "not_enabled_by_current_view");
     assert(result["camera_provenance"]["jitter_y"]["producer_candidate"] == .125);
     assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == false);
+    const auto camera = result["camera_provenance"];
+    assert(camera["schema"] == "optiscaler.fsr_rr.early_camera_sources.v2");
+    assert(camera["snapshot_atomic"] == false && camera["view_pointer_unchanged"] == true);
+    assert(camera["bound_shared_cb12_match"] == "not_validated");
+    assert(camera["jitter_free_projection"] == "not_captured_or_reconstructed");
+    assert(camera["fov_degrees"]["producer_candidate"] == 70.f && !camera.contains("fov_radians"));
+    assert(camera["projection_zoom"]["producer_candidate"] == 1.25f);
+    assert(camera["authored_lens_offset"]["source_float_rows"][0][0] == .03125f);
+    assert(camera["authored_lens_offset"]["source_float_rows"][0][1] == -.0625f);
+    assert(camera["position"]["source_int32_xyz"][0] == -131072);
+    assert(camera["position"]["source_uint32_words"][2] == 0x80000000u);
+    assert(camera["position"]["producer_candidate"] == Json::array({-1.f, 2.f, -16384.f}));
+    assert(camera["basis_right"]["source_float_rows"][0] == Json::array({1.f,2.f,3.f}));
+    assert(camera["basis_up"]["source_float_rows"][0] == Json::array({4.f,5.f,6.f}));
+    assert(camera["basis_forward"]["source_float_rows"][0] == Json::array({7.f,8.f,9.f}));
+    assert(camera["native_jitter_width"]["source_value"] == 1280);
+    assert(camera["native_jitter_height"]["source_value"] == 720);
+    assert(camera["jitter_related_field"]["source_value"] == 17);
+    assert(camera["projection_flags"]["source_value"] == 0x84);
+    assert(camera["projection_flags"]["reverse_z_mask"] == 4);
+    assert(camera["frame_id_virtual_route"]["status"] == "image_local_target_observed");
+    assert(camera["frame_id_virtual_route"]["object_address"] == 0xe00000);
+    assert(camera["frame_id_virtual_route"]["vtable_address"] == 0xf00000);
+    assert(camera["frame_id_virtual_route"]["target_address"] == image + 0x123450);
+    assert(camera["frame_id_virtual_route"]["target_rva"] == 0x123450);
+    assert(camera["frame_id_virtual_route"]["virtual_call_performed"] == false);
+    assert(camera["frame_id_virtual_route"]["returned_object"] == "not_observed");
+    const auto& matrices = camera["matrices"];
+    assert(matrices.size() == 5);
+    for (const auto& matrix : matrices)
+    {
+        assert(matrix["status"] == "CPU_value_present" && matrix["all_finite"] == true);
+        assert(matrix["repeated_source_words_equal"] == true && matrix["byte_size"] == 64);
+        const auto offset = matrix["view_offset"].get<uint32_t>();
+        assert(matrix["source_uint32_rows"].size() == 4);
+        for (size_t row = 0; row < 4; ++row)
+        {
+            assert(matrix["source_uint32_rows"][row].size() == 4);
+            for (size_t col = 0; col < 4; ++col)
+                assert(matrix["source_uint32_rows"][row][col] == 0x3f000000u + offset*16 + row*4 + col);
+        }
+    }
+    assert(matrices["native_view"]["view_offset"] == 0xc0);
+    assert(matrices["inverse_native_view"]["view_offset"] == 0x180);
+    assert(matrices["native_projection_jittered"]["view_offset"] == 0x200);
+    assert(matrices["inverse_native_projection_jittered"]["view_offset"] == 0x1c0);
+    assert(matrices["depth_converted_projection_jittered"]["view_offset"] == 0x360);
     put<uint8_t>(view + 0xef0, 0); put<uint32_t>(view + 0x3e4, 0);
     result = describe();
     assert(result["camera_provenance"]["history"]["producer_reset_candidate"] == true);
     assert(result["camera_provenance"]["jitter_y"]["producer_candidate_bits"] == 0x80000000u);
     put<uint32_t>(view + 0x90, 0x7fc01234u); result = describe();
-    assert(result["camera_provenance"]["fov_radians"]["source_bits"] == 0x7fc01234u);
-    assert(result["camera_provenance"]["fov_radians"]["producer_candidate"].is_null());
+    assert(result["camera_provenance"]["fov_degrees"]["source_bits"] == 0x7fc01234u);
+    assert(result["camera_provenance"]["fov_degrees"]["producer_candidate"].is_null());
     memory.erase(view + 0xef0); memory.erase(view + 0xb0); result = describe();
     assert(!result.contains("read_failure"));
     assert(result["camera_provenance"]["history"]["status"] == "unavailable");
     assert(result["camera_provenance"]["near_plane"]["status"] == "unavailable");
+    setup(); put<uint32_t>(view + 0x1c0, 0x7fc05678u);
+    put<uint32_t>(view + 0x1c4, 0xff800000u); put<uint32_t>(view + 0x1c8, 0x80000000u);
+    result = describe();
+    const auto raw = result["camera_provenance"]["matrices"]["inverse_native_projection_jittered"];
+    assert(raw["all_finite"] == false && raw["status"] == "CPU_value_present");
+    assert(raw["source_uint32_rows"][0][0] == 0x7fc05678u);
+    assert(raw["source_uint32_rows"][0][1] == 0xff800000u);
+    assert(raw["source_uint32_rows"][0][2] == 0x80000000u);
+    assert(raw["source_float_rows"][0][0].is_null() && raw["source_float_rows"][0][1].is_null());
+    assert(raw["source_float_rows"][0][2] == 0.f); // Sign remains exact in uint32 rows.
+    setup(); mutateAfterRead = view + 0x180; result = describe();
+    assert(result["camera_provenance"]["matrices"]["inverse_native_view"]["repeated_source_words_equal"] == false);
+    assert(result["camera_provenance"]["matrices"]["inverse_native_view"]["source_uint32_rows"][0][0] ==
+           0x3f000000u + 0x180*16); // First raw snapshot is retained without repair.
+    setup(); memory.erase(view + 0x200 + 63); result = describe();
+    assert(!result.contains("read_failure"));
+    assert(result["camera_provenance"]["matrices"]["native_projection_jittered"]["status"] == "unavailable");
+    assert(!result["camera_provenance"]["matrices"]["native_projection_jittered"].contains("source_uint32_rows"));
+    assert(result["camera_provenance"]["matrices"]["inverse_native_view"]["status"] == "CPU_value_present");
+    setup(); memory.erase(view + 0x70); memory.erase(view + 0x3e8); result = describe();
+    assert(result["camera_provenance"]["position"]["status"] == "unavailable");
+    assert(result["camera_provenance"]["native_jitter_width"]["status"] == "unavailable");
+    setup(); mutateAfterRead = context + 0x18; result = describe();
+    assert(result["camera_provenance"]["view_pointer_unchanged"] == false);
+    setup(); partial = true;
+    Reader cameraRead;
+    const auto partialRows = FloatRowsField<4,4>(cameraRead, view, 0xc0);
+    assert(partialRows["status"] == "unavailable" && !partialRows.contains("source_uint32_rows"));
+    partial = false;
+    const auto overflowRows = FloatRowsField<4,4>(cameraRead, UINTPTR_MAX - 0xc0, 0xc0);
+    assert(overflowRows["reason"] == "invalid read range");
+    cameraRead.calls = MaxReadCalls;
+    assert((FloatRowsField<4,4>(cameraRead, view, 0xc0)["status"] == "unavailable"));
+    for (const auto invalidTarget : {uintptr_t(0), image - 1, image + ImageBytes, UINTPTR_MAX})
+    {
+        setup(); put<uintptr_t>(0xf00020, invalidTarget); result = describe();
+        const auto& route = result["camera_provenance"]["frame_id_virtual_route"];
+        assert(route["status"] == "unavailable" && !route.contains("target_address") && !route.contains("target_rva"));
+        assert(result["camera_provenance"]["frame_token"] == "not_observed");
+    }
+    for (const auto validTarget : {image, image + ImageBytes - 1})
+    {
+        setup(); put<uintptr_t>(0xf00020, validTarget); result = describe();
+        assert(result["camera_provenance"]["frame_id_virtual_route"]["target_rva"] == validTarget - image);
+        assert(result["camera_provenance"]["frame_id_virtual_route"]["target_executable"] == "not_established");
+    }
+    for (const auto unavailableAddress : {context, uintptr_t(0xe00000), uintptr_t(0xf00020)})
+    {
+        setup(); memory.erase(unavailableAddress); result = describe();
+        assert(!result.contains("read_failure"));
+        assert(result["camera_provenance"]["frame_id_virtual_route"]["status"] == "unavailable");
+    }
+    setup(); put<uintptr_t>(context, 0); result = describe();
+    assert(result["camera_provenance"]["frame_id_virtual_route"]["status"] == "unavailable");
+    setup(); put<uintptr_t>(0xe00000, UINTPTR_MAX); result = describe();
+    assert(result["camera_provenance"]["frame_id_virtual_route"]["reason"] == "null or overflowing address");
     setup(); put<uint64_t>(view + 0x17d8, uint64_t(1) << (0x5a & 63));
     result = describe(); assert(result["inputs"][6]["handle"] == 105);
     put<uint64_t>(view + 0x17d0, uint64_t(1) << 0x37);
@@ -238,7 +477,7 @@ int main()
     assert(result["guide_settings"]["extra_specular_scale"] == .75);
     setup(); put<uintptr_t>(entries + 0x20, 0);
     put<uintptr_t>(entries + 0x28, 0xd00000); put<uint32_t>(entries + 0x34, 3);
-    for (unsigned i = 0; i < 3; ++i) put<uintptr_t>(0xd00000 + i * 24, 0xa00000 + i * 0x100);
+    for (unsigned i = 0; i < 3; ++i) put<uintptr_t>(0xd00000 + i * 24, holders + i * 0x58);
     put<uint64_t>(0xd00008, 0); put<uint64_t>(0xd00020, 10); put<uint64_t>(0xd00038, 99);
     result = describe(); assert(result["inputs"][0]["handle"] == 101);
     assert(result["inputs"][0]["selected_version_index"] == 1);
@@ -254,7 +493,7 @@ int main()
     assert(result["inputs"][0]["reason"] == "graph hash chain bound or cycle");
     setup(); put<uintptr_t>(entries + 0x20, 0); // Missing version metadata must be caught.
     result = describe(); assert(result["inputs"][0]["status"] == "unavailable");
-    setup(); put<uintptr_t>(0xa00050, 0); result = describe();
+    setup(); put<uintptr_t>(holders + 0x50, 0); result = describe();
     assert(result["inputs"][0]["reason"] == "selected resource record unavailable");
     setup(); put<uint8_t>(context + 0x30, 3); result = describe();
     assert(result["namespace"] == 0 && result["inputs"][0]["status"] == "unavailable");

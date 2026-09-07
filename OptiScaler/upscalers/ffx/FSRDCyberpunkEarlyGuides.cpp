@@ -134,6 +134,81 @@ struct TableHeader
 };
 static_assert(sizeof(uintptr_t) == 8 && sizeof(TableHeader) == 32);
 
+// Compiler 0x24cac8 and allocator 0x1f7f24 use closed unsigned ranges of
+// (selector << 16) | uint16(operationIndex), stored in uint64 fields.
+// 0x24d114 preserves the original end at +0x10 BEFORE +0x08 is extended
+// through protected scopes. This describes compiler reservation only:
+// neither a producer, native resource lifetime, nor GPU readiness is proved.
+Json LogicalInterval(Reader& read, const GraphContext& context, uintptr_t holder,
+                     uintptr_t resourceRecord, uint32_t handle)
+{
+    constexpr uintptr_t HolderArenaOffset = 0x514a18, HolderStride = 0x58;
+    constexpr uint32_t HolderCapacity = 320, MaxEncodedPosition = 0x00ffffff;
+    Json result = { { "status", "unavailable" }, { "holder_address", holder },
+        { "resource_record_address", resourceRecord }, { "graph_address", context.graph },
+        { "current_position", context.position }, { "current_operation_counter", context.counter },
+        { "current_selector", context.selector }, { "holder_capacity", HolderCapacity },
+        { "position_encoding", "selector_u8_shift16_or_operation_u16" },
+        { "interval_semantics", "inclusive_compiler_reservation_only" },
+        { "producer_completion", "not_established" }, { "alias_lifetime", "not_established" },
+        { "resource_state", "not_observed" }, { "snapshot_atomic", false } };
+    try
+    {
+        const auto phase = read.Read<uint8_t>(Address(context.graph, 2));
+        const auto count = read.Read<uint32_t>(Address(context.graph, 0x514a10));
+        result["graph_phase"] = phase;
+        result["holder_count"] = count;
+        const auto arena = Address(context.graph, HolderArenaOffset);
+        if (!count || count > HolderCapacity || holder < arena ||
+            (holder - arena) % HolderStride || (holder - arena) / HolderStride >= count)
+            throw std::runtime_error("holder outside current bounded graph arena");
+        result["holder_index"] = (holder - arena) / HolderStride;
+        const auto ranges = read.Read<std::array<uint64_t, 3>>(holder);
+        const auto recordRanges = read.Read<std::array<uint64_t, 2>>(resourceRecord);
+        const auto used = read.Read<uint8_t>(Address(resourceRecord, 0x10));
+        const auto kind = read.Read<uint8_t>(Address(resourceRecord, 0x3c));
+        const auto policy = read.Read<uint8_t>(Address(resourceRecord, 0x40));
+        result["holder_first_use"] = ranges[0];
+        result["holder_reservation_end"] = ranges[1];
+        result["holder_end_event_position"] = ranges[2];
+        // A reused physical record may describe another logical reservation.
+        // Do not substitute its ranges for the selected holder's interval.
+        result["record_range_begin"] = recordRanges[0];
+        result["record_range_end"] = recordRanges[1];
+        result["record_used_flag"] = used;
+        result["record_handle"] = handle;
+        result["record_kind"] = kind;
+        result["record_policy"] = policy;
+        const bool unchanged = ranges == read.Read<std::array<uint64_t, 3>>(holder) &&
+            recordRanges == read.Read<std::array<uint64_t, 2>>(resourceRecord) &&
+            resourceRecord == read.Read<uintptr_t>(Address(holder, 0x50)) &&
+            handle == read.Read<uint32_t>(Address(resourceRecord, 0x14)) &&
+            used == read.Read<uint8_t>(Address(resourceRecord, 0x10)) &&
+            kind == read.Read<uint8_t>(Address(resourceRecord, 0x3c)) &&
+            policy == read.Read<uint8_t>(Address(resourceRecord, 0x40)) &&
+            count == read.Read<uint32_t>(Address(context.graph, 0x514a10)) &&
+            phase == read.Read<uint8_t>(Address(context.graph, 2)) &&
+            context.counter == read.Read<uint32_t>(Address(context.graph,
+                uint64_t(context.selector) * 0x5e00 + 0x40)) &&
+            context.selector == read.Read<uint8_t>(Address(context.context, 0x38));
+        result["repeated_metadata_equal"] = unchanged;
+        if (!unchanged)
+            throw std::runtime_error("graph interval metadata changed during reads");
+        if (phase != 2 || !context.counter || used != 1)
+            throw std::runtime_error("executing operation and assigned record not established");
+        if (ranges[0] > MaxEncodedPosition || ranges[1] > MaxEncodedPosition ||
+            ranges[2] > MaxEncodedPosition || ranges[0] > ranges[2] || ranges[2] > ranges[1])
+            throw std::runtime_error("unsupported or unordered compiler interval");
+        result["inclusive_contains_position"] =
+            ranges[0] <= context.position && context.position <= ranges[1];
+        result["end_event_relation"] = context.position < ranges[2] ? "before" :
+            context.position == ranges[2] ? "at" : "after";
+        result["status"] = "compiler_interval_observed";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
 // Bounded read-only translation of RVA 0x1f3d20 and version selector 0x96d5ec
 // for the already-authenticated executable. Missing versions fail closed, unlike
 // the original helper's unchecked dereference. No graph dependency registration.
@@ -224,6 +299,7 @@ Json Resolve(Reader& read, const GraphContext& context, uint32_t baseKey, const 
             throw std::runtime_error("selected resource record unavailable");
         const auto handle = read.Read<uint32_t>(Address(resourceRecord, 0x14));
         result["handle"] = handle;
+        result["logical_interval"] = LogicalInterval(read, context, holder, resourceRecord, handle);
         result["status"] = handle && handle <= INT32_MAX ? "handle_present" : "unavailable";
         if (!handle || handle > INT32_MAX)
             result["reason"] = "selected native handle invalid";
@@ -376,7 +452,8 @@ Json SpecularHitDistance(Reader& read, const GraphContext& context, const ViewFe
 
 Json FloatField(Reader& read, uintptr_t view, uintptr_t offset, uint32_t signXor = 0)
 {
-    Json result = { { "view_offset", offset }, { "status", "unavailable" } };
+    Json result = { { "view_offset", offset }, { "byte_size", sizeof(float) },
+        { "producer_sign_xor", signXor }, { "status", "unavailable" } };
     try
     {
         const auto bits = read.Read<uint32_t>(Address(view, offset));
@@ -392,21 +469,153 @@ Json FloatField(Reader& read, uintptr_t view, uintptr_t offset, uint32_t signXor
     return result;
 }
 
+// One complete bounded read per raw block; a repeated read detects some source
+// mutations only. Equal bytes do not establish an atomic camera/frame snapshot.
+// Preserve NaN payloads and signed zero in the integer rows; JSON float views are
+// convenience only. Never transpose, invert, normalize or repair these sources.
+template <size_t Rows, size_t Columns>
+Json FloatRowsField(Reader& read, uintptr_t view, uintptr_t offset)
+{
+    using Words = std::array<std::array<uint32_t, Columns>, Rows>;
+    static_assert(sizeof(Words) == Rows * Columns * sizeof(uint32_t));
+    Json result = { { "view_offset", offset }, { "byte_size", sizeof(Words) },
+        { "layout", "consecutive_float32_rows" }, { "status", "unavailable" },
+        { "repeated_source_words_equal", nullptr } };
+    try
+    {
+        const auto words = read.Read<Words>(Address(view, offset));
+        Json values = Json::array();
+        bool allFinite = true;
+        for (const auto& row : words)
+        {
+            Json valueRow = Json::array();
+            for (const auto bits : row)
+            {
+                float value = 0;
+                std::memcpy(&value, &bits, sizeof(value));
+                allFinite &= std::isfinite(value);
+                valueRow.push_back(std::isfinite(value) ? Json(value) : Json(nullptr));
+            }
+            values.push_back(std::move(valueRow));
+        }
+        result["source_uint32_rows"] = words;
+        result["source_float_rows"] = std::move(values);
+        result["all_finite"] = allFinite;
+        result["status"] = "CPU_value_present";
+        try
+        {
+            result["repeated_source_words_equal"] = words == read.Read<Words>(Address(view, offset));
+        }
+        catch (const std::exception& error) { result["repeat_read_failure"] = error.what(); }
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
+Json PositionField(Reader& read, uintptr_t view)
+{
+    Json result = { { "view_offset", 0x70 }, { "byte_size", 12 },
+        { "source_type", "int32_xyz_fixed_point" }, { "producer_scale_bits", 0x37000000u },
+        { "status", "unavailable" } };
+    try
+    {
+        const auto words = read.Read<std::array<uint32_t, 3>>(Address(view, 0x70));
+        std::array<int32_t, 3> position {};
+        std::memcpy(position.data(), words.data(), sizeof(position));
+        std::array<float, 3> candidate {};
+        for (size_t i = 0; i < candidate.size(); ++i)
+            candidate[i] = static_cast<float>(position[i]) * (1.0f / 131072.0f);
+        result["source_uint32_words"] = words;
+        result["source_int32_xyz"] = position;
+        result["producer_candidate"] = candidate; // Authored signed conversion, not inverse-view translation.
+        result["status"] = "CPU_value_present";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
+template <typename T> Json UnsignedField(Reader& read, uintptr_t view, uintptr_t offset)
+{
+    static_assert(std::is_unsigned_v<T>);
+    Json result = { { "view_offset", offset }, { "byte_size", sizeof(T) }, { "status", "unavailable" } };
+    try
+    {
+        result["source_value"] = read.Read<T>(Address(view, offset));
+        result["status"] = "CPU_value_present";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
+// RVA 0x1d4fdc0 obtains an explicit frame ID through context[0]'s virtual
+// slot +0x20, then returnedObject+0x1a0. Observe the route only: no virtual
+// call, no guessed returned object, and no inferred frame ID/token.
+Json FrameIdVirtualRoute(Reader& read, const GraphContext& context, uintptr_t image)
+{
+    Json result = { { "status", "unavailable" }, { "context_object_offset", 0 },
+        { "vtable_slot_offset", 0x20 }, { "virtual_call_performed", false },
+        { "returned_object", "not_observed" }, { "frame_id", "not_observed" },
+        { "target_executable", "not_established" }, { "snapshot_atomic", false } };
+    try
+    {
+        const auto imageLast = Address(image, ImageBytes - 1);
+        const auto object = read.Read<uintptr_t>(Address(context.context, 0));
+        result["object_address"] = object;
+        const auto vtable = read.Read<uintptr_t>(Address(object, 0));
+        result["vtable_address"] = vtable;
+        const auto target = read.Read<uintptr_t>(Address(vtable, 0x20));
+        if (target < image || target > imageLast)
+            throw std::runtime_error("frame-ID virtual target is outside authenticated image");
+        result["target_address"] = target;
+        result["target_rva"] = target - image;
+        result["status"] = "image_local_target_observed";
+    }
+    catch (const std::exception& error) { result["reason"] = error.what(); }
+    return result;
+}
+
 // The later authored producer (RVA 0x788a9c, publishing through 0x78933c)
 // reads these view fields. We have NOT observed that producer or its frame token;
 // these are candidates, not an early-ready replacement for final NGX constants.
-Json CameraProvenance(Reader& read, const GraphContext& context)
+Json CameraProvenance(Reader& read, const GraphContext& context, uintptr_t image)
 {
-    Json result = { { "status", "current_view_CPU_sources_only" },
+    Json result = { { "schema", "optiscaler.fsr_rr.early_camera_sources.v2" },
+        { "status", "current_view_CPU_sources_only" }, { "snapshot_atomic", false },
         { "streamline_producer_observed", false }, { "frame_token", "not_observed" },
-        { "final_ngx_constants", "not_established" }, { "matrix_payload", "not_captured" },
-        { "effective_ngx_reset", "not_established" } };
+        { "final_ngx_constants", "not_established" }, { "matrix_payload", "current_view_CPU_source_rows_only" },
+        { "bound_shared_cb12_match", "not_validated" }, { "camera_position_binding", "not_observed" },
+        { "jitter_free_projection", "not_captured_or_reconstructed" },
+        { "previous_camera", "not_observed" }, { "effective_ngx_reset", "not_established" } };
+    result["frame_id_virtual_route"] = FrameIdVirtualRoute(read, context, image);
     result["near_plane"] = FloatField(read, context.view, 0xb0);
     result["far_plane"] = FloatField(read, context.view, 0xb4);
-    result["fov_radians"] = FloatField(read, context.view, 0x90);
+    // RVA 0x1e4338 multiplies this field by pi/180 before projection creation.
+    // Cyberpunk copies degrees to SL despite that API's radians documentation.
+    result["fov_degrees"] = FloatField(read, context.view, 0x90);
     result["aspect_ratio"] = FloatField(read, context.view, 0x98);
+    result["projection_zoom"] = FloatField(read, context.view, 0x9c);
+    result["authored_lens_offset"] = FloatRowsField<1, 2>(read, context.view, 0xa0);
     result["jitter_x"] = FloatField(read, context.view, 0x3e0);
     result["jitter_y"] = FloatField(read, context.view, 0x3e4, 0x80000000u);
+    result["native_jitter_width"] = UnsignedField<uint32_t>(read, context.view, 0x3e8);
+    result["native_jitter_height"] = UnsignedField<uint32_t>(read, context.view, 0x3ec);
+    result["jitter_related_field"] = UnsignedField<uint32_t>(read, context.view, 0x3f0);
+    result["projection_flags"] = UnsignedField<uint8_t>(read, context.view, 0x3f4);
+    result["projection_flags"]["reverse_z_mask"] = 0x04;
+    result["position"] = PositionField(read, context.view);
+    result["basis_right"] = FloatRowsField<1, 3>(read, context.view, 0x2c0);
+    result["basis_up"] = FloatRowsField<1, 3>(read, context.view, 0x2e0);
+    result["basis_forward"] = FloatRowsField<1, 3>(read, context.view, 0x2d0);
+    // Recompute RVA 0x1e412c and shared-CB producer 0x7854c0 establish these
+    // CPU offsets. The cb12 ray matrix uses inverse_native_projection_jittered
+    // times inverse_native_view with row 3 replaced by [0,0,0,1]. Capture sources
+    // only: that product is an offline prediction, not the bound GPU payload.
+    result["matrices"] = {
+        { "native_view", FloatRowsField<4, 4>(read, context.view, 0xc0) },
+        { "inverse_native_view", FloatRowsField<4, 4>(read, context.view, 0x180) },
+        { "native_projection_jittered", FloatRowsField<4, 4>(read, context.view, 0x200) },
+        { "inverse_native_projection_jittered", FloatRowsField<4, 4>(read, context.view, 0x1c0) },
+        { "depth_converted_projection_jittered", FloatRowsField<4, 4>(read, context.view, 0x360) } };
     Json history = { { "view_offset", 0xef0 }, { "status", "unavailable" } };
     try
     {
@@ -417,6 +626,15 @@ Json CameraProvenance(Reader& read, const GraphContext& context)
     }
     catch (const std::exception& error) { history["reason"] = error.what(); }
     result["history"] = std::move(history);
+    // A matching pointer is only a source identity check, not a frame token or
+    // proof that the independently read view fields were unchanged in between.
+    result["view_pointer_unchanged"] = nullptr;
+    try
+    {
+        result["view_pointer_unchanged"] = context.view ==
+            read.Read<uintptr_t>(Address(context.context, 0x18));
+    }
+    catch (const std::exception& error) { result["view_pointer_read_failure"] = error.what(); }
     return result;
 }
 }
@@ -465,7 +683,7 @@ std::string Describe(const void* context, uintptr_t authenticatedImageBase) noex
                     input["texture_registry"] = RegistryMapping(read, authenticatedImageBase,
                                                                  input["handle"].get<uint32_t>());
             result["inputs"] = std::move(inputs);
-            result["camera_provenance"] = CameraProvenance(read, graph);
+            result["camera_provenance"] = CameraProvenance(read, graph, authenticatedImageBase);
             Json settings = { { "NoV_mode", read.Read<int32_t>(Address(authenticatedImageBase, NoVModeRva)) },
                 { "scope", "authored settings only; not a ready or complete early cb6 payload" } };
             if (!extra.contains("feature_0x35"))
