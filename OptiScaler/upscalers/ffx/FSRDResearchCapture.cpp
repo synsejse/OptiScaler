@@ -32,6 +32,7 @@ struct Entry
 
 struct Batch
 {
+    std::shared_ptr<void> provenanceOwner;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12GraphicsCommandList> list;
     ID3D12CommandList* submittedList = nullptr;
@@ -56,6 +57,7 @@ struct Registry
     std::mutex mutex;
     std::vector<Capture> pending;
     UINT count = 0;
+    UINT fogCandidateAttempts = 0;
     uint64_t sequence = 0;
     UINT burst = 0;
     std::string label;
@@ -141,16 +143,29 @@ static ComPtr<ID3D12Resource> Buffer(ID3D12Device* device, UINT64 size, D3D12_HE
     return result;
 }
 
-Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width, UINT height, uint64_t feature,
-              uint64_t frame, const std::string& metadata)
+static Capture BeginInternal(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width, UINT height,
+                             uint64_t feature, uint64_t frame, const std::string& metadata,
+                             const std::shared_ptr<void>& provenanceOwner)
 {
-    if (!WantsCapture(feature))
+    const bool fogCandidate = bool(provenanceOwner);
+    if (fogCandidate && (!Config::Instance()->FfxDenoiserCyberpunkFogProbe.value_or_default() ||
+                         !Config::Instance()->FfxDenoiserCyberpunkFogCapture.value_or_default()))
+        return {};
+    if (!fogCandidate && !WantsCapture(feature))
         return {};
     auto& registry = RegistryInstance();
     std::lock_guard lock(registry.mutex);
+    if (fogCandidate)
+    {
+        if (registry.fogCandidateAttempts >= 2)
+            return {};
+        ++registry.fogCandidateAttempts;
+        if (registry.burst != 0 || registry.requestedFeature.load(std::memory_order_relaxed) != NoFeature)
+            return {};
+    }
     if (registry.pending.size() >= 2)
         return {};
-    const bool fromGui = registry.requestedFeature.load(std::memory_order_relaxed) == feature;
+    const bool fromGui = !fogCandidate && registry.requestedFeature.load(std::memory_order_relaxed) == feature;
     try
     {
         if (width == 0 || height == 0 || UINT64(width) * height * 16 > MaxBytes / 2)
@@ -158,7 +173,11 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
         const auto base = Util::ExePath().parent_path();
         const auto request = base / "FSRRR-capture.request";
         std::error_code error;
-        if (fromGui)
+        if (fogCandidate)
+        {
+            // No marker consumption, global request, or retry on a later evaluation.
+        }
+        else if (fromGui)
         {
             registry.label = TimestampLabel(registry, "dump");
             registry.burst = 1;
@@ -186,10 +205,11 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
             registry.burst = 2;
             registry.burstFeature = feature;
         }
-        if (registry.burstFeature != feature)
+        if (!fogCandidate && registry.burstFeature != feature)
             return {};
 
         auto batch = std::make_shared<Batch>();
+        batch->provenanceOwner = provenanceOwner;
         batch->device = device;
         batch->list = list;
         batch->submittedList = ResTrack_Dx12::PrepareSubmission(device, list);
@@ -203,10 +223,11 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
         batch->metadata["storage"] =
             "little-endian float32 RGBA, row-major, shader-visible values (not native texture bytes)";
         batch->metadata["textures"] = Json::array();
-        batch->metadata["trigger"] = fromGui ? "gui" : "file";
+        batch->metadata["trigger"] = fogCandidate ? "fog_candidate_unvalidated" : fromGui ? "gui" : "file";
         batch->metadata["byte_limit"] = MaxBytes;
+        const auto label = fogCandidate ? TimestampLabel(registry, "fog-candidate") : registry.label;
         batch->directory =
-            base / "FSRRR-captures" / std::format("{}-{}-{}-{}", registry.label, GetCurrentProcessId(), feature, frame);
+            base / "FSRRR-captures" / std::format("{}-{}-{}-{}", label, GetCurrentProcessId(), feature, frame);
         std::filesystem::create_directories(batch->directory.parent_path());
         if (!std::filesystem::create_directory(batch->directory))
             throw std::runtime_error("capture directory already exists; refusing to overwrite it");
@@ -231,9 +252,10 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
                             "research fence failed");
         registry.pending.push_back(batch);
         hasCaptures.store(true, std::memory_order_release);
-        if (!fromGui)
+        if (!fromGui && !fogCandidate)
             ++registry.count;
-        --registry.burst;
+        if (!fogCandidate)
+            --registry.burst;
         registry.status.directory = batch->directory.string();
         registry.status.message = "Recording buffers; waiting for GPU submission.";
         LOG_INFO("FSRRR research recording {}", batch->directory.string());
@@ -241,13 +263,29 @@ Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width,
     }
     catch (const std::exception& error)
     {
-        registry.burst = 0;
+        if (!fogCandidate)
+            registry.burst = 0;
         if (fromGui)
             registry.requestedFeature.store(NoFeature, std::memory_order_release);
         registry.status.message = std::format("Dump failed: {}", error.what());
         LOG_ERROR("FSRRR research begin: {}", error.what());
         return {};
     }
+}
+
+Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width, UINT height, uint64_t feature,
+              uint64_t frame, const std::string& metadata)
+{
+    return BeginInternal(device, list, width, height, feature, frame, metadata, {});
+}
+
+Capture BeginFogCandidate(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width, UINT height,
+                          uint64_t feature, uint64_t frame, const std::string& metadata,
+                          const std::shared_ptr<void>& provenanceOwner)
+{
+    if (!provenanceOwner)
+        return {};
+    return BeginInternal(device, list, width, height, feature, frame, metadata, provenanceOwner);
 }
 
 void Record(const Capture& batch, const char* name, ID3D12Resource* texture, bool fullExtent)

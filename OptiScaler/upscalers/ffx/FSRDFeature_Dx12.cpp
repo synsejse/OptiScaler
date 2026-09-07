@@ -718,6 +718,14 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     ffxDispatchDescDenoiser denoiserDesc = {};
     bool isDenoiserReady = false;
 
+    FSRDCyberpunkFogProbe::CaptureCandidate fogCandidate;
+    bool fogCandidateStarted = false;
+    struct FogCandidateCompletion
+    {
+        const FSRDCyberpunkFogProbe::CaptureCandidate& candidate;
+        const bool& started;
+        ~FogCandidateCompletion() { FSRDCyberpunkFogProbe::CandidateCaptureResult(candidate, started); }
+    } fogCandidateCompletion { fogCandidate, fogCandidateStarted };
     if (cfg.FfxDenoiserCyberpunkFogProbe.value_or_default() &&
         cfg.FfxDenoiserCyberpunkFogCapture.value_or_default())
     {
@@ -725,8 +733,8 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         ID3D12Resource* beforeParticles = nullptr;
         TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_Color, color);
         TryGetNGXVoidPointer(inParams, NVSDK_NGX_Parameter_DLSSD_ColorBeforeParticles, beforeParticles);
-        FSRDCyberpunkFogProbe::ObserveNgxInput(InCommandList, color, beforeParticles,
-                                             Handle()->Id, _frameCount, RenderWidth(), RenderHeight());
+        fogCandidate = FSRDCyberpunkFogProbe::ObserveNgxInput(InCommandList, color, beforeParticles,
+                                                            Handle()->Id, _frameCount, RenderWidth(), RenderHeight());
     }
 
     // Pull configuration and input buffers for DLSS-RR from the param table, convert and
@@ -740,7 +748,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     // The options were snapshotted before conversion. Request the dump here on
     // the render thread after input preparation, so the reset and capture cannot
     // land on different frames. A busy capture defers the manual reset request.
-    const bool manualDenoiserReset = diagnosticView && !(_frameDiagnosticOptions & FSRD::IdentityDenoiser) &&
+    const bool manualDenoiserReset = !fogCandidate && diagnosticView && !(_frameDiagnosticOptions & FSRD::IdentityDenoiser) &&
         _diagnostics.resetDenoiserHistory.load() && FSRDResearch::Request(Handle()->Id);
     const auto diagnosticPlan = FSRD::PlanDiagnostics(_frameDiagnosticOptions, isDenoiseBypassed,
         _isInReset, denoiserHadHistory, _lastDenoiserOptions, upscalerHadHistory, _lastUpscalerOptions,
@@ -758,7 +766,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
     _frameShowNativeDebug = diagnosticView && diagnosticPlan.runDenoiser && _nativeDebugOutput &&
                             _diagnostics.ShowNativeDebug();
     const bool dispatchNativeDebug = diagnosticView && diagnosticPlan.runDenoiser && _nativeDebugOutput &&
-                                     (_frameShowNativeDebug || FSRDResearch::WantsCapture(Handle()->Id));
+                                     (_frameShowNativeDebug || fogCandidate || FSRDResearch::WantsCapture(Handle()->Id));
     ffxDispatchDescDenoiserDebugView nativeDebugDesc = {};
     if (dispatchNativeDebug)
     {
@@ -780,7 +788,7 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
         const bool& succeeded;
         ~CaptureCompletion() { FSRDResearch::Finish(capture, succeeded); }
     } captureCompletion { research, captureEvaluationSucceeded };
-    if (FSRDResearch::WantsCapture(Handle()->Id))
+    if (fogCandidate || FSRDResearch::WantsCapture(Handle()->Id))
     {
         auto matrix = [](const XMFLOAT4X4& value)
         {
@@ -871,8 +879,18 @@ bool FSRDFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
             if (inParams.Get(key, &value) == NVSDK_NGX_Result_Success)
                 metadata["scalars"][key] = value;
         }
-        research = FSRDResearch::Begin(Device, InCommandList, RenderWidth(), RenderHeight(),
-                                      Handle()->Id, _frameCount, metadata.dump());
+        if (fogCandidate)
+        {
+            // Candidate identity is not a validated same-frame association. Its submission
+            // sidecar and exact image values must be checked offline before pairing.
+            metadata["fog_candidate"] = nlohmann::json::parse(fogCandidate->metadata);
+            research = FSRDResearch::BeginFogCandidate(Device, InCommandList, RenderWidth(), RenderHeight(),
+                Handle()->Id, _frameCount, metadata.dump(), fogCandidate->ownership);
+            fogCandidateStarted = bool(research);
+        }
+        else
+            research = FSRDResearch::Begin(Device, InCommandList, RenderWidth(), RenderHeight(),
+                                          Handle()->Id, _frameCount, metadata.dump());
         if (research)
         {
             const std::pair<const char*, const char*> inputs[] = {

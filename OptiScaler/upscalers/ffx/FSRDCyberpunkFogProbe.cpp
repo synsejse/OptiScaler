@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -56,6 +57,8 @@ constexpr unsigned MaxListEvictionLogs = 8;
 constexpr UINT64 MaxCaptureTextureBytes = 256ull * 1024 * 1024;
 constexpr unsigned MaxNgxEndpoints = 8;
 constexpr UINT64 MaxEndpointResourceBytes = 256ull * 1024 * 1024;
+constexpr unsigned MaxCaptureCandidates = 2, MaxObservedSubmissions = 256, MaxListsPerSubmission = 512;
+constexpr ULONGLONG SubmissionWindowMs = 10000;
 
 // Runtime loading avoids adding another DLL import to ordinary, probe-off builds.
 struct CryptoApi
@@ -167,6 +170,19 @@ struct ListState
     std::array<D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports {};
     std::array<D3D12_RECT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors {};
 };
+struct CandidateState
+{
+    ComPtr<IUnknown> list;
+    uint64_t generation = 0;
+    Json metadata;
+    bool reported = false, started = false;
+};
+struct SubmissionData
+{
+    ComPtr<IUnknown> queue;
+    uint64_t entry = 0, exit = 0;
+    Json lists;
+};
 struct EndpointTrace
 {
     ComPtr<IUnknown> list;
@@ -177,6 +193,13 @@ struct EndpointTrace
     uint64_t generation = 0, ordinal = 0;
     UINT64 resourceBytes = 0;
     unsigned count = 0;
+    std::string sessionKey, sidecarRelative, fogCaptureId;
+    std::vector<CandidateState> candidates;
+    std::vector<std::shared_ptr<SubmissionData>> submissions;
+    ULONGLONG startedAt = 0;
+    unsigned observedSubmissions = 0;
+    bool endpointsClosed = false, fogRecorded = false, finalized = false;
+    std::string failure;
 };
 struct Registry
 {
@@ -186,6 +209,7 @@ struct Registry
     std::vector<RtvHeap> heaps;
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
+    std::shared_ptr<EndpointTrace> submissionTrace;
     size_t slots = 0;
     uint64_t reservedRtvSlots = 0;
     uint64_t nextHeap = 0, nextSlot = 0, nextRecording = 0;
@@ -206,6 +230,8 @@ std::atomic<bool> captureEnabled { false }, captureTrackingValid { true };
 std::atomic<unsigned> captureRefusalLogs { 0 };
 std::atomic<bool> captureStarted { false };
 std::atomic<bool> endpointActive { false };
+std::atomic<bool> submissionActive { false };
+std::atomic<uint64_t> submissionSerial { 0 };
 std::atomic<unsigned> drawLogs { 0 }, emptyLogs { 0 };
 std::atomic<unsigned> arm { 0 };
 std::atomic<uint64_t> scopes { 0 };
@@ -517,6 +543,128 @@ Json OwnEndpointResource(EndpointTrace& trace, ID3D12Resource* resource)
             { "mip_levels", desc.MipLevels }, { "format", UINT(desc.Format) },
             { "sample_count", desc.SampleDesc.Count }, { "sample_quality", desc.SampleDesc.Quality },
             { "layout", UINT(desc.Layout) }, { "flags", UINT(desc.Flags) } } } };
+}
+
+struct LocatedSubmission
+{
+    std::shared_ptr<SubmissionData> submission;
+    UINT index = 0;
+    unsigned occurrences = 0;
+};
+LocatedSubmission LocateSubmission(const EndpointTrace& trace, const std::string& role)
+{
+    LocatedSubmission result;
+    for (const auto& submission : trace.submissions)
+        for (const auto& list : submission->lists)
+            for (const auto& foundRole : list["roles"])
+                if (foundRole == role)
+                {
+                    result.submission = submission;
+                    result.index = list["array_index"].get<UINT>();
+                    ++result.occurrences;
+                }
+    return result;
+}
+
+Json SubmissionRelation(const LocatedSubmission& fog, const LocatedSubmission& rr)
+{
+    const char* relation = "submission_not_observed";
+    if (fog.occurrences > 1 || rr.occurrences > 1)
+        relation = "repeated_recording_submission_ambiguous";
+    else if (fog.submission && rr.submission && fog.submission->exit && rr.submission->exit)
+    {
+        if (fog.submission == rr.submission)
+            relation = fog.index < rr.index ? "same_batch_array_order_only" : fog.index == rr.index ?
+                "same_submitted_command_list" : "RR_list_precedes_fog_in_same_batch";
+        else if (fog.submission->queue.Get() != rr.submission->queue.Get())
+            relation = "different_queues_synchronization_not_observed";
+        else if (fog.submission->exit < rr.submission->entry)
+            relation = "ordered_nonoverlapping_same_queue_calls";
+        else if (rr.submission->exit < fog.submission->entry)
+            relation = "RR_submission_precedes_fog";
+        else
+            relation = "overlapping_queue_calls_order_unknown";
+    }
+    return { { "relation", relation }, { "fog_submission_occurrences", fog.occurrences },
+        { "RR_submission_occurrences", rr.occurrences },
+        { "resource_dependencies", "not_tracked" }, { "same_frame", "not_established" },
+        { "unchanged_contents", "requires_independent_native_pixel_comparison" } };
+}
+
+void FinalizeSubmissionTrace(const std::shared_ptr<EndpointTrace>& trace) noexcept
+{
+    if (!trace)
+        return;
+    try
+    {
+        Json document;
+        std::string relative;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            if (trace->finalized)
+                return;
+            const auto fog = LocateSubmission(*trace, "fog");
+            bool ready = trace->fogRecorded && fog.occurrences == 1 && fog.submission->exit &&
+                !trace->candidates.empty() &&
+                (trace->candidates.size() == MaxCaptureCandidates || trace->endpointsClosed);
+            Json candidates = Json::array(), submissions = Json::array();
+            for (size_t i = 0; i < trace->candidates.size(); ++i)
+            {
+                const auto& candidate = trace->candidates[i];
+                const auto rr = LocateSubmission(*trace, std::format("candidate-{}", i + 1));
+                ready &= candidate.reported && (!candidate.started ||
+                    (rr.occurrences == 1 && rr.submission->exit));
+                candidates.push_back({ { "candidate", candidate.metadata },
+                    { "capture_result_reported", candidate.reported }, { "capture_started", candidate.started },
+                    { "submission_evidence", SubmissionRelation(fog, rr) } });
+            }
+            if (GetTickCount64() - trace->startedAt > SubmissionWindowMs && !ready)
+                trace->failure = "submission observation window expired";
+            if (!ready && trace->failure.empty())
+                return;
+            trace->finalized = true;
+            for (const auto& submission : trace->submissions)
+                submissions.push_back({ { "queue_identity", std::format("{:x}", uintptr_t(submission->queue.Get())) },
+                    { "call_entry_serial", submission->entry }, { "call_exit_serial", submission->exit },
+                    { "lists", submission->lists } });
+            document = { { "schema", "optiscaler.fsr_rr.fog_submission_candidates.v1" },
+                { "complete", ready && trace->failure.empty() }, { "failure", trace->failure },
+                { "session_key", trace->sessionKey }, { "process_id", GetCurrentProcessId() },
+                { "fog_capture_id", trace->fogCaptureId }, { "fog_origin", trace->fog },
+                { "candidates", candidates }, { "submissions", submissions },
+                { "observed_queue_calls", trace->observedSubmissions },
+                { "status", "candidate_provenance_only_not_validated_pairing" },
+                { "interval_semantics", "CPU call entry/return brackets; no new queue ordering or fences" },
+                { "same_batch_warning", "array order alone does not prove workload completion or unchanged color" } };
+            relative = trace->sidecarRelative;
+            submissionActive.store(false, std::memory_order_release);
+            data.submissionTrace.reset();
+        }
+        const auto path = Util::ExePath().parent_path() / relative;
+        auto temporary = path;
+        temporary += ".tmp";
+        std::filesystem::create_directories(path.parent_path());
+        const auto contents = document.dump(2);
+        if (contents.size() > 2 * 1024 * 1024)
+            throw std::runtime_error("submission sidecar size limit exceeded");
+        HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("cannot create unique submission sidecar");
+        DWORD written = 0;
+        const bool saved = WriteFile(file, contents.data(), DWORD(contents.size()), &written, nullptr) &&
+                           written == contents.size();
+        CloseHandle(file);
+        if (!saved || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH))
+            throw std::runtime_error("cannot finalize submission sidecar");
+        LOG_INFO("[FSRRR fog endpoint] candidate submission provenance saved {}; complete={} (not a validated frame pair)",
+                 path.string(), document["complete"].get<bool>());
+    }
+    catch (const std::exception& error)
+    {
+        try { LOG_WARN("[FSRRR fog endpoint] submission sidecar incomplete: {}", error.what()); } catch (...) {}
+    }
+    catch (...) {}
 }
 
 HRESULT WINAPI HookCreateList(ID3D12Device* device, UINT nodeMask, D3D12_COMMAND_LIST_TYPE type,
@@ -995,7 +1143,16 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     if (mainBytes > MaxCaptureTextureBytes || copyBytes > MaxCaptureTextureBytes || authoredBytes > MaxCaptureTextureBytes ||
         mainBytes + 2 * copyBytes + authoredBytes > MaxCaptureTextureBytes)
         throw std::runtime_error("fog capture retained texture allocation exceeds 256 MiB");
+    SYSTEMTIME now {};
+    GetSystemTime(&now);
+    plan->endpoint->startedAt = GetTickCount64();
+    plan->endpoint->sessionKey = std::format("{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}Z-{}-{}", now.wYear,
+        now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+        GetCurrentProcessId(), plan->provenance["scope_serial"].get<uint64_t>());
+    plan->endpoint->sidecarRelative = std::format("FSRRR-fog-captures/provenance-{}.json", plan->endpoint->sessionKey);
     plan->endpoint->fog = {
+        { "session_key", plan->endpoint->sessionKey }, { "process_id", GetCurrentProcessId() },
+        { "submission_sidecar", plan->endpoint->sidecarRelative },
         { "scope_serial", plan->provenance["scope_serial"] },
         { "command_list_identity", std::format("{:x}", uintptr_t(plan->endpoint->list.Get())) },
         { "command_list_generation", plan->endpoint->generation }, { "endpoint_ordinal", plan->endpoint->ordinal },
@@ -1047,7 +1204,9 @@ void PublishFogEndpoint(const std::shared_ptr<CapturePlan>& plan) noexcept
         {
             std::lock_guard lock(data.mutex);
             data.endpoint = plan->endpoint;
+            data.submissionTrace = plan->endpoint;
             endpointActive.store(true, std::memory_order_release);
+            submissionActive.store(true, std::memory_order_release);
         }
         LOG_INFO("[FSRRR fog endpoint] original fog draw recorded; origin={}; next {} CPU-observed RR endpoints only; no GPU/frame/content association",
                  plan->endpoint->fog.dump(), MaxNgxEndpoints);
@@ -1079,6 +1238,17 @@ void FinishCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<Captur
     }
     const bool recorded = FSRDFogLayerCapture::Record(plan->device.Get(), list, plan->layers,
                                                      plan->provenance.dump(), plan);
+    {
+        const auto status = FSRDFogLayerCapture::GetStatus();
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        plan->endpoint->fogRecorded = recorded;
+        if (!status.directory.empty())
+            plan->endpoint->fogCaptureId = std::filesystem::path(status.directory).filename().string();
+        if (!recorded)
+            plan->endpoint->failure = "native fog readback was not recorded";
+    }
+    FinalizeSubmissionTrace(plan->endpoint);
     LOG_INFO("[FSRRR fog capture] original draw preserved; private readback recorded={} scope={}",
              recorded, plan->provenance["scope_serial"].get<uint64_t>());
 }
@@ -1312,12 +1482,13 @@ bool Authenticate(uintptr_t& entry)
 }
 } // namespace
 
-void ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
+CaptureCandidate ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                      ID3D12Resource* colorBeforeParticles, uint64_t featureId, uint64_t frameIndex,
                      UINT renderWidth, UINT renderHeight) noexcept
 {
     if (!endpointActive.load(std::memory_order_acquire))
-        return; // No COM calls, allocation, file polling or locks on the inactive path.
+        return {}; // No COM calls, allocation, file polling or locks on the inactive path.
+    CaptureCandidate result;
     Metadata([&] {
         std::shared_ptr<EndpointTrace> trace;
         try
@@ -1359,13 +1530,40 @@ void ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                     { "unchanged_contents", "not_verified" },
                     { "observation_order", "CPU endpoint callbacks only; not submission or presentation order" }
                 };
+                if (trace->candidates.size() < MaxCaptureCandidates && recordingKnown && color &&
+                    record["color"]["matches_fog_resource"].get<bool>() && renderWidth && renderHeight)
+                {
+                    const unsigned candidateIndex = UINT(trace->candidates.size()) + 1;
+                    Json metadata = {
+                        { "schema", "optiscaler.fsr_rr.fog_capture_candidate.v1" },
+                        { "status", "unvalidated_candidate" }, { "session_key", trace->sessionKey },
+                        { "process_id", GetCurrentProcessId() }, { "fog_scope_serial", trace->fog["scope_serial"] },
+                        { "candidate_index", candidateIndex }, { "rr_feature", featureId }, { "rr_frame", frameIndex },
+                        { "fog_origin", trace->fog }, { "rr_command_list_identity", record["command_list_identity"] },
+                        { "rr_recording_generation", generation }, { "rr_endpoint_ordinal", ordinal },
+                        { "owned_resource_identity", record["color"]["canonical_identity"] },
+                        { "color_address", record["color"]["address"] }, { "render_extent", { renderWidth, renderHeight } },
+                        { "local_recording_relation", relation }, { "provenance_file", trace->sidecarRelative },
+                        { "owned_identities_retained", true },
+                        { "acceptance", "requires completed submission evidence and independent native pixel comparison; not a frame proof" }
+                    };
+                    auto candidate = std::make_shared<NgxCaptureCandidate>();
+                    candidate->metadata = metadata.dump();
+                    candidate->index = candidateIndex;
+                    candidate->ownership = trace;
+                    trace->candidates.push_back({ identity, generation, std::move(metadata) });
+                    result = std::move(candidate); // Consumed now, never requeued if this Evaluate fails.
+                    record["capture_candidate_index"] = candidateIndex;
+                }
                 if (trace->count == MaxNgxEndpoints)
                 {
+                    trace->endpointsClosed = true;
                     endpointActive.store(false, std::memory_order_release);
                     data.endpoint.reset(); // Local shared owners outlive the lock and final log.
                 }
             }
             LOG_INFO("[FSRRR fog endpoint] NGX {}", record.dump());
+            FinalizeSubmissionTrace(trace);
         }
         catch (const std::exception& error)
         {
@@ -1374,9 +1572,125 @@ void ObserveNgxInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color,
                 auto& data = Data();
                 std::lock_guard lock(data.mutex);
                 trace = std::move(data.endpoint);
+                if (trace) trace->failure = error.what();
             }
             LOG_WARN("[FSRRR fog endpoint] observation window stopped; association incomplete: {}", error.what());
+            FinalizeSubmissionTrace(trace);
         }
+    });
+    return result;
+}
+
+void CandidateCaptureResult(const CaptureCandidate& candidate, bool started) noexcept
+{
+    if (!candidate || !candidate->ownership)
+        return;
+    Metadata([&] {
+        const auto trace = std::static_pointer_cast<EndpointTrace>(candidate->ownership);
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            if (!candidate->index || candidate->index > trace->candidates.size() || trace->finalized)
+                return;
+            auto& state = trace->candidates[candidate->index - 1];
+            if (state.reported)
+                return; // An exact-Evaluate result is immutable once reported.
+            state.reported = true;
+            state.started = started;
+        }
+        FinalizeSubmissionTrace(trace);
+    });
+}
+
+struct SubmissionObservation
+{
+    std::shared_ptr<EndpointTrace> trace;
+    std::shared_ptr<SubmissionData> record;
+};
+
+SubmissionObservationToken PreparingSubmission(ID3D12CommandQueue* queue, UINT count,
+                                                ID3D12CommandList* const* lists) noexcept
+{
+    if (!submissionActive.load(std::memory_order_acquire))
+        return {};
+    const uint64_t entry = submissionSerial.fetch_add(1) + 1;
+    SubmissionObservationToken result;
+    Metadata([&] {
+        std::shared_ptr<EndpointTrace> trace;
+        try
+        {
+            auto record = std::make_shared<SubmissionData>();
+            if (!queue || FAILED(queue->QueryInterface(IID_PPV_ARGS(&record->queue))))
+                throw std::runtime_error("submission queue identity unavailable");
+            record->entry = entry;
+            record->lists = Json::array();
+            bool matched = false;
+            {
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                trace = data.submissionTrace;
+                if (!trace || trace->finalized)
+                    return;
+                if (++trace->observedSubmissions > MaxObservedSubmissions || !lists || !count ||
+                    count > MaxListsPerSubmission || GetTickCount64() - trace->startedAt > SubmissionWindowMs)
+                    throw std::runtime_error("bounded submission observation window exceeded");
+                for (UINT i = 0; i < count; ++i)
+                {
+                    ComPtr<IUnknown> identity;
+                    if (!lists[i] || FAILED(lists[i]->QueryInterface(IID_PPV_ARGS(&identity))))
+                        throw std::runtime_error("submitted list identity unavailable");
+                    const auto found = data.lists.find(identity.Get());
+                    const bool known = captureTrackingValid.load() && found != data.lists.end();
+                    const uint64_t generation = known ? found->second.generation : 0;
+                    Json roles = Json::array();
+                    if (known && identity.Get() == trace->list.Get() && generation == trace->generation)
+                        roles.push_back("fog");
+                    for (size_t c = 0; c < trace->candidates.size(); ++c)
+                        if (known && identity.Get() == trace->candidates[c].list.Get() &&
+                            generation == trace->candidates[c].generation)
+                            roles.push_back(std::format("candidate-{}", c + 1));
+                    matched |= !roles.empty();
+                    record->lists.push_back({ { "array_index", i },
+                        { "command_list_identity", std::format("{:x}", uintptr_t(identity.Get())) },
+                        { "recording_known", known },
+                        { "recording_generation", known ? Json(generation) : Json(nullptr) }, { "roles", roles } });
+                }
+                if (matched)
+                {
+                    if (trace->submissions.size() >= 8)
+                        throw std::runtime_error("matched recording submission budget exceeded");
+                    trace->submissions.push_back(record);
+                    result = std::make_shared<SubmissionObservation>(SubmissionObservation { trace, record });
+                }
+            }
+        }
+        catch (const std::exception& error)
+        {
+            if (trace)
+            {
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                trace->failure = error.what();
+            }
+            FinalizeSubmissionTrace(trace);
+        }
+    });
+    return result;
+}
+
+void SubmittedSubmission(const SubmissionObservationToken& observation) noexcept
+{
+    if (!observation)
+        return;
+    const uint64_t exit = submissionSerial.fetch_add(1) + 1;
+    Metadata([&] {
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            if (!observation->record->exit)
+                observation->record->exit = exit;
+        }
+        FinalizeSubmissionTrace(observation->trace);
     });
 }
 

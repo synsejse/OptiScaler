@@ -24,14 +24,40 @@ class CaptureUI(unittest.TestCase):
         self.assertIn("||", wants)
         self.assertIn("== feature", wants)
         self.assertIn("FSRDResearch::WantsCapture(Handle()->Id)", FEATURE)
-        begin = SOURCE.split("Capture Begin(", 1)[1].split("void Record(", 1)[0]
+        begin = SOURCE.split("static Capture BeginInternal(", 1)[1].split("Capture Begin(", 1)[0]
         gui = begin.split("if (fromGui)", 1)[1].split("else if", 1)[0]
         self.assertIn("registry.burst = 1", gui)
         self.assertIn("registry.burstFeature = feature", gui)
         self.assertIn("requestedFeature.store(NoFeature", gui)
         self.assertNotIn("registry.count", gui)
-        self.assertIn("if (!fromGui)\n            ++registry.count", begin)
+        self.assertIn("if (!fromGui && !fogCandidate)\n            ++registry.count", begin)
         self.assertIn("registry.pending.size() >= 2", begin)
+
+    def test_fog_candidates_are_bounded_immediate_and_do_not_consume_requests(self):
+        begin = SOURCE.split("static Capture BeginInternal(", 1)[1].split("Capture Begin(", 1)[0]
+        self.assertIn("FfxDenoiserCyberpunkFogProbe.value_or_default()", begin)
+        self.assertIn("FfxDenoiserCyberpunkFogCapture.value_or_default()", begin)
+        self.assertIn("registry.fogCandidateAttempts >= 2", begin)
+        self.assertLess(begin.index("++registry.fogCandidateAttempts"), begin.index("registry.pending.size() >= 2"))
+        self.assertIn("!fogCandidate && registry.burstFeature != feature", begin)
+        self.assertIn("if (!fogCandidate)\n            --registry.burst", begin)
+        self.assertIn('"fog_candidate_unvalidated"', begin)
+        self.assertIn("batch->provenanceOwner = provenanceOwner", begin)
+        wrapper = SOURCE.split("Capture BeginFogCandidate(", 1)[1].split("void Record(", 1)[0]
+        self.assertIn("if (!provenanceOwner)", wrapper)
+        self.assertNotIn("Request(", wrapper)
+
+    def test_fog_candidate_result_is_reported_even_when_evaluation_fails_early(self):
+        self.assertIn("~FogCandidateCompletion()", FEATURE)
+        self.assertIn("CandidateCaptureResult(candidate, started)", FEATURE)
+        self.assertLess(FEATURE.index("} fogCandidateCompletion"),
+                        FEATURE.index("if (!PrepareDenoiserInput("))
+        candidate = FEATURE.split("if (fogCandidate)\n        {", 1)[1].split("if (research)", 1)[0]
+        self.assertIn('metadata["fog_candidate"]', candidate)
+        self.assertIn("BeginFogCandidate(", candidate)
+        self.assertIn("fogCandidateStarted = bool(research)", candidate)
+        self.assertNotIn("FSRDResearch::Request(", candidate)
+        self.assertNotIn('metadata["fog_pairing"]', candidate)
 
     def test_queued_cancel_does_not_discard_gpu_owned_buffers(self):
         cancel = SOURCE.split("void CancelRequest()", 1)[1].split("Status GetStatus()", 1)[0]

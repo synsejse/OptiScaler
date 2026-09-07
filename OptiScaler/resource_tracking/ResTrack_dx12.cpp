@@ -2,6 +2,7 @@
 #include "ResTrack_dx12.h"
 #include "upscalers/ffx/FSRDResearchCapture.h"
 #include "FSRDSubmission.h"
+#include <upscalers/ffx/FSRDCyberpunkFogProbe.h>
 
 #include <Config.h>
 #include <State.h>
@@ -706,8 +707,10 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
         if (!found.empty())
         {
+            const auto fogSubmission = FSRDCyberpunkFogProbe::PreparingSubmission(This, NumCommandLists, ppCommandLists);
             const auto fsrdSubmission = FSRDSubmission::Preparing(NumCommandLists, ppCommandLists);
             o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+            FSRDCyberpunkFogProbe::SubmittedSubmission(fogSubmission);
             FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
             FSRDSubmission::Submitted(This, fsrdSubmission);
 
@@ -722,8 +725,10 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
 
     LOG_TRACK("Done NumCommandLists: {}", NumCommandLists);
 
+    const auto fogSubmission = FSRDCyberpunkFogProbe::PreparingSubmission(This, NumCommandLists, ppCommandLists);
     const auto fsrdSubmission = FSRDSubmission::Preparing(NumCommandLists, ppCommandLists);
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+    FSRDCyberpunkFogProbe::SubmittedSubmission(fogSubmission);
     FSRDResearch::Submitted(This, NumCommandLists, ppCommandLists);
     FSRDSubmission::Submitted(This, fsrdSubmission);
 }

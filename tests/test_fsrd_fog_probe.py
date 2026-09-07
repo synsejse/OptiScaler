@@ -300,11 +300,11 @@ class FogProbe(unittest.TestCase):
     def test_endpoint_observer_inactive_path_has_no_com_or_gpu_work(self):
         observe = function("ObserveNgxInput")
         self.assertLess(observe.index("if (!endpointActive.load"), observe.index("Metadata("))
-        self.assertLess(observe.index("return;"), observe.index("EndpointListIdentity("))
+        self.assertLess(observe.index("return {};"), observe.index("EndpointListIdentity("))
         for mutation in ("->Draw", "->Dispatch", "->Copy", "->ResourceBarrier", "->SetPipelineState",
                          "->OMSetRenderTargets", "FSRDResearch::Request", "FSRDSubmission::Retain"):
             self.assertNotIn(mutation, observe)
-        self.assertIn("noexcept", SOURCE[SOURCE.index("void ObserveNgxInput"):].split("{", 1)[0])
+        self.assertIn("noexcept", SOURCE[SOURCE.index("CaptureCandidate ObserveNgxInput"):].split("{", 1)[0])
 
     def test_endpoint_origin_is_published_only_after_original_capture_draw(self):
         draw = function("HookDraw")
@@ -362,6 +362,76 @@ class FogProbe(unittest.TestCase):
             self.assertIn(statement, observe)
         self.assertIn("CPU endpoint callbacks only; not submission or presentation order", observe)
         self.assertIn("Ordinal of observed endpoints only", SOURCE)
+
+    def test_two_candidate_tokens_are_exact_endpoint_owned_not_queued_requests(self):
+        self.assertIn("MaxCaptureCandidates = 2", SOURCE)
+        observe = function("ObserveNgxInput")
+        self.assertIn("trace->candidates.size() < MaxCaptureCandidates && recordingKnown && color", observe)
+        self.assertIn('record["color"]["matches_fog_resource"].get<bool>()', observe)
+        self.assertIn("candidate->ownership = trace", observe)
+        self.assertIn("trace->candidates.push_back", observe)
+        self.assertNotIn("FSRDResearch::Request", observe)
+        self.assertIn('"unvalidated_candidate"', observe)
+        for field in ("session_key", "candidate_index", "rr_feature", "rr_frame", "rr_recording_generation",
+                      "rr_command_list_identity", "owned_resource_identity", "provenance_file"):
+            self.assertIn('"' + field + '"', observe)
+        result = function("CandidateCaptureResult")
+        self.assertIn("if (!candidate || !candidate->ownership)", result)
+        self.assertIn("if (state.reported)", result)
+        self.assertIn("state.started = started", result)
+        self.assertNotIn("FSRDResearch::", result)
+
+    def test_submission_probe_is_bounded_and_only_matches_known_recording_generations(self):
+        self.assertIn("MaxObservedSubmissions = 256, MaxListsPerSubmission = 512", SOURCE)
+        self.assertIn("SubmissionWindowMs = 10000", SOURCE)
+        prepare = function("PreparingSubmission")
+        self.assertLess(prepare.index("if (!submissionActive.load"), prepare.index("QueryInterface("))
+        self.assertIn("trace->observedSubmissions > MaxObservedSubmissions", prepare)
+        self.assertIn("count > MaxListsPerSubmission", prepare)
+        self.assertIn("trace->submissions.size() >= 8", prepare)
+        self.assertIn("generation == trace->generation", prepare)
+        self.assertIn("generation == trace->candidates[c].generation", prepare)
+        self.assertIn("captureTrackingValid.load() && found != data.lists.end()", prepare)
+        self.assertIn('"array_index"', prepare)
+        for mutation in ("->Signal(", "->Wait(", "->ExecuteCommandLists(", "->ResourceBarrier("):
+            self.assertNotIn(mutation, prepare + function("SubmittedSubmission"))
+
+    def test_submission_intervals_do_not_invent_queue_order_or_frame_identity(self):
+        relation = function("SubmissionRelation")
+        self.assertIn("fog.submission->exit < rr.submission->entry", relation)
+        self.assertIn("fog.submission->queue.Get() != rr.submission->queue.Get()", relation)
+        for label in ("same_batch_array_order_only", "different_queues_synchronization_not_observed",
+                      "ordered_nonoverlapping_same_queue_calls", "overlapping_queue_calls_order_unknown",
+                      "repeated_recording_submission_ambiguous"):
+            self.assertIn('"' + label + '"', relation)
+        self.assertIn('{ "same_frame", "not_established" }', relation)
+        self.assertIn('{ "resource_dependencies", "not_tracked" }', relation)
+
+    def test_submission_sidecar_requires_closed_observations_and_is_not_positive_pairing(self):
+        finalize = function("FinalizeSubmissionTrace")
+        self.assertIn("candidate.reported", finalize)
+        self.assertIn("fog.occurrences == 1 && fog.submission->exit", finalize)
+        self.assertIn("rr.occurrences == 1 && rr.submission->exit", finalize)
+        self.assertIn("trace->finalized = true", finalize)
+        self.assertIn("ready && trace->failure.empty()", finalize)
+        self.assertIn("candidate_provenance_only_not_validated_pairing", finalize)
+        self.assertIn("CREATE_NEW", finalize)
+        self.assertIn("MOVEFILE_WRITE_THROUGH", finalize)
+        self.assertNotIn("MOVEFILE_REPLACE_EXISTING", finalize)
+        self.assertIn("contents.size() > 2 * 1024 * 1024", finalize)
+        for field in ("session_key", "fog_capture_id", "fog_origin", "candidates", "submissions",
+                      "call_entry_serial", "call_exit_serial", "queue_identity"):
+            self.assertIn('"' + field + '"', finalize)
+
+    def test_both_queue_hook_paths_bracket_original_without_serializing_it(self):
+        queue = (ROOT / "OptiScaler/resource_tracking/ResTrack_dx12.cpp").read_text()
+        self.assertEqual(queue.count("FSRDCyberpunkFogProbe::PreparingSubmission(This, NumCommandLists, ppCommandLists)"), 2)
+        self.assertEqual(queue.count("FSRDCyberpunkFogProbe::SubmittedSubmission(fogSubmission)"), 2)
+        pattern = (r"PreparingSubmission\(This, NumCommandLists, ppCommandLists\);\s*"
+                   r"const auto fsrdSubmission = FSRDSubmission::Preparing\(NumCommandLists, ppCommandLists\);\s*"
+                   r"o_ExecuteCommandLists\(This, NumCommandLists, ppCommandLists\);\s*"
+                   r"FSRDCyberpunkFogProbe::SubmittedSubmission\(fogSubmission\);")
+        self.assertEqual(len(re.findall(pattern, queue)), 2)
 
 
 if __name__ == "__main__":

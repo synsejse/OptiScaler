@@ -522,3 +522,61 @@ pointer equality across independent dumps, feature-local frame counters, and
 CPU timestamps are insufficient: textures persist across frames and worker
 threads can record GPU-later command lists first. Endpoint identity/order is
 reported separately from any claim that no intermediate writer changed color.
+
+### Native authored-fog capture closes the blend equation
+
+Build `0bb40f44` captured the live High/RGBA16F fog draw in
+`fog-20260907-010043-666Z-324`. The capture contains native, unfiltered
+`scene_before.rgba16f`, `scene_after.rgba16f`, and the unchanged shader's private
+`authored_fog.rgba32f`. The game draw was not replaced. All inputs are finite and
+the original files' hashes are preserved by the analysis.
+
+The authored RGB is the expected smooth, blue-gray atmospheric contribution;
+its alpha varies from 0.00986 to 1 (median approximately 0.4021). Both main scene
+alphas are exactly 1 everywhere, so main alpha is not the required transmittance.
+
+The fixed equation `F + (1-opacity)*pre` explains the observed post-fog image.
+Using an explicit precision reference—authored RGBA rounded toward zero to FP16,
+FP32 blend arithmetic, then an FP16 round-toward-zero result—predicts
+**99.9917896%** of the 2,764,800 RGB components bit-exactly. The remaining 227
+components differ by at most one native FP16 step (maximum absolute error
+0.00024414; mean 4.2834e-9). No coefficients or layer values were fitted.
+
+This is strong evidence for the captured blend's source/target precision, not a
+universal hardware requirement. Microsoft's [blending precision specification](https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#BlendingPrecision)
+allows FP16-target blending at target precision or higher. A full-precision
+source reference has small systematic rounding differences; it must not be
+mistaken for evidence of another lighting layer.
+
+The endpoint observer also confirms that fog and RR use the same owned main
+resource. However, all eight observed RR endpoints use different command lists
+from the captured fog draw. The first RR CPU callback even arrives before the
+fog capture has finished recording. Thus these observations do **not** establish
+same-frame GPU ordering or unchanged color between the passes. Submission
+provenance and a paired RR-input capture are still required before replaying a
+purported same-frame correction.
+
+### Separate-particle-color is not the main haze artifact
+
+The `DLSSDSeparateParticleColor` setting routes a selected category of transparent
+draws to view key `0x2eb2c2ae`, which ApplyDLSS maps to Streamline's
+`ColorBeforeParticles` tag. Static draw-selection tracing finds valid
+category-5/class-3 draws that occur only in this auxiliary pass; the auxiliary
+cannot be assumed to be a universal duplicate of main color or simply added to
+it without its blend contract. The fullscreen FogNode itself writes main color,
+not this auxiliary. In baseline frame 14824, auxiliary alpha has 12,992 distinct
+FP16 values and main alpha is uniformly 1.
+
+An engine-authored control set `[Rendering] DLSSDSeparateParticleColor=false`
+temporarily, with default fog and NoV and unchanged RR conversion. Capture
+`particles-in-main-20260907-20260907-004949-336Z-1-324-1000000-16004`
+has no BeforeParticles resource and a normal 16.263 ms frame interval. All 43
+checked static RR manifest settings match the baseline. Within that frame, the
+raw far tower is nearly hidden by haze but recomposed color again contains harsh
+material structure (luminance p10–p90 width 0.013465 to 0.034591). This rejects
+missing BeforeParticles as a sufficient explanation for the principal artifact.
+
+The control used AutoSave18 in a separate run; stochastic state, bias-mask
+coverage and camera/jitter differ from baseline. It is not an exact cross-run
+pixel subtraction or proof that every particle effect is handled correctly.
+The temporary engine override was removed after capture.

@@ -25,6 +25,11 @@ bool WantsCapture(uint64_t feature);
 // Both paths share the same bounded GPU storage and completion fences.
 Capture Begin(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width, UINT height, uint64_t feature,
               uint64_t frame, const std::string& metadata);
+// Authenticated fog probe candidates are immediate, unvalidated diagnostic samples.
+// At most two attempts/process; never queue or consume a GUI/file request on failure.
+Capture BeginFogCandidate(ID3D12Device* device, ID3D12GraphicsCommandList* list, UINT width, UINT height,
+                          uint64_t feature, uint64_t frame, const std::string& metadata,
+                          const std::shared_ptr<void>& provenanceOwner);
 void Record(const Capture& capture, const char* name, ID3D12Resource* texture, bool fullExtent = false);
 // Backend output is UAV (or a configured restored state), unlike the readable inputs.
 void RecordOutput(const Capture& capture, ID3D12Resource* texture, D3D12_RESOURCE_STATES state);
