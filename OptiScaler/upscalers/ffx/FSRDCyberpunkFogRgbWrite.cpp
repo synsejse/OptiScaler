@@ -152,8 +152,11 @@ std::shared_ptr<Work> Prepare(ID3D12Device* device, UINT width, UINT height,
         pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pso.NumRenderTargets = 1; pso.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         pso.SampleDesc.Count = 1;
-        Require(SUCCEEDED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&lease.pipeline))) && lease.pipeline,
-                "RGB-write pipeline creation failed");
+        const HRESULT pipelineResult = device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&lease.pipeline));
+        if (!SUCCEEDED(pipelineResult) || !lease.pipeline)
+            LOG_WARN("[FSRRR RGB identity] graphics pipeline creation HRESULT={:08x}; VS={} bytes PS={} bytes",
+                     uint32_t(pipelineResult), sizeof(FSRDFogRgbWrite_VS_cso), sizeof(FSRDFogRgbWrite_PS_cso));
+        Require(SUCCEEDED(pipelineResult) && lease.pipeline, "RGB-write pipeline creation failed");
 
         ScopedSkipHeapCapture skipHeapCapture {};
         D3D12_DESCRIPTOR_HEAP_DESC heap {};

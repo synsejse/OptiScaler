@@ -58,8 +58,12 @@ class FogRgbShaderBuild(unittest.TestCase):
             self.assertIn(f'#include "FSRDFogRgbWrite_{stage}.h"', source)
             self.assertIn(f'Validate(FSRDFogRgbWrite_{stage}_cso, sizeof(FSRDFogRgbWrite_{stage}_cso)', source)
         for check in ('D3DReflect(', 'IsSampleFrequencyShader()', 'D3D11_SHVER_GET_TYPE',
-                      'D3D11_SHVER_GET_MAJOR', 'D3D11_SHVER_GET_MINOR'):
+                      'D3D11_SHVER_GET_MAJOR', 'D3D11_SHVER_GET_MINOR', '!ValidateLinkage()',
+                      'output.Register != input.Register', 'output.MinPrecision != input.MinPrecision'):
             self.assertIn(check, source)
+        shader = (ROOT / 'OptiScaler/shaders/fsrd_preprocess/precompile/FSRDFogRgbWrite.hlsl').read_text()
+        self.assertLess(shader.index('float2 uv : TEXCOORD0;'), shader.index('float4 position : SV_Position;'))
+        self.assertIn('float4 PSMain(sample float2 uv : TEXCOORD0)', shader)
         self.assertNotIn('D3DCompile(', source)
         self.assertIn('vcvars64.bat', command)
         self.assertIn('cl /nologo', command)
@@ -96,15 +100,16 @@ inline int _stricmp(const char* a,const char* b){while(*a&&*b){int x=std::tolowe
 #endif
 struct D3D11_SHADER_DESC{UINT Version=0,InputParameters=1,OutputParameters=1,BoundResources=1;};
 struct D3D11_SIGNATURE_PARAMETER_DESC{const char* SemanticName=nullptr;UINT SemanticIndex=0;
- UINT SystemValueType=0,ComponentType=3;BYTE Mask=3;UINT Stream=0;};
+ UINT SystemValueType=0,ComponentType=3;BYTE Mask=3;UINT Stream=0,Register=0,MinPrecision=0;};
 struct D3D11_SHADER_INPUT_BIND_DESC{UINT Type=2,BindPoint=0,BindCount=1,Dimension=4,ReturnType=5;};
 namespace Fake{
-struct Shader{D3D11_SHADER_DESC desc;D3D11_SIGNATURE_PARAMETER_DESC input,output;
+struct Shader{D3D11_SHADER_DESC desc;D3D11_SIGNATURE_PARAMETER_DESC input,output,secondOutput;
  D3D11_SHADER_INPUT_BIND_DESC texture;bool frequency=false,reflectionFail=false,reflectionNull=false;
  bool descFail=false,inputFail=false,outputFail=false,textureFail=false;};
 inline Shader vs,ps;inline unsigned alive=0;
 inline void Reset(){vs={};ps={};vs.desc={0x10050,1,2,0};ps.desc={0x50,1,1,1};
  vs.input={"SV_VertexID",0,6,1,1,0};ps.input={"TEXCOORD",0,0,3,3,0};
+ vs.output={"TEXCOORD",0,0,3,3,0,0,0};vs.secondOutput={"SV_Position",0,1,3,15,0,1,0};
  ps.output={"SV_Target",0,64,3,15,0};ps.frequency=true;}
 }
 struct ID3D11ShaderReflection{Fake::Shader* s;explicit ID3D11ShaderReflection(Fake::Shader* p):s(p){++Fake::alive;}
@@ -112,7 +117,8 @@ struct ID3D11ShaderReflection{Fake::Shader* s;explicit ID3D11ShaderReflection(Fa
  HRESULT GetDesc(D3D11_SHADER_DESC* p){*p=s->desc;return s->descFail?-1:0;}
  BOOL IsSampleFrequencyShader(){return s->frequency;}
  HRESULT GetInputParameterDesc(UINT i,D3D11_SIGNATURE_PARAMETER_DESC* p){assert(i==0);*p=s->input;return s->inputFail?-1:0;}
- HRESULT GetOutputParameterDesc(UINT i,D3D11_SIGNATURE_PARAMETER_DESC* p){assert(i==0);*p=s->output;return s->outputFail?-1:0;}
+ HRESULT GetOutputParameterDesc(UINT i,D3D11_SIGNATURE_PARAMETER_DESC* p){assert(i<s->desc.OutputParameters&&i<2);
+  *p=i?s->secondOutput:s->output;return s->outputFail?-1:0;}
  HRESULT GetResourceBindingDesc(UINT i,D3D11_SHADER_INPUT_BIND_DESC* p){assert(i==0);*p=s->texture;return s->textureFail?-1:0;}};
 inline HRESULT D3DReflect(const void* bytes,size_t size,ID3D11ShaderReflection** out){
  assert(bytes);bool pixel=static_cast<const BYTE*>(bytes)[0]==0x50;assert(size==(pixel?44u:40u));
@@ -128,6 +134,23 @@ namespace Microsoft::WRL{template<class T>class ComPtr{T* p=nullptr;public:
 #undef main
 int main(){
  Fake::Reset();assert(ValidateGeneratedMain()==0&&!Fake::alive);
+ // Actual a8aa3ab2 regression: both standalone profiles/signatures pass,
+ // but VS TEXCOORD0 o1 cannot link to PS TEXCOORD0 v0.
+ Fake::Reset();Fake::vs.output.Register=1;Fake::vs.secondOutput.Register=0;
+ assert(Validate(FSRDFogRgbWrite_VS_cso,sizeof(FSRDFogRgbWrite_VS_cso),false));
+ assert(Validate(FSRDFogRgbWrite_PS_cso,sizeof(FSRDFogRgbWrite_PS_cso),true));
+ assert(!ValidateLinkage()&&ValidateGeneratedMain()!=0&&!Fake::alive);
+ for(int bad=0;bad<11;++bad){Fake::Reset();auto& output=Fake::vs.output;
+  switch(bad){case 0:Fake::vs.outputFail=true;break;case 1:output.SemanticName=nullptr;break;
+   case 2:output.SemanticName="TEXCOORD_OTHER";break;case 3:output.SemanticIndex=1;break;
+   case 4:output.Mask=15;break;case 5:output.ComponentType=1;break;
+   case 6:output.MinPrecision=1;break;case 7:output.SystemValueType=1;break;
+   case 8:output.Stream=1;break;case 9:Fake::vs.secondOutput=output;break;
+   case 10:Fake::vs.secondOutput.SemanticName=nullptr;break;}
+  assert(ValidateGeneratedMain()!=0&&!Fake::alive);}
+ // Reflection descriptor enumeration order is not the payload register index.
+ Fake::Reset();{auto temp=Fake::vs.output;Fake::vs.output=Fake::vs.secondOutput;Fake::vs.secondOutput=temp;}
+ assert(ValidateGeneratedMain()==0&&!Fake::alive);
  // The installed Wine stub returns false, including for the genuine PS.
  Fake::Reset();Fake::ps.frequency=false;assert(ValidateGeneratedMain()!=0&&!Fake::alive);
  for(bool pixel:{false,true})for(int bad=0;bad<10;++bad){Fake::Reset();auto& s=pixel?Fake::ps:Fake::vs;

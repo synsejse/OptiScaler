@@ -4,8 +4,10 @@
 Texture2D<float4> Input : register(t0);
 struct VertexOutput
 {
-    float4 position : SV_Position;
+    // DXBC links stages by register as well as semantic: PS consumes TEXCOORD0
+    // as v0, so keep UV first (o0). Native build validation checks exact linkage.
     float2 uv : TEXCOORD0;
+    float4 position : SV_Position;
 };
 VertexOutput VSMain(uint vertex : SV_VertexID)
 {

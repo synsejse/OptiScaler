@@ -49,18 +49,48 @@ bool Validate(const void* bytes, size_t size, bool pixel)
         return false;
     return true;
 }
+
+bool ValidateLinkage()
+{
+    ComPtr<ID3D11ShaderReflection> vertex, pixel;
+    if (FAILED(D3DReflect(FSRDFogRgbWrite_VS_cso, sizeof(FSRDFogRgbWrite_VS_cso), IID_PPV_ARGS(&vertex))) || !vertex ||
+        FAILED(D3DReflect(FSRDFogRgbWrite_PS_cso, sizeof(FSRDFogRgbWrite_PS_cso), IID_PPV_ARGS(&pixel))) || !pixel)
+        return false;
+    D3D11_SHADER_DESC vs {}, ps {};
+    if (FAILED(vertex->GetDesc(&vs)) || FAILED(pixel->GetDesc(&ps)) ||
+        vs.OutputParameters != 2 || ps.InputParameters != 1) return false;
+    D3D11_SIGNATURE_PARAMETER_DESC input {};
+    if (FAILED(pixel->GetInputParameterDesc(0, &input)) || !input.SemanticName) return false;
+    UINT matches = 0;
+    for (UINT i = 0; i < vs.OutputParameters; ++i)
+    {
+        D3D11_SIGNATURE_PARAMETER_DESC output {};
+        if (FAILED(vertex->GetOutputParameterDesc(i, &output)) || !output.SemanticName) return false;
+        if (_stricmp(output.SemanticName, input.SemanticName) != 0 || output.SemanticIndex != input.SemanticIndex)
+            continue;
+        ++matches;
+        // Individually valid shaders can still fail D3D12 PSO creation: semantic
+        // names alone do not link DXBC o1 to v0. This owned adapter requires an
+        // exact UV payload, not merely a compatible subset of a larger output.
+        if (output.Register != input.Register || output.Mask != input.Mask ||
+            output.ComponentType != input.ComponentType || output.MinPrecision != input.MinPrecision ||
+            output.SystemValueType != input.SystemValueType || output.Stream != input.Stream)
+            return false;
+    }
+    return matches == 1;
+}
 }
 
 int main()
 {
     if (!Validate(FSRDFogRgbWrite_VS_cso, sizeof(FSRDFogRgbWrite_VS_cso), false) ||
-        !Validate(FSRDFogRgbWrite_PS_cso, sizeof(FSRDFogRgbWrite_PS_cso), true))
+        !Validate(FSRDFogRgbWrite_PS_cso, sizeof(FSRDFogRgbWrite_PS_cso), true) || !ValidateLinkage())
     {
-        std::fputs("Pre-Fog RGB DXBC contract failed: native VS/PS stage, sample frequency or resource signature.\n", stderr);
+        std::fputs("Pre-Fog RGB DXBC contract failed: native VS/PS stage, sample frequency, resource signature or cross-stage linkage.\n", stderr);
         return 1;
     }
     // The validator must refuse a real non-sample-frequency shader as a PS.
     if (Validate(FSRDFogRgbWrite_VS_cso, sizeof(FSRDFogRgbWrite_VS_cso), true)) return 2;
-    std::puts("Pre-Fog exact embedded DXBC validated: VS5.0, PS5.0 sample frequency, t0 texture2D, TEXCOORD0.");
+    std::puts("Pre-Fog exact embedded DXBC validated: VS5.0, PS5.0 sample frequency, t0 texture2D, TEXCOORD0 register linkage.");
     return 0;
 }
