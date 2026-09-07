@@ -833,6 +833,9 @@
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingSource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="upscalers\ffx\FSRDCyberpunkRayConstants.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="upscalers\ffx\FSRDCyberpunkLightingConstants.h">
       <Filter>Header Files</Filter>
     </ClInclude>

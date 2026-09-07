@@ -9,6 +9,7 @@
 #include "FSRDCyberpunkExposurePass.h"
 #include "FSRDCyberpunkExposureSource.h"
 #include "FSRDCyberpunkLightingSource.h"
+#include "FSRDCyberpunkRayConstants.h"
 #include "FSRDCyberpunkLightingConstants.h"
 
 #include <Util.h>
@@ -289,6 +290,8 @@ struct Registry
     UINT64 cpuSrvSlots = 0, cpuSrvBytes = 0;
     std::vector<std::byte> guideShader;
     std::shared_ptr<EarlyProducer> earlyProducer;
+    // Bounded immutable CPU-upload snapshots, never live GPU/frame authority.
+    std::vector<FSRD::CyberpunkRayConstants::Receipt> rayConstants;
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
     std::shared_ptr<EndpointTrace> submissionTrace;
@@ -328,12 +331,14 @@ std::mutex hookMutex;
 using FogNode = void(__fastcall*)(void* node, void* context);
 FogNode originalFogNode = nullptr;
 FogNode originalLightingNode = nullptr;
+FogNode originalRayNode = nullptr;
 using FullscreenHelper = void(__fastcall*)(void*, uint32_t, uint8_t);
 FullscreenHelper originalFullscreenHelper = nullptr;
 using BindTextures = void(__fastcall*)(uint32_t, uint32_t, const uint32_t*, uint8_t);
 BindTextures originalBindTextures = nullptr;
 using UploadLightingConstants = void(__fastcall*)(uint32_t, const void*);
 UploadLightingConstants originalUploadLightingConstants = nullptr;
+UploadLightingConstants originalUploadRayConstants = nullptr;
 using GBufferInitializer = void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
 GBufferInitializer originalGBufferInitializer = nullptr;
 using SetPso = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetPipelineState)>::type;
@@ -431,6 +436,14 @@ struct LightingScope
     FSRD::CyberpunkLightingConstants::Receipt lightingConstants;
 };
 thread_local LightingScope* lightingScope = nullptr;
+struct RayScope
+{
+    RayScope* previous = nullptr;
+    uint64_t serial = 0;
+    void* context = nullptr;
+    FSRD::CyberpunkRayConstants::Receipt receipt;
+};
+thread_local RayScope* rayScope = nullptr;
 
 bool ReadExactMemory(uintptr_t address, void* destination, size_t bytes) noexcept
 {
@@ -1318,6 +1331,80 @@ void __fastcall HookLightingNode(void* node, void* context)
     lightingScope = &current;
     struct Restore { LightingScope* previous; ~Restore() { lightingScope = previous; } } restore { current.previous };
     originalLightingNode(node, context); // Exactly one original callback, including ordinary refusal paths.
+}
+
+void __fastcall HookRayNode(void* node, void* context)
+{
+    for (auto* parent = rayScope; parent; parent = parent->previous)
+        FSRD::CyberpunkRayConstants::Invalidate(parent->receipt);
+    RayScope current { rayScope, scopes.fetch_add(1) + 1, context };
+    rayScope = &current;
+    struct Restore { RayScope* previous; ~Restore() { rayScope = previous; } } restore { current.previous };
+    originalRayNode(node, context); // Original exactly once, never caught/replayed.
+}
+
+FSRD::CyberpunkRayConstants::Scope CurrentRayConstantScope()
+{
+    FSRD::CyberpunkRayConstants::Scope result;
+    uint8_t initialized = 0;
+    if (!rayScope || !ReadEarly(uintptr_t(__readgsqword(0x58)), result.tls) ||
+        !ReadEarlyAt(result.tls, 0x14, initialized) || !initialized ||
+        !ReadEarlyAt(result.tls, 0x188, result.engine) ||
+        !ReadEarlyAt(result.engine, 0x30, result.list))
+        throw std::runtime_error("current ray upload TLS/list unavailable");
+    result.serial = rayScope->serial;
+    result.graphContext = uintptr_t(rayScope->context);
+    uintptr_t object = 0, vtable = 0, getter = 0;
+    constexpr std::array<uint8_t, 5> GetterBytes { 0x48, 0x8d, 0x41, 0x10, 0xc3 };
+    std::array<uint8_t, 5> bytes {};
+    uint32_t repeatedFrame = 0;
+    if (!ReadEarlyAt(result.graphContext, 0x18, result.view) ||
+        !ReadEarlyAt(result.graphContext, 0, object) || !ReadEarlyAt(object, 0, vtable) ||
+        !ReadEarlyAt(vtable, 0x20, getter) || getter != authenticatedImage.load() + 0x18ec810 ||
+        !ReadEarly(getter, bytes) || bytes != GetterBytes ||
+        !ReadEarlyAt(object, 0x1b0, result.frameSource) ||
+        !ReadEarlyAt(object, 0x1b0, repeatedFrame) || repeatedFrame != result.frameSource)
+        throw std::runtime_error("current ray CPU frame-source route unavailable");
+    auto identity = ListIdentity(reinterpret_cast<ID3D12GraphicsCommandList*>(result.list));
+    auto& data = Data();
+    std::lock_guard lock(data.mutex);
+    const auto found = data.lists.find(identity.Get());
+    if (found == data.lists.end() || !found->second.known)
+        throw std::runtime_error("current ray list generation unavailable");
+    result.recordingGeneration = found->second.generation;
+    return result;
+}
+
+void __fastcall HookUploadRayConstants(uint32_t bytes, const void* source)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = rayScope;
+    bool begun = false;
+    if (current && !inMetadata && lightingRequested.load() && !lightingAttempted.load())
+    {
+        FSRD::CyberpunkRayConstants::Invalidate(current->receipt);
+        Metadata([&] {
+            struct Reader { bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); } } reader;
+            begun = FSRD::CyberpunkRayConstants::Begin(reader, authenticatedImage.load(), caller,
+                CurrentRayConstantScope(), bytes, uintptr_t(source), current->receipt);
+        });
+    }
+    originalUploadRayConstants(bytes, source); // Original upload always executes exactly once.
+    if (begun)
+    {
+        Metadata([&] {
+            struct Reader { bool Read(uintptr_t p, void* out, size_t n) noexcept { return ReadExactMemory(p, out, n); } } reader;
+            if (rayScope != current || !FSRD::CyberpunkRayConstants::Complete(reader, CurrentRayConstantScope(), current->receipt))
+                return;
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            if (data.rayConstants.size() == 4) data.rayConstants.erase(data.rayConstants.begin());
+            data.rayConstants.push_back(current->receipt); // Source pointer has already been cleared.
+        });
+        // Metadata exceptions must not preserve a borrowed original stack pointer.
+        if (current->receipt.phase == FSRD::CyberpunkRayConstants::Phase::Pending)
+            FSRD::CyberpunkRayConstants::Invalidate(current->receipt);
+    }
 }
 
 FSRD::CyberpunkLightingConstants::Scope CurrentLightingConstantScope()
@@ -2526,6 +2613,27 @@ std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsComman
     PrepareLightingExposure(*plan); // Optional raw words; three native guides remain available if refused.
     PrepareLightingT8(*plan); // Original encoded texture, without denoising/decoding.
     DescribeLightingConstants(*plan);
+    {
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        auto& candidates = plan->provenance["ray_cpu_upload_candidates"];
+        candidates = Json::array();
+        for (const auto& receipt : data.rayConstants)
+        {
+            const auto& observed = receipt.scope;
+            candidates.push_back({ { "status", "original_cpu_upload_observed" },
+                { "gpu_payload_proven", false }, { "same_frame_pairing", "not_asserted" },
+                { "dispatch_binding_proven", false }, { "byte_count", FSRD::CyberpunkRayConstants::PayloadBytes },
+                { "upload_return_rva", receipt.callerRva }, { "scope", observed.serial },
+                { "graph_context", observed.graphContext }, { "view", observed.view },
+                { "tls", observed.tls }, { "engine", observed.engine }, { "native_list", observed.list },
+                { "recording_generation", observed.recordingGeneration }, { "frame_source_cpu", observed.frameSource },
+                { "same_view_address", observed.view == plan->view }, { "same_list_address", observed.list == plan->list },
+                { "cpu_descriptor", receipt.descriptor }, { "words", receipt.words },
+                { "hit_encoding_cpu_word", receipt.words[FSRD::CyberpunkRayConstants::EncodingByteOffset / 4] },
+                { "write_hit_cpu_word", receipt.words[FSRD::CyberpunkRayConstants::WriteHitByteOffset / 4] } });
+        }
+    }
     plan->provenance["current_inputs"] = plan->metadata;
     plan->provenance["actual_pixel_bindings"] = plan->bindings;
     plan->provenance["native_list"] = plan->list;
@@ -3649,6 +3757,12 @@ void Initialize(bool enabled)
                     [&](const auto& code) { return MatchLiveCode(image, { code.rva, code.bytes, code.sha256 }); }))
                     originalUploadLightingConstants = reinterpret_cast<UploadLightingConstants>(image + FSRD::CyberpunkLightingConstants::UploadRva);
             }
+            if (captures && std::all_of(std::begin(FSRD::CyberpunkRayConstants::Code), std::end(FSRD::CyberpunkRayConstants::Code),
+                [&](const auto& code) { return MatchLiveCode(image, { code.rva, code.bytes, code.sha256 }); }))
+            {
+                originalRayNode = reinterpret_cast<FogNode>(image + FSRD::CyberpunkRayConstants::NodeRva);
+                originalUploadRayConstants = reinterpret_cast<UploadLightingConstants>(image + FSRD::CyberpunkRayConstants::UploadRva);
+            }
             originalFogNode = reinterpret_cast<FogNode>(entry);
             LONG error = DetourTransactionBegin();
             if (error == NO_ERROR)
@@ -3666,6 +3780,10 @@ void Initialize(bool enabled)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalBindTextures), HookBindTextures);
                 if (error == NO_ERROR && originalUploadLightingConstants)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalUploadLightingConstants), HookUploadLightingConstants);
+                if (error == NO_ERROR && originalRayNode)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalRayNode), HookRayNode);
+                if (error == NO_ERROR && originalUploadRayConstants)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalUploadRayConstants), HookUploadRayConstants);
                 if (error == NO_ERROR)
                     error = DetourTransactionCommit();
                 else
@@ -3679,6 +3797,8 @@ void Initialize(bool enabled)
                 originalFullscreenHelper = nullptr;
                 originalBindTextures = nullptr;
                 originalUploadLightingConstants = nullptr;
+                originalRayNode = nullptr;
+                originalUploadRayConstants = nullptr;
                 authenticatedImage.store(0);
                 LOG_WARN("[FSRRR fog probe] engine hook failed: {}", error);
                 return;
