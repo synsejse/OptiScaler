@@ -72,6 +72,19 @@ constexpr FSRD::CyberpunkEngineAccess::CodeRange ProducerCode[] = {
     { 0x7711c8, 0x41, "db8138c090761f534aadb90b66535164c94addc01561e614602626b9acbed32b" },
     { 0x1fa1f8, 0x3c, "718d57eb7d9b01daf4c57690874faffc238620e8a978e5840263508097098666" }
 };
+constexpr uintptr_t LightingNodeRva = 0x154610, FullscreenHelperRva = 0x20c954;
+constexpr uintptr_t FinalLightingHelperReturnRva = 0x155e0c, NativeFullscreenDrawReturnRva = 0x20ccac;
+constexpr FSRD::CyberpunkEngineAccess::CodeRange LightingCode[] = {
+    { 0x154610, 0x1960, "3beb50773dd93b66302aef64a3facea1d9a46976867546abfb16dbc6661ca761" },
+    { 0x20c954, 0x63, "dcc4dcd485f4318d8708181a715d6c4b26619a9c8523648525821a49dec92180" },
+    { 0x20cc64, 0x58, "4833392e71c08768cbd9f77675121fa58bc2ff9f8fb27080386226d5cf13dca0" },
+    { 0x2221f4, 0xc38, "a42b9e7ead94a67cd1a3dc7e405614ec4eeeadb9b955c0db9ea817f6a56b0562" },
+    { 0x7711c8, 0x41, "db8138c090761f534aadb90b66535164c94addc01561e614602626b9acbed32b" },
+    { 0x22c1f4, 0x37, "56bd6fdfea2f273df26d56c0aa62834d6ca739b6cf76b16a60ce0943ba618502" },
+    { 0x1f22e4, 0x4dc, "f4a5782e0cead125409e02ce0ff209aa5468564dc286cd1403798a1bb18f8bfc" },
+    { 0x1f3a6c, 0x2b1, "3d8ea951900012b9cb82212dc4d84a01312eac865475cb2e86501cdb138e1b1b" },
+    { 0x774be0, 0x115, "30bc7d4d922f733905cfdb61a5c5eba8bdbb8add3f2bcd5c0dbd0b6759e2aaa7" }
+};
 constexpr unsigned MaxListEvictionLogs = 8;
 constexpr UINT64 MaxCaptureTextureBytes = 256ull * 1024 * 1024;
 constexpr unsigned MaxNgxEndpoints = 8;
@@ -296,6 +309,8 @@ std::atomic<uintptr_t> authenticatedImage { 0 };
 std::atomic<bool> earlyRequested { false }, earlyAttempted { false }, earlyHeapTrackingValid { true };
 std::atomic<bool> earlyFatalRecording { false };
 std::atomic<ULONGLONG> earlyRequestedAt { 0 };
+std::atomic<bool> lightingRequested { false }, lightingAttempted { false };
+std::atomic<ULONGLONG> lightingRequestedAt { 0 };
 std::atomic<bool> endpointActive { false };
 std::atomic<bool> submissionActive { false };
 std::atomic<uint64_t> submissionSerial { 0 };
@@ -306,6 +321,9 @@ std::mutex hookMutex;
 
 using FogNode = void(__fastcall*)(void* node, void* context);
 FogNode originalFogNode = nullptr;
+FogNode originalLightingNode = nullptr;
+using FullscreenHelper = void(__fastcall*)(void*, uint32_t, uint8_t);
+FullscreenHelper originalFullscreenHelper = nullptr;
 using GBufferInitializer = void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
 GBufferInitializer originalGBufferInitializer = nullptr;
 using SetPso = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetPipelineState)>::type;
@@ -378,6 +396,25 @@ thread_local Scope* scope = nullptr;
 thread_local bool inMetadata = false;
 thread_local EarlyProducer* producerScope = nullptr;
 
+struct LightingScope
+{
+    LightingScope* previous;
+    uint64_t serial;
+    void* node;
+    void* context;
+    ID3D12GraphicsCommandList* psoList = nullptr;
+    ComPtr<ID3D12PipelineState> pso;
+    ID3D12GraphicsCommandList* rtvList = nullptr;
+    UINT rtvCount = 0;
+    BOOL contiguous = FALSE;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 2> rtvs {};
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv {};
+    std::array<BoundRtv, 2> targets;
+    bool finalHelper = false, hasDsv = false;
+    unsigned finalDraws = 0;
+};
+thread_local LightingScope* lightingScope = nullptr;
+
 bool ReadExactMemory(uintptr_t address, void* destination, size_t bytes) noexcept
 {
     if (!address || !bytes || bytes > 65536 || bytes - 1 > UINTPTR_MAX - address)
@@ -389,6 +426,10 @@ bool ReadExactMemory(uintptr_t address, void* destination, size_t bytes) noexcep
 template <typename T> bool ReadEarly(uintptr_t address, T& result) noexcept
 {
     return ReadExactMemory(address, &result, sizeof(result));
+}
+template <typename T> bool ReadEarlyAt(uintptr_t base, uintptr_t offset, T& result) noexcept
+{
+    return base && offset <= UINTPTR_MAX - base && ReadEarly(base + offset, result);
 }
 bool MatchLiveCode(uintptr_t image, const FSRD::CyberpunkEngineAccess::CodeRange& code) noexcept
 {
@@ -995,6 +1036,26 @@ void PollRearm() noexcept
             return;
         if (captureEnabled.load() && captureTrackingValid.load())
         {
+            if (lightingRequested.load() && !lightingAttempted.load() &&
+                GetTickCount64() - lightingRequestedAt.load() >= 10000)
+            {
+                lightingAttempted.store(true);
+                FSRDFogLayerCapture::CancelEarlyGuideRequest();
+                LOG_WARN("[FSRRR lighting guides] request timed out without the exact final lighting draw; no private dispatch");
+            }
+            const auto lightingRequest = Util::ExePath().parent_path() / L"FSRRR-lighting-guides.request";
+            const auto lightingAttributes = GetFileAttributesW(lightingRequest.c_str());
+            if (!lightingAttempted.load() && lightingAttributes != INVALID_FILE_ATTRIBUTES &&
+                !(lightingAttributes & FILE_ATTRIBUTE_DIRECTORY) && FSRDFogLayerCapture::RequestEarlyGuides())
+            {
+                if (DeleteFileW(lightingRequest.c_str()))
+                {
+                    lightingRequestedAt.store(GetTickCount64());
+                    lightingRequested.store(true);
+                    LOG_INFO("[FSRRR lighting guides] one-shot armed; private outputs only after exact original final lighting draw");
+                }
+                else FSRDFogLayerCapture::CancelEarlyGuideRequest();
+            }
             const auto captureRequest = Util::ExePath().parent_path() / L"FSRRR-fog-capture.request";
             const auto captureAttributes = GetFileAttributesW(captureRequest.c_str());
             if (captureAttributes != INVALID_FILE_ATTRIBUTES && !(captureAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -1226,8 +1287,34 @@ void __fastcall HookFogNode(void* node, void* context)
                                current.serial, GetCurrentThreadId(), uintptr_t(node), uintptr_t(context)); });
 }
 
+void __fastcall HookLightingNode(void* node, void* context)
+{
+    PollRearm();
+    LightingScope current { lightingScope, scopes.fetch_add(1) + 1, node, context };
+    lightingScope = &current;
+    struct Restore { LightingScope* previous; ~Restore() { lightingScope = previous; } } restore { current.previous };
+    originalLightingNode(node, context); // Exactly one original callback, including ordinary refusal paths.
+}
+
+void __fastcall HookFullscreenHelper(void* renderer, uint32_t shader, uint8_t flag)
+{
+    const auto caller = uintptr_t(_ReturnAddress());
+    auto* current = lightingScope;
+    const bool previous = current && current->finalHelper;
+    if (current)
+        current->finalHelper = !inMetadata && caller == authenticatedImage.load() + FinalLightingHelperReturnRva;
+    struct Restore { LightingScope* current; bool previous; ~Restore() { if (current) current->finalHelper = previous; } }
+        restore { current, previous };
+    originalFullscreenHelper(renderer, shader, flag); // Scope only; never invoke an extra engine draw.
+}
+
 void WINAPI HookSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
 {
+    if (lightingScope && !inMetadata && lightingRequested.load() && !lightingAttempted.load())
+        Metadata([&] {
+            lightingScope->psoList = list;
+            lightingScope->pso = pso; // Original valid SetPipelineState borrow boundary.
+        });
     if (scope && !inMetadata)
     {
         scope->psoList = list;
@@ -1240,6 +1327,51 @@ void WINAPI HookSetRtv(ID3D12GraphicsCommandList* list, UINT count,
                        const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL contiguous,
                        const D3D12_CPU_DESCRIPTOR_HANDLE* dsv)
 {
+    if (lightingScope && !inMetadata && lightingRequested.load() && !lightingAttempted.load())
+        Metadata([&] {
+            auto& current = *lightingScope;
+            current.rtvList = list;
+            current.rtvCount = count;
+            current.contiguous = contiguous;
+            current.hasDsv = dsv != nullptr;
+            current.dsv = dsv ? *dsv : D3D12_CPU_DESCRIPTOR_HANDLE {};
+            current.rtvs = {};
+            current.targets = {};
+            if (count != 2 || !rtvs) return;
+            ComPtr<ID3D12Device> device;
+            if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return;
+            const auto increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            if (!increment || rtvs[0].ptr > SIZE_MAX - increment) return;
+            for (UINT i = 0; i < 2; ++i)
+            {
+                BoundRtv bound;
+                ID3D12Resource* borrowed = nullptr;
+                {
+                    auto& data = Data();
+                    std::lock_guard lock(data.mutex);
+                    RtvHeap* heap = nullptr;
+                    UINT index = 0;
+                    const auto* first = FindRtv(data, rtvs[0].ptr, &heap, &index);
+                    if (!first || !heap) return;
+                    const SIZE_T handle = contiguous ? rtvs[0].ptr + SIZE_T(i) * increment : rtvs[i].ptr;
+                    const auto* slot = FindRtv(data, handle, &heap, &index);
+                    if (!slot || !slot->known || !slot->resource) return;
+                    borrowed = slot->resource;
+                    bound.heap = heap->heap;
+                    bound.view = slot->view;
+                    bound.heapGeneration = heap->generation;
+                    bound.slotGeneration = slot->generation;
+                    bound.index = index;
+                    bound.known = true;
+                    bound.documentedDefault = slot->documentedDefault;
+                    current.rtvs[i].ptr = handle;
+                }
+                // Original OM bind is a valid borrow; no sampled resource AddRef
+                // and no final COM release while the metadata registry is locked.
+                bound.resource = borrowed;
+                current.targets[i] = std::move(bound);
+            }
+        });
     if (scope && !inMetadata)
     {
         scope->rtvList = list;
@@ -1619,6 +1751,395 @@ void PrepareAndRecordEarlyGuides(ID3D12GraphicsCommandList* list, CapturePlan& p
         evidence["reason"] = error.what();
         LOG_WARN("[FSRRR private guides] one-shot refused: {}", error.what());
     }
+}
+
+struct LightingCapturePlan
+{
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<IUnknown> listIdentity;
+    std::array<ComPtr<ID3D12Resource>, 4> resources;
+    std::array<FSRD::CyberpunkEngineAccess::TextureBorrow, 4> textures {};
+    std::array<BoundRtv, 2> targets;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv {};
+    ListState drawState;
+    uintptr_t list = 0, context = 0, view = 0;
+    uint64_t serial = 0;
+    Json metadata, bindings, provenance;
+    std::shared_ptr<FSRD::CyberpunkGuidePass::Work> work;
+};
+
+// Read the actual pixel binding-cache route consumed by authenticated1f22e4.
+// This does not guess native root indices from range indices and does not treat
+// a positive registry ref or a remembered descriptor as proof of current use.
+Json ObserveLightingBindings(uintptr_t list, uintptr_t pso, const Json& metadata)
+{
+    uintptr_t tls = 0, engine = 0, cache = 0, layout = 0, descriptors = 0, native = 0, cachedPso = 0;
+    uint8_t initialized = 0;
+    const auto slots = uintptr_t(__readgsqword(0x58));
+    if (!ReadEarly(slots, tls) || !ReadEarlyAt(tls, 0x14, initialized) || !initialized ||
+        !ReadEarlyAt(tls, 0x188, engine) || !ReadEarlyAt(engine, 0x30, native) || native != list ||
+        !ReadEarlyAt(engine, 0x3d0, cachedPso) || cachedPso != pso ||
+        !ReadEarlyAt(engine, 0x60, cache) || !ReadEarlyAt(cache, 0x68, layout) ||
+        !ReadEarlyAt(cache, 0x28, descriptors))
+        throw std::runtime_error("current initialized lighting binding cache unavailable");
+    Json result = { { "tls", tls }, { "engine", engine }, { "cache", cache }, { "layout", layout },
+        { "descriptor_array", descriptors }, { "pixel_srvs", Json::array() } };
+    constexpr uint32_t registers[] = { 1, 2, 3, 14 };
+    for (size_t i = 0; i < 4; ++i)
+    {
+        const auto reg = registers[i];
+        uint8_t rangeIndex = 0xff;
+        std::array<uint8_t, 16> range {};
+        uint64_t dirty70 = 0, dirty78 = 0, resourceMask = 0, samplerMask = 0;
+        if (!ReadEarlyAt(layout, 0x4c3 + 0x100 + 2 * reg, rangeIndex) || rangeIndex >= 64 ||
+            !ReadEarlyAt(layout, 0x38 + uintptr_t(rangeIndex) * 0x10, range) ||
+            !ReadEarlyAt(layout, 0x8, resourceMask) || !ReadEarlyAt(layout, 0, samplerMask) ||
+            !(resourceMask & (uint64_t(1) << rangeIndex)) || (samplerMask & (uint64_t(1) << rangeIndex)) ||
+            !ReadEarlyAt(cache, 0x70, dirty70) || !ReadEarlyAt(cache, 0x78, dirty78) ||
+            ((dirty70 | dirty78) & (uint64_t(1) << rangeIndex)))
+            throw std::runtime_error("original lighting pixel range missing or not flushed before draw");
+        uint32_t base = 0;
+        uint16_t first = 0, count = 0;
+        std::memcpy(&base, range.data() + 4, 4);
+        std::memcpy(&first, range.data() + 8, 2);
+        std::memcpy(&count, range.data() + 10, 2);
+        const uint64_t index = uint64_t(base) + reg - first;
+        // 65536 is our diagnostic read cap, not an inferred engine allocation
+        // size. Authenticated current-use/range containment supplies provenance.
+        if (reg < first || !count || reg - first >= count || index >= 65536 ||
+            range[13] == 2 || range[14] >= 64)
+            throw std::runtime_error("original lighting pixel range/descriptor index unsupported");
+        uintptr_t descriptor = 0;
+        if (!ReadEarlyAt(descriptors, uintptr_t(index) * 8, descriptor) || !descriptor)
+            throw std::runtime_error("current lighting CPU binding descriptor unavailable");
+        const auto& source = EarlyInput(metadata, i).at("texture_registry").at("descriptor_sources");
+        if (source.at("status") != "cpu_descriptor_sources_observed" ||
+            !source.at("repeated_source_fields_equal").get<bool>() ||
+            descriptor != source.at(i == 3 ? "alternate_cpu_srv_handle" : "ordinary_cpu_srv_handle").get<uintptr_t>())
+            throw std::runtime_error("current pixel binding differs from selected authored guide SRV");
+        result["pixel_srvs"].push_back({ { "register", reg }, { "range_index", rangeIndex },
+            { "range_bytes", range }, { "descriptor_index", index }, { "cpu_srv_handle", descriptor },
+            { "native_root_parameter", range[14] }, { "range_dirty70", false }, { "range_dirty78", false } });
+    }
+    return result;
+}
+
+bool LightingDepthAlias(const LightingCapturePlan& plan,
+                        const FSRD::CyberpunkEngineAccess::TextureBorrow& texture) noexcept
+{
+    if (!lightingScope || !lightingScope->hasDsv || lightingScope->dsv.ptr != plan.dsv.ptr ||
+        texture.handle != plan.textures[3].handle || texture.native != plan.textures[3].native ||
+        !texture.handle || texture.handle > 0x8000 || !plan.dsv.ptr)
+        return false;
+    uintptr_t registry = 0, native = 0, readonlyDsv = 0;
+    int32_t refs = 0;
+    uint32_t requestedRead = 0;
+    std::array<uint8_t, 12> compact {};
+    const auto slot = uintptr_t(0x2f1d8) + uintptr_t(texture.handle - 1) * 0xb0;
+    return ReadEarlyAt(authenticatedImage.load(), FSRD::CyberpunkEngineAccess::RegistryRva, registry) &&
+        ReadEarlyAt(registry, slot - 8, refs) && refs > 0 &&
+        ReadEarlyAt(registry, slot, native) && native == texture.native &&
+        ReadEarlyAt(registry, slot + 0x28, readonlyDsv) && readonlyDsv == plan.dsv.ptr &&
+        ReadEarlyAt(registry, slot + 0x48, requestedRead) && requestedRead == 0xe0 &&
+        ReadEarlyAt(registry, slot + 0x4e, compact) &&
+        // Authenticated2221f4 second DSV has Flags3 for these depth/stencil
+        // formats. Both planes are read-only, not merely depth-format guessed.
+        compact[4] == 1 && compact[5] == 0 && (compact[8] & 4) &&
+        (compact[6] & 0xf) == 0 && compact[7] < 0x40 &&
+        ((compact[7] & 0x3f) == 0x18 || (compact[7] & 0x3f) == 0x19);
+}
+
+struct LightingEngineHost
+{
+    const LightingCapturePlan& plan;
+    bool Read(uintptr_t address, void* destination, size_t bytes) noexcept
+    { return ReadExactMemory(address, destination, bytes); }
+    uint32_t ThreadId() noexcept { return GetCurrentThreadId(); }
+    bool ReadTlsSlotZero(uintptr_t& result) noexcept
+    { return ReadEarly(uintptr_t(__readgsqword(0x58)), result) && result; }
+    bool ExactImageAuthenticated(uintptr_t image, uintptr_t size, uint32_t stamp, std::string_view sha) noexcept
+    {
+        return active.load() && captureEnabled.load() && lightingRequested.load() &&
+            image == authenticatedImage.load() && image == uintptr_t(GetModuleHandleW(nullptr)) &&
+            size == 0x04efc000 && stamp == 0x68af45ea && sha == ExeSha256;
+    }
+    bool LiveCodeMatches(uintptr_t image, const FSRD::CyberpunkEngineAccess::CodeRange& code) noexcept
+    { return MatchLiveCode(image, code); }
+    bool IsReadOnlyDepthAliasAdmitted(const FSRD::CyberpunkEngineAccess::TextureBorrow& texture) noexcept
+    { return LightingDepthAlias(plan, texture); }
+    bool IsAdmittedFogScope(uint64_t serial, uintptr_t list, uintptr_t pso,
+                            const std::array<FSRD::CyberpunkEngineAccess::TextureBorrow, 4>& inputs) noexcept
+    {
+        if (!lightingScope || !lightingScope->finalHelper || lightingScope->serial != plan.serial || serial != plan.serial ||
+            uintptr_t(lightingScope->context) != plan.context || list != plan.list ||
+            lightingScope->psoList != reinterpret_cast<ID3D12GraphicsCommandList*>(list) ||
+            lightingScope->pso.Get() != plan.pso.Get() || pso != uintptr_t(plan.pso.Get()) ||
+            lightingScope->rtvList != reinterpret_cast<ID3D12GraphicsCommandList*>(list) || lightingScope->rtvCount != 2 ||
+            !captureTrackingValid.load() || !LightingDepthAlias(plan, inputs[3]))
+            return false;
+        try
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            const auto found = data.lists.find(plan.listIdentity.Get());
+            if (found == data.lists.end() || found->second.generation != plan.drawState.generation ||
+                !found->second.known || found->second.predicated || found->second.renderPass || found->second.queryCount)
+                return false;
+        }
+        catch (...) { return false; }
+        uintptr_t view = 0;
+        uint8_t flags = 0;
+        if (!ReadEarlyAt(plan.context, 0x18, view) || view != plan.view ||
+            !ReadEarlyAt(plan.context, 0x30, flags) || !(flags & 2)) return false;
+        for (size_t i = 0; i < 4; ++i)
+        {
+            if (inputs[i].handle != plan.textures[i].handle || inputs[i].native != plan.textures[i].native || !plan.resources[i])
+                return false;
+            for (size_t target = 0; target < 2; ++target)
+                if (lightingScope->targets[target].resource.Get() != plan.targets[target].resource.Get() ||
+                    inputs[i].native == uintptr_t(plan.targets[target].resource.Get())) return false;
+        }
+        return true;
+    }
+    bool ListIsDirect(uintptr_t list) noexcept
+    { return reinterpret_cast<ID3D12GraphicsCommandList*>(list)->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT; }
+    uintptr_t CurrentNativeList(uintptr_t address) noexcept
+    { return uintptr_t(reinterpret_cast<void*(__fastcall*)()>(address)()); }
+    void RequestState(uintptr_t address, uintptr_t engine, uint32_t handle, uint32_t state, uint32_t subresource) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t)>(address)(reinterpret_cast<void*>(engine), handle, state, subresource); }
+    void Flush(uintptr_t address, uintptr_t engine) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*)>(address)(reinterpret_cast<void*>(engine)); }
+    void Reenter(uintptr_t address, uintptr_t list) noexcept
+    { reinterpret_cast<void(__fastcall*)(ID3D12GraphicsCommandList*)>(address)(reinterpret_cast<ID3D12GraphicsCommandList*>(list)); }
+    void RestorePso(uintptr_t list, uintptr_t pso) noexcept
+    { originalSetPso(reinterpret_cast<ID3D12GraphicsCommandList*>(list), reinterpret_cast<ID3D12PipelineState*>(pso)); }
+};
+
+std::shared_ptr<FSRD::CyberpunkGuidePass::Work> PrepareLightingGuideWork(LightingCapturePlan& plan)
+{
+    const auto& current = plan.metadata;
+    const auto dimensions = current.at("view_dimensions").get<std::array<uint32_t, 2>>();
+    FSRD::CyberpunkGuideMatrix::MatrixWords inverseProjection {}, inverseView {};
+    const auto& matrices = current.at("camera_provenance").at("matrices");
+    for (const auto& item : { std::pair { "inverse_native_projection_jittered", &inverseProjection },
+                              std::pair { "inverse_native_view", &inverseView } })
+    {
+        const auto rows = matrices.at(item.first).at("source_uint32_rows").get<std::array<std::array<uint32_t, 4>, 4>>();
+        std::memcpy(item.second->data(), rows.data(), 64);
+    }
+    FSRD::CyberpunkGuideConstants::ObservedSharedWords sharedWords {};
+    if (!FSRD::CyberpunkGuideMatrix::Generate(inverseProjection, inverseView, dimensions[0], dimensions[1], sharedWords))
+        throw std::runtime_error("exact current native camera recipe unavailable");
+    const auto& settings = current.at("guide_settings");
+    if (settings.at("extra_specular_enabled").get<unsigned>() != 0)
+        throw std::runtime_error("authored extra-specular branch needs unavailable t5; not disabled implicitly");
+    FSRD::CyberpunkGuideConstants::PassSources passSources;
+    passSources.width = dimensions[0]; passSources.height = dimensions[1];
+    passSources.transparency = FSRD::CyberpunkGuideConstants::TransparencyInput::PreTransparencySurface;
+    passSources.noVMode = settings.at("NoV_mode").get<int32_t>();
+    passSources.extraSpecularScaleBits = settings.at("extra_specular_scale_bits").get<uint32_t>();
+    FSRD::CyberpunkGuideConstants::PassConstants pass {};
+    if (!FSRD::CyberpunkGuideConstants::PackPass(passSources, pass))
+        throw std::runtime_error("exact authored pass constants unavailable");
+    std::array<FSRD::CyberpunkGuidePass::SourceView, 4> sources;
+    Json views = Json::array();
+    for (size_t i = 0; i < 4; ++i)
+    {
+        const auto& descriptors = EarlyInput(current, i).at("texture_registry").at("descriptor_sources");
+        if (i == 3)
+        {
+            const auto formatTag = descriptors.at("raw_format_sample_bits").get<uint32_t>() & 0x3f;
+            if (descriptors.at("raw_array_size").get<uint32_t>() != 1 ||
+                (descriptors.at("raw_dimension_mip_bits").get<uint32_t>() & 0xf) != 0 ||
+                (descriptors.at("raw_flags_bits").get<uint32_t>() & 5) != 5 ||
+                (formatTag != 0x18 && formatTag != 0x19) ||
+                plan.resources[i]->GetDesc().Format !=
+                    (formatTag == 0x18 ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R32G8X24_TYPELESS))
+                throw std::runtime_error("current t4 does not satisfy authenticated stencil-view factory branch");
+        }
+        const auto descriptor = descriptors.at(i == 3 ? "alternate_cpu_srv_handle" : "ordinary_cpu_srv_handle").get<SIZE_T>();
+        sources[i].resource = plan.resources[i];
+        sources[i].descriptor.ptr = descriptor;
+        uint64_t generation = 0;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            for (const auto& heap : data.cpuSrvHeaps)
+                if (descriptor >= heap.start && (descriptor - heap.start) % heap.increment == 0 &&
+                    (descriptor - heap.start) / heap.increment < heap.count)
+                {
+                    if (sources[i].heap) throw std::runtime_error("current source CPU range ambiguous");
+                    sources[i].heap = heap.heap;
+                    generation = heap.generation;
+                }
+        }
+        if (!sources[i].heap) throw std::runtime_error("current authored SRV has no retained CPU-only heap");
+        views.push_back({ { "private_register", i == 3 ? 4 : i }, { "lighting_register", i == 3 ? 14 : i + 1 },
+            { "handle", plan.textures[i].handle }, { "native", plan.textures[i].native },
+            { "cpu_srv_handle", descriptor }, { "heap_generation", generation }, { "descriptor_transform", "none" } });
+    }
+    std::vector<std::byte> shader;
+    {
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        shader = data.guideShader;
+    }
+    if (shader.size() != GuideShaderBytes) throw std::runtime_error("runtime authenticated guide shader unavailable");
+    if (ObserveLightingBindings(plan.list, uintptr_t(plan.pso.Get()), current) != plan.bindings)
+        throw std::runtime_error("current authored binding cache changed before descriptor copies");
+    auto work = FSRD::CyberpunkGuidePass::Prepare(plan.device.Get(), dimensions[0], dimensions[1], sources, pass,
+        FSRD::CyberpunkGuideConstants::PackShared(sharedWords), shader);
+    if (!work) throw std::runtime_error("private guide resource/PSO setup refused");
+    plan.provenance["sources"] = std::move(views);
+    plan.provenance["cb12_words"] = sharedWords;
+    plan.provenance["cb6_words"] = pass;
+    plan.provenance["shader_sha256"] = GuideShaderSha256;
+    return work;
+}
+
+std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(ID3D12GraphicsCommandList* list,
+                                                           std::shared_ptr<LightingCapturePlan>& diagnostic)
+{
+    auto plan = std::make_shared<LightingCapturePlan>();
+    diagnostic = plan; // Refusals retain bounded evidence even when this function throws.
+    auto& current = *lightingScope;
+    plan->list = uintptr_t(list); plan->context = uintptr_t(current.context); plan->serial = current.serial;
+    plan->provenance = { { "schema", "optiscaler.fsr_rr.lighting_private_guides.v1" }, { "status", "preparing" },
+        { "original_scene_modified", false }, { "node_rva", LightingNodeRva },
+        { "helper_return_rva", FinalLightingHelperReturnRva }, { "native_draw_return_rva", NativeFullscreenDrawReturnRva },
+        { "transparent_input", "explicit_pre_transparency_t3_t6_disabled" }, { "extra_specular_t5", "requires_authored_disabled" },
+        { "SL_frame_association", "not_asserted" }, { "GPU_completion", "requires_standalone_completion_fence" } };
+    plan->provenance["draw_observation"] = { { "native_list", plan->list }, { "scope", plan->serial },
+        { "pso_list", uintptr_t(current.psoList) }, { "pso", uintptr_t(current.pso.Get()) },
+        { "rtv_list", uintptr_t(current.rtvList) }, { "rtv_count", current.rtvCount },
+        { "has_dsv", current.hasDsv }, { "dsv", current.dsv.ptr } };
+    uint8_t flags = 0;
+    uint32_t nodeKind = 0;
+    if (!ReadEarlyAt(plan->context, 0x30, flags) || !(flags & 2) ||
+        !ReadEarlyAt(uintptr_t(current.node), 0x18, nodeKind) || nodeKind != 2 ||
+        current.psoList != list || !current.pso || current.rtvList != list || current.rtvCount != 2 ||
+        !current.hasDsv || !current.dsv.ptr || !earlyHeapTrackingValid.load())
+        throw std::runtime_error("final lighting kind/PSO/two-MRT/read-only-DSV observation incomplete");
+    plan->pso = current.pso; plan->targets = current.targets; plan->dsv = current.dsv;
+    plan->listIdentity = ListIdentity(list);
+    {
+        auto& data = Data();
+        std::lock_guard lock(data.mutex);
+        const auto found = data.lists.find(plan->listIdentity.Get());
+        if (found == data.lists.end() || !found->second.known || found->second.predicated ||
+            found->second.renderPass || found->second.queryCount)
+            throw std::runtime_error("final lighting Reset/predication/query/render-pass state unavailable");
+        plan->drawState = found->second;
+    }
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&plan->device)))) throw std::runtime_error("lighting device unavailable");
+    plan->metadata = Json::parse(FSRDCyberpunkEarlyGuides::Describe(current.context, authenticatedImage.load()));
+    plan->provenance["current_inputs"] = plan->metadata;
+    plan->view = plan->metadata.at("view").get<uintptr_t>();
+    const auto dimensions = plan->metadata.at("view_dimensions").get<std::array<uint32_t, 2>>();
+    for (const auto& target : plan->targets)
+    {
+        if (!target.known || !target.resource || target.view.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D ||
+            target.view.Texture2D.MipSlice || target.view.Texture2D.PlaneSlice)
+            throw std::runtime_error("both original MRT resource identities must be owned at their native bind");
+        const auto desc = target.resource->GetDesc();
+        if (desc.Width != dimensions[0] || desc.Height != dimensions[1])
+            throw std::runtime_error("original lighting MRT extents differ from current view");
+    }
+    plan->bindings = ObserveLightingBindings(plan->list, uintptr_t(plan->pso.Get()), plan->metadata);
+    plan->provenance["actual_pixel_bindings"] = plan->bindings;
+    UINT64 ownedBytes = 0;
+    for (size_t i = 0; i < 4; ++i)
+    {
+        const auto& source = EarlyInput(plan->metadata, i);
+        const auto& registry = source.at("texture_registry");
+        plan->textures[i] = { source.at("handle").get<uint32_t>(), registry.at("borrowed_native_address").get<uintptr_t>() };
+        if (!plan->textures[i].native || registry.at("descriptor_sources").at("requested_srv_state_mask").get<uint32_t>() !=
+                (i == 3 ? 0xe0u : 0xc0u))
+            throw std::runtime_error("current authored resource/read-state identity unavailable");
+        for (const auto& target : plan->targets)
+            if (plan->textures[i].native == uintptr_t(target.resource.Get()))
+                throw std::runtime_error("guide source aliases original writable lighting MRT");
+        // Exact authenticated final native Draw consumes these selected current
+        // pixel SRVs NOW. Its active graph/cache borrow, not old clears or sampled
+        // pointers, is the ownership boundary for this AddRef.
+        plan->resources[i] = reinterpret_cast<ID3D12Resource*>(plan->textures[i].native);
+        const auto desc = plan->resources[i]->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != dimensions[0] ||
+            desc.Height != dimensions[1] || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1)
+            throw std::runtime_error("current lighting guide layout unsupported");
+        const auto bytes = plan->device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        constexpr UINT64 MaxOwnedInputBytes = 128ull * 1024 * 1024;
+        if (!bytes || bytes > MaxOwnedInputBytes - ownedBytes) throw std::runtime_error("lighting input ownership budget exceeded");
+        ownedBytes += bytes;
+    }
+    if (!LightingDepthAlias(*plan, plan->textures[3]))
+        throw std::runtime_error("actual bound DSV differs from authenticated both-planes-readonly t14 alias");
+    const auto fresh = Json::parse(FSRDCyberpunkEarlyGuides::Describe(current.context, authenticatedImage.load()));
+    for (size_t i = 0; i < 4; ++i)
+        if (!SameEarlyReservation(plan->metadata, fresh, i) ||
+            EarlyInput(plan->metadata, i).at("texture_registry").at("descriptor_sources") !=
+                EarlyInput(fresh, i).at("texture_registry").at("descriptor_sources"))
+            throw std::runtime_error("current lighting reservation/descriptor changed during preparation");
+    if (fresh.at("view") != plan->metadata.at("view") || fresh.at("view_dimensions") != plan->metadata.at("view_dimensions") ||
+        fresh.at("guide_settings") != plan->metadata.at("guide_settings") ||
+        fresh.at("camera_provenance").at("matrices") != plan->metadata.at("camera_provenance").at("matrices"))
+        throw std::runtime_error("current lighting camera/settings changed during preparation");
+    plan->work = PrepareLightingGuideWork(*plan);
+    plan->provenance["current_inputs"] = plan->metadata;
+    plan->provenance["actual_pixel_bindings"] = plan->bindings;
+    plan->provenance["native_list"] = plan->list;
+    plan->provenance["recording_generation"] = plan->drawState.generation;
+    plan->provenance["scope"] = plan->serial;
+    plan->provenance["original_mrt_resources"] = { uintptr_t(plan->targets[0].resource.Get()), uintptr_t(plan->targets[1].resource.Get()) };
+    plan->provenance["readonly_dsv"] = plan->dsv.ptr;
+    return plan;
+}
+
+void FinishLightingCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<LightingCapturePlan>& plan)
+{
+    // Original final lighting DrawInstanced has already returned exactly once.
+    // Compute does not touch OM/RS/IA: retain both original MRTs and read-only DSV
+    // bindings unchanged. Engine state requests preserve the DSV DEPTH_READ bit.
+    if (ObserveLightingBindings(plan->list, uintptr_t(plan->pso.Get()), plan->metadata) != plan->bindings)
+        throw std::runtime_error("original draw changed current lighting binding identity");
+    LightingEngineHost host { *plan };
+    FSRD::CyberpunkEngineAccess::Input input;
+    input.image = authenticatedImage.load(); input.list = plan->list; input.originalPso = uintptr_t(plan->pso.Get());
+    input.originalFogScope = plan->serial; input.textures = plan->textures; input.preserveReadOnlyDepth = true;
+    if (!FSRDSubmission::Retain(plan->device.Get(), list, plan))
+        throw std::runtime_error("lighting capture lifetime retention unavailable");
+    const auto result = FSRD::CyberpunkEngineAccess::RecordPrivateCompute(host, input, [&] { return plan->work->Record(list); });
+    if (result.outcome == FSRD::CyberpunkEngineAccess::Outcome::ScopeLostAfterPrivate)
+    {
+        earlyFatalRecording.store(true); // Nonthrowing latch precedes every log/JSON allocation.
+        try { LOG_ERROR("[FSRRR lighting guides] FATAL private recording lost original scope; terminating authenticated Cyberpunk only"); }
+        catch (...) {}
+        if (active.load() && captureEnabled.load() && lightingRequested.load() &&
+            input.image == authenticatedImage.load() && input.image == uintptr_t(GetModuleHandleW(nullptr)))
+        {
+            TerminateProcess(GetCurrentProcess(), 0xf51d0001u);
+            RaiseFailFastException(nullptr, nullptr, 0);
+        }
+        return;
+    }
+    plan->provenance["engine_state_requests"] = result.requestsIssued;
+    plan->provenance["bindings_restored"] = result.bindingsRestored;
+    plan->provenance["outcome"] = unsigned(result.outcome);
+    if (result.outcome != FSRD::CyberpunkEngineAccess::Outcome::PrivateRecordedRestored)
+        throw std::runtime_error("private lighting guide recording refused/failed; no completed guide payload");
+    plan->provenance["status"] = "private_dispatch_recorded";
+    plan->provenance["recording_position"] = "after original final lighting draw on its own native list/Reset";
+    plan->provenance["read_states"] = { 0xc0, 0xc0, 0xc0, 0xe0 };
+    std::array<FSRDFogLayerCapture::Texture, 3> outputs;
+    for (size_t i = 0; i < 3; ++i)
+    {
+        outputs[i].resource = plan->work->Outputs()[i];
+        outputs[i].viewFormat = i < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        outputs[i].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    const bool recorded = FSRDFogLayerCapture::RecordEarlyGuides(plan->device.Get(), list, outputs, plan->provenance.dump(), plan);
+    LOG_INFO("[FSRRR lighting guides] original draw preserved; private guide readback recorded={} scope={}", recorded, plan->serial);
 }
 
 bool HasBoundCb12Psos(const CapturePlan& plan)
@@ -2026,9 +2547,43 @@ void FinishCapture(ID3D12GraphicsCommandList* list, const std::shared_ptr<Captur
              recorded, plan->provenance["scope_serial"].get<uint64_t>());
 }
 
+bool MatchesFinalLightingDraw(bool scoped, bool finalHelper, uintptr_t nativeCaller, uintptr_t image,
+                              UINT count, UINT instances, UINT start, UINT firstInstance) noexcept
+{
+    return scoped && finalHelper && image && image <= UINTPTR_MAX - NativeFullscreenDrawReturnRva &&
+        nativeCaller == image + NativeFullscreenDrawReturnRva && count == 3 && instances == 1 && !start && !firstInstance;
+}
+
 void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances, UINT start, UINT firstInstance)
 {
+    const auto nativeCaller = uintptr_t(_ReturnAddress());
     LogDraw(list, false, count, instances, start, 0, firstInstance);
+    std::shared_ptr<LightingCapturePlan> lightingPlan;
+    if (captureEnabled.load() && !inMetadata && lightingRequested.load() && !lightingAttempted.load() &&
+        FSRDFogLayerCapture::WantsEarlyGuideCapture() &&
+        MatchesFinalLightingDraw(lightingScope != nullptr, lightingScope && lightingScope->finalHelper,
+            nativeCaller, authenticatedImage.load(), count, instances, start, firstInstance) &&
+        !lightingAttempted.exchange(true))
+        Metadata([&] {
+            std::shared_ptr<LightingCapturePlan> diagnostic;
+            try
+            {
+                ++lightingScope->finalDraws;
+                if (lightingScope->finalDraws != 1) throw std::runtime_error("ambiguous repeated final lighting draw");
+                lightingPlan = PrepareLightingCapture(list, diagnostic);
+            }
+            catch (const std::exception& error)
+            {
+                FSRDFogLayerCapture::CancelEarlyGuideRequest();
+                if (diagnostic)
+                {
+                    diagnostic->provenance["status"] = "refused_before_original_draw";
+                    diagnostic->provenance["reason"] = error.what();
+                    LOG_WARN("[FSRRR lighting guides] refusal {}", diagnostic->provenance.dump());
+                }
+                else LOG_WARN("[FSRRR lighting guides] preparation refused: {}", error.what());
+            }
+        });
     std::shared_ptr<CapturePlan> plan;
     if (captureEnabled.load() && !inMetadata && scope)
         Metadata([&] {
@@ -2043,6 +2598,17 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
     if (earlyFatalRecording.load() || (plan && plan->fatalEarlyRecording))
         return; // Only the fatal post-private scope-loss outcome; never ordinary refusal.
     originalDraw(list, count, instances, start, firstInstance);
+    if (lightingPlan)
+        Metadata([&] {
+            try { FinishLightingCapture(list, lightingPlan); }
+            catch (const std::exception& error)
+            {
+                FSRDFogLayerCapture::CancelEarlyGuideRequest();
+                lightingPlan->provenance["status"] = "refused_after_original_draw";
+                lightingPlan->provenance["reason"] = error.what();
+                LOG_WARN("[FSRRR lighting guides] refusal {}", lightingPlan->provenance.dump());
+            }
+        });
     if (plan)
     {
         PublishFogEndpoint(plan); // Publish only AFTER the original target draw was recorded once.
@@ -2598,6 +3164,12 @@ void Initialize(bool enabled)
             if (captures && std::all_of(std::begin(ProducerCode), std::end(ProducerCode),
                                        [&](const auto& code) { return MatchLiveCode(image, code); }))
                 originalGBufferInitializer = reinterpret_cast<GBufferInitializer>(image + GBufferInitializerRva);
+            if (captures && std::all_of(std::begin(LightingCode), std::end(LightingCode),
+                                       [&](const auto& code) { return MatchLiveCode(image, code); }))
+            {
+                originalLightingNode = reinterpret_cast<FogNode>(image + LightingNodeRva);
+                originalFullscreenHelper = reinterpret_cast<FullscreenHelper>(image + FullscreenHelperRva);
+            }
             originalFogNode = reinterpret_cast<FogNode>(entry);
             LONG error = DetourTransactionBegin();
             if (error == NO_ERROR)
@@ -2607,6 +3179,10 @@ void Initialize(bool enabled)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalFogNode), HookFogNode);
                 if (error == NO_ERROR && originalGBufferInitializer)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalGBufferInitializer), HookGBufferInitializer);
+                if (error == NO_ERROR && originalLightingNode)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalLightingNode), HookLightingNode);
+                if (error == NO_ERROR && originalFullscreenHelper)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalFullscreenHelper), HookFullscreenHelper);
                 if (error == NO_ERROR)
                     error = DetourTransactionCommit();
                 else
@@ -2616,6 +3192,8 @@ void Initialize(bool enabled)
             {
                 originalFogNode = nullptr;
                 originalGBufferInitializer = nullptr;
+                originalLightingNode = nullptr;
+                originalFullscreenHelper = nullptr;
                 authenticatedImage.store(0);
                 LOG_WARN("[FSRRR fog probe] engine hook failed: {}", error);
                 return;

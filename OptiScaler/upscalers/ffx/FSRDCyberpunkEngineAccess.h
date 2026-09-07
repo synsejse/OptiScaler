@@ -9,8 +9,8 @@
 
 namespace FSRD::CyberpunkEngineAccess
 {
-// Isolated, NOT installed/invoked. Only for a synchronous private compute pass
-// inside an already authenticated original Fog draw on the executing thread.
+// Only for a synchronous private compute pass inside an already authenticated
+// original engine draw scope on the executing thread (Fog or final lighting).
 // The caller must admit compiler-reserved current resources, producer ordering,
 // descriptor provenance and no active writable-target aliases BEFORE entry.
 // Positive registry refs alone establish none of those facts.
@@ -62,6 +62,9 @@ struct Input
     uintptr_t image = 0, list = 0, originalPso = 0;
     uint64_t originalFogScope = 0;
     std::array<TextureBorrow, 4> textures {}; // t0, t1, t2, t4; admitted by caller.
+    // Narrow lighting-only opt-in: t4 is also the currently bound DSV with BOTH
+    // depth and stencil read-only. Never accept a caller-selected arbitrary mask.
+    bool preserveReadOnlyDepth = false;
 };
 
 enum class Outcome
@@ -82,6 +85,13 @@ struct Result
 
 namespace Detail
 {
+template <typename Host> bool ReadOnlyDepthAdmitted(Host& host, const Input& input)
+{
+    if (!input.preserveReadOnlyDepth) return true;
+    if constexpr (requires { host.IsReadOnlyDepthAliasAdmitted(input.textures[3]); })
+        return host.IsReadOnlyDepthAliasAdmitted(input.textures[3]);
+    return false; // Existing Fog hosts cannot opt into an unimplemented proof.
+}
 template <typename Host, typename T> bool Read(Host& host, uintptr_t base, uintptr_t offset, T& value)
 {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -104,6 +114,7 @@ template <typename Host> bool SameScope(Host& host, const Input& input, const Sn
     uint8_t initialized = 0;
     uint32_t kind = 0;
     return host.ThreadId() == saved.thread &&
+        ReadOnlyDepthAdmitted(host, input) &&
         host.IsAdmittedFogScope(input.originalFogScope, input.list, input.originalPso, input.textures) &&
         host.ReadTlsSlotZero(tls) && tls == saved.tls &&
         Read(host, tls, 0x14, initialized) && initialized &&
@@ -184,6 +195,9 @@ template <typename Host> bool Prepare(Host& host, const Input& input, Snapshot& 
 // - ExactImageAuthenticated supplies existing full-file SHA/PE identity evidence.
 // - IsAdmittedFogScope validates synchronous scope/list/PSO/resource admission,
 //   including logical reservations, producer order and no writable aliases.
+// - The optional IsReadOnlyDepthAliasAdmitted validates the current input[3]
+//   native resource against the exact bound DSV and proves BOTH read-only flags.
+//   It is rechecked at each scope gate when preserveReadOnlyDepth is true.
 // - CurrentNativeList invokes the authenticated Win64 void*() getter.
 // - RequestState invokes void(context*, uint32 handle, uint32 nativeState,
 //   uint32 subresource); Flush invokes void(context*); Reenter invokes void(list*).
@@ -203,10 +217,11 @@ Result RecordPrivateCompute(Host& host, const Input& input, PrivateWork&& privat
         return result;
     // All admission checks precede any mutation. The engine owns StateBefore,
     // unknown-first-use reconciliation and later submission. Flush is NOT a wait.
-    for (const auto& texture : input.textures)
+    for (size_t i = 0; i < input.textures.size(); ++i)
     {
-        host.RequestState(input.image + RequestStateRva, saved.context, texture.handle,
-                          InputReadState, AllSubresources);
+        const auto& texture = input.textures[i];
+        const auto readState = InputReadState | ((i == 3 && input.preserveReadOnlyDepth) ? 0x20u : 0u);
+        host.RequestState(input.image + RequestStateRva, saved.context, texture.handle, readState, AllSubresources);
         ++result.requestsIssued;
     }
     host.Flush(input.image + FlushRva, saved.context);

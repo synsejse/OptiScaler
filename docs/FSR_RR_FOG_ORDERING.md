@@ -84,7 +84,7 @@ not ship the game's shader bytes or guess material properties. Its initial
 pre-transparency mode explicitly excludes later transparent-guide adaptation.
 An active extra-specular branch with unavailable input must be refused.
 
-Live camera capture has twice matched all 20 consumed GPU constant words
+Live camera capture has three times matched all 20 consumed GPU constant words
 bit-for-bit. That verifies the tested current camera recipe, not every guide's
 contents, GPU readiness, or frame ownership. In another capture the early
 explicit engine frame ID was 108866 but subsequent observed SL tokens were
@@ -95,6 +95,19 @@ initialization/version/lifetime and GPU ordering evidence, correct restoration
 of engine command state, current temporal resources, and a validated early
 denoiser/late-SR handoff. Numeric graph intervals and a reused resource address
 alone are not that proof. Private guide capture is an intermediate check.
+
+The first live private-guide admission test observed all four original GBuffer
+clears with matching frame/view/resource identities, but the clears and Fog
+were recorded on different native command-list generations. It correctly
+refused dispatch; this was not evidence of a broken game frame. A separate
+one-shot `FSRRR-lighting-guides.request` diagnostic instead intercepts the exact
+final original lighting draw, where the four selected material SRVs are in
+current use. It records private guide generation **after** that original draw,
+preserves both original color targets and the depth/stencil read-only binding,
+and emits three native-format textures to `FSRRR-early-guide-captures/`.
+This avoids claiming that earlier CPU callbacks establish GPU ordering. The
+capture is still diagnostic: it neither denoises scene color nor proves that
+depth, motion, hit distance and temporal scalars are ready for early RR.
 
 No fitted haze, inferred diffuse/specular split, raw/denoised blend, history
 reset trick, or permanent removal of the game's authored fog is proposed.

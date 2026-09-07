@@ -73,11 +73,14 @@ struct Host
 {
     std::map<uintptr_t,std::vector<unsigned char>> memory;
     std::vector<std::string> calls;
+    std::vector<uint32_t> states;
     uint32_t thread=123;
     unsigned codeCount=0, codeFailure=99, getters=0;
     bool imageOk=true, scopeOk=true, direct=true, tlsOk=true;
     uintptr_t tls=Tls, currentList=List, actualPso=Pso;
     bool loseOnFlush=false;
+    bool readonlyDepth=false;
+    unsigned readonlyChecks=0;
     template<class T> void Put(uintptr_t address,T value)
     { auto& bytes=memory[address]; bytes.resize(sizeof(T)); std::memcpy(bytes.data(),&value,sizeof(T)); }
     bool Read(uintptr_t address,void* output,size_t bytes) noexcept
@@ -96,6 +99,8 @@ struct Host
     bool IsAdmittedFogScope(uint64_t scope,uintptr_t list,uintptr_t pso,
                            const std::array<E::TextureBorrow,4>&) noexcept
     { return scopeOk&&scope==42&&list==List&&pso==Pso; }
+    bool IsReadOnlyDepthAliasAdmitted(const E::TextureBorrow& texture) noexcept
+    { ++readonlyChecks;return readonlyDepth&&texture.handle==4&&texture.native==0x703000; }
     uint32_t ThreadId() noexcept { return thread; }
     bool ReadTlsSlotZero(uintptr_t& result) noexcept { result=tls;return tlsOk; }
     bool ListIsDirect(uintptr_t list) noexcept { assert(list==List);return direct; }
@@ -103,7 +108,8 @@ struct Host
     { assert(address==Image+E::GetCurrentListRva);++getters;return currentList; }
     void RequestState(uintptr_t address,uintptr_t context,uint32_t handle,uint32_t state,uint32_t subresource) noexcept
     {
-        assert(address==Image+E::RequestStateRva&&context==Context&&state==0xc0&&subresource==0xffffffff);
+        assert(address==Image+E::RequestStateRva&&context==Context&&subresource==0xffffffff);
+        assert(state==((readonlyDepth&&handle==4)?0xe0u:0xc0u));states.push_back(state);
         calls.push_back("read"+std::to_string(handle));
     }
     void Flush(uintptr_t address,uintptr_t context) noexcept
@@ -155,6 +161,8 @@ int main()
     rejected([](Host&,E::Input& in){in.textures[0].handle=0;});
     rejected([](Host&,E::Input& in){in.textures[0].handle=0x8001;});
     rejected([](Host&,E::Input& in){in.image=~uintptr_t(0);});
+    rejected([](Host&,E::Input& in){in.preserveReadOnlyDepth=true;});
+    rejected([](Host& h,E::Input& in){in.preserveReadOnlyDepth=true;h.readonlyDepth=true;in.textures[3].handle=3;});
     { Host h;auto in=Setup(h);h.Put<uint8_t>(Tls+0x14,0);
       E::RecordPrivateCompute(h,in,[]{return true;});assert(!h.getters); }
     for(unsigned mode=0;mode<3;++mode)
@@ -169,6 +177,7 @@ int main()
         assert(result.requestsIssued==4&&result.callbackEntered&&result.bindingsRestored);
         assert(h.actualPso==Pso&&h.getters==1&&h.codeCount==11);
         assert((h.calls==std::vector<std::string>{"read1","read2","read3","read4","flush","private","reentry","pso"}));
+        assert((h.states==std::vector<uint32_t>{0xc0,0xc0,0xc0,0xc0}));
     }
     { Host h;auto in=Setup(h);h.loseOnFlush=true;
       const auto result=E::RecordPrivateCompute(h,in,[]{assert(false);return true;});
@@ -180,6 +189,13 @@ int main()
     { Host h;auto in=Setup(h);h.Put<uint32_t>(Context+0x68,4);h.Put<uint8_t>(Registry+0x1a8e988,0);
       const auto result=E::RecordPrivateCompute(h,in,[]{return true;});
       assert(result.outcome==E::Outcome::PrivateRecordedRestored); }
+    { Host h;auto in=Setup(h);in.preserveReadOnlyDepth=true;h.readonlyDepth=true;
+      const auto result=E::RecordPrivateCompute(h,in,[]{return true;});
+      assert(result.outcome==E::Outcome::PrivateRecordedRestored&&h.readonlyChecks>=4);
+      assert((h.states==std::vector<uint32_t>{0xc0,0xc0,0xc0,0xe0})); }
+    { Host h;auto in=Setup(h);in.preserveReadOnlyDepth=true;h.readonlyDepth=true;
+      const auto result=E::RecordPrivateCompute(h,in,[&]{h.readonlyDepth=false;return true;});
+      assert(result.outcome==E::Outcome::ScopeLostAfterPrivate&&!result.bindingsRestored); }
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-engine-access-") as name:

@@ -14,7 +14,7 @@ SOURCE = CPP.read_text()
 class EarlyGuides(unittest.TestCase):
     def test_observation_is_only_in_authenticated_capture_or_explicit_early_request(self):
         probe = (CPP.parent / "FSRDCyberpunkFogProbe.cpp").read_text()
-        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 4)
+        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 6)
         initializer = probe.split("void __fastcall HookGBufferInitializer(", 1)[1].split("void ObserveInitializerClear(", 1)[0]
         self.assertLess(initializer.index("earlyRequested.load() && !earlyAttempted.load() && !inMetadata"),
                         initializer.index("FSRDCyberpunkEarlyGuides::Describe("))
@@ -24,6 +24,12 @@ class EarlyGuides(unittest.TestCase):
         self.assertIn("Describe(s.context, uintptr_t(GetModuleHandleW(nullptr)))", capture)
         self.assertLess(capture.index('plan->provenance["endpoint_origin"]'),
                         capture.index('plan->provenance["early_guide_availability"]'))
+        lighting = probe.split("std::shared_ptr<LightingCapturePlan> PrepareLightingCapture(", 1)[1].split("void FinishLightingCapture(", 1)[0]
+        self.assertEqual(lighting.count("FSRDCyberpunkEarlyGuides::Describe("), 2)
+        draw = probe.split("void WINAPI HookDraw(", 1)[1].split("void WINAPI HookDrawIndexed(", 1)[0]
+        for gate in ("lightingRequested.load()", "WantsEarlyGuideCapture()", "MatchesFinalLightingDraw(",
+                     "!lightingAttempted.exchange(true)"):
+            self.assertLess(draw.index(gate), draw.index("PrepareLightingCapture("))
 
     def test_read_only_and_no_persistent_engine_state(self):
         self.assertIn("ReadProcessMemory(GetCurrentProcess()", SOURCE)

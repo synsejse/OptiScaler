@@ -40,6 +40,7 @@ struct Status
     bool complete = false;
     std::string message;
     std::string directory;
+    std::string kind; // "fog_layers" or "early_guides" when a request has been admitted.
 };
 
 // Initially one recorded attempt per process, including failed attempts. A queued
@@ -48,6 +49,33 @@ bool Request();
 void CancelRequest();
 bool WantsCapture();
 Status GetStatus();
+
+// Independent request KIND, sharing the same bounded one-attempt registry/worker.
+// A fog request cannot consume/cancel a guide request, or vice versa. Only one
+// recorded kind is allowed per process; no second 256 MiB batch is introduced.
+bool RequestEarlyGuides();
+void CancelEarlyGuideRequest();
+bool WantsEarlyGuideCapture();
+
+// Standalone native guide readback; no fog draw or scene snapshots are required.
+// guides = u0 diffuse RGBA8_UNORM, u1 specular RGBA8_UNORM, u2 normal/roughness
+// RGBA16F. All three must be distinct private immutable typed mip0/slice0,
+// single-mip/single-array/single-sample textures of identical dimensions, in
+// NON_PIXEL|PIXEL_SHADER_RESOURCE (0xc0), the private GuidePass's completed-recording
+// state. No shader, exposure, normalization, alpha or integer conversion is made.
+// Caller authenticates the original scene scope/inputs and restores any earlier
+// compute binding changes. This helper only copies private textures/restores states.
+// keepAlive is REQUIRED and must retain the dispatch Work's resources/PSO/heaps;
+// earlier dispatch references must already be retained even if this call refuses.
+// Copies are retained before recording on this exact list. Callback return is NOT
+// submission/completion: the existing actual-list queue observer/fence and worker
+// still determine GetStatus().complete. A false return can mean refused setup;
+// true only means copies recorded (worker startup/disk failure is separate status).
+// Output: <exe>/FSRRR-early-guide-captures/<UTC timestamp>/manifest.json plus three
+// native companions. Caller provenance is evidence, not promoted to frame proof.
+bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                       const std::array<Texture, 3>& guides, const std::string& provenanceJson,
+                       const std::shared_ptr<void>& keepAlive) noexcept;
 
 // Caller preconditions (not authenticated by this generic readback helper):
 // - Authenticate the exact fog PSO, draw, bindings, subresource and blend descriptor.

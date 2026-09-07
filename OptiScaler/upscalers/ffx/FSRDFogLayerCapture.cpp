@@ -40,6 +40,7 @@ struct Entry
 
 struct Batch
 {
+    bool guidesOnly = false;
     std::array<Entry, 3> entries;
     std::optional<Entry> boundCb12;
     std::optional<std::array<Entry, 3>> earlyGuides;
@@ -48,10 +49,13 @@ struct Batch
     std::filesystem::path directory;
 };
 
+enum class RequestKind { FogLayers, EarlyGuides };
+
 struct Registry
 {
     std::mutex mutex;
     std::atomic<bool> requested { false };
+    std::atomic<RequestKind> kind { RequestKind::FogLayers };
     Status status { .message = "No fog capture requested." };
     // Ticket owns Batch through FSRDSubmission. Batch must NOT own Ticket.
     // These additional references survive worker errors/timeouts without a GPU wait.
@@ -73,11 +77,11 @@ void Check(HRESULT result, const char* operation)
         throw std::runtime_error(std::format("{} ({:08X})", operation, static_cast<UINT>(result)));
 }
 
-std::string Timestamp()
+std::string Timestamp(const char* prefix = "fog")
 {
     SYSTEMTIME now {};
     GetSystemTime(&now);
-    return std::format("fog-{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}Z-{}", now.wYear, now.wMonth,
+    return std::format("{}-{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}Z-{}", prefix, now.wYear, now.wMonth,
                        now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetCurrentProcessId());
 }
 
@@ -303,12 +307,12 @@ void WriteWhenComplete(const WorkerArgs& args)
     {
         if (SubmissionFailed(args.ticket))
         {
-            FinishStatus(false, "Fog capture submission failed/device removed; GPU storage retained.", false);
+            FinishStatus(false, "Native capture submission failed/device removed; GPU storage retained.", false);
             return;
         }
         if (GetTickCount64() - start >= CompletionTimeoutMs)
         {
-            FinishStatus(false, "Fog capture completion timed out; GPU storage retained (no render-thread wait).", false);
+            FinishStatus(false, "Native capture completion timed out; GPU storage retained (no render-thread wait).", false);
             return;
         }
         Sleep(20); // Only the one-shot background writer waits, never the game's recording thread.
@@ -323,7 +327,7 @@ void WriteWhenComplete(const WorkerArgs& args)
         if (!std::filesystem::create_directory(batch.directory))
             throw std::runtime_error("fog capture directory already exists");
         directoryCreated = true;
-        WriteManifest(batch); // Explicitly incomplete until all three files are closed successfully.
+        WriteManifest(batch); // Explicitly incomplete until all native files are closed successfully.
         for (const auto& entry : batch.entries)
             WriteEntry(batch, entry);
         if (batch.boundCb12)
@@ -333,7 +337,8 @@ void WriteWhenComplete(const WorkerArgs& args)
                 WriteEntry(batch, entry);
         batch.metadata["complete"] = true;
         WriteManifest(batch);
-        FinishStatus(true, "Fog capture saved: three native floating-point RGBA layers and provenance.", true);
+        FinishStatus(true, batch.guidesOnly ? "Early guide capture saved: three native guide companions and provenance." :
+                                            "Fog capture saved: three native floating-point RGBA layers and provenance.", true);
     }
     catch (const std::exception& error)
     {
@@ -350,7 +355,7 @@ void WriteWhenComplete(const WorkerArgs& args)
                 // Keep partial files for diagnosis; do not turn a disk error into a render failure.
             }
         }
-        FinishStatus(false, std::format("Fog capture write failed: {}", error.what()), true);
+        FinishStatus(false, std::format("Native capture write failed: {}", error.what()), true);
     }
 }
 
@@ -370,7 +375,7 @@ DWORD WINAPI WriterThread(void* raw)
             // A failed worker never releases storage whose completion was not established.
             try
             {
-                FinishStatus(false, "Fog capture worker failed; GPU storage retained.", false);
+                FinishStatus(false, "Native capture worker failed; GPU storage retained.", false);
             }
             catch (...)
             {}
@@ -381,29 +386,48 @@ DWORD WINAPI WriterThread(void* raw)
 }
 } // namespace
 
-bool Request()
+bool RequestKindCapture(RequestKind kind)
 {
     auto& registry = GetRegistry();
     std::lock_guard lock(registry.mutex);
     if (registry.status.attempted || registry.requested.load(std::memory_order_relaxed))
         return false;
-    registry.status = { .queued = true, .busy = true, .message = "Queued: waiting for authenticated fog-layer snapshots." };
+    registry.status = { .queued = true, .busy = true,
+        .message = kind == RequestKind::FogLayers ? "Queued: waiting for authenticated fog-layer snapshots." :
+                                                   "Queued: waiting for authenticated private early guides.",
+        .kind = kind == RequestKind::FogLayers ? "fog_layers" : "early_guides" };
+    registry.kind.store(kind, std::memory_order_relaxed);
     registry.requested.store(true, std::memory_order_release);
     return true;
 }
 
-void CancelRequest()
+void CancelKindCapture(RequestKind kind)
 {
     auto& registry = GetRegistry();
     std::lock_guard lock(registry.mutex);
-    if (!registry.requested.exchange(false, std::memory_order_acq_rel))
+    if (registry.kind.load(std::memory_order_relaxed) != kind ||
+        !registry.requested.exchange(false, std::memory_order_acq_rel))
         return;
-    registry.status = { .message = "Queued fog capture cancelled." };
+    registry.status = { .message = "Queued native capture cancelled." };
 }
+
+bool Request() { return RequestKindCapture(RequestKind::FogLayers); }
+bool RequestEarlyGuides() { return RequestKindCapture(RequestKind::EarlyGuides); }
+void CancelRequest() { CancelKindCapture(RequestKind::FogLayers); }
+void CancelEarlyGuideRequest() { CancelKindCapture(RequestKind::EarlyGuides); }
 
 bool WantsCapture()
 {
-    return GetRegistry().requested.load(std::memory_order_acquire);
+    auto& registry = GetRegistry();
+    return registry.requested.load(std::memory_order_acquire) &&
+           registry.kind.load(std::memory_order_relaxed) == RequestKind::FogLayers;
+}
+
+bool WantsEarlyGuideCapture()
+{
+    auto& registry = GetRegistry();
+    return registry.requested.load(std::memory_order_acquire) &&
+           registry.kind.load(std::memory_order_relaxed) == RequestKind::EarlyGuides;
 }
 
 Status GetStatus()
@@ -419,7 +443,8 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
     auto& registry = GetRegistry();
     {
         std::lock_guard lock(registry.mutex);
-        if (!registry.requested.exchange(false, std::memory_order_acq_rel))
+        if (registry.kind.load(std::memory_order_relaxed) != RequestKind::FogLayers ||
+            !registry.requested.exchange(false, std::memory_order_acq_rel))
             return false;
         registry.status.queued = false;
         registry.status.attempted = true;
@@ -587,6 +612,142 @@ bool Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, const Layers&
             FreeLibrary(module);
         FinishStatus(false, std::format("Fog capture failed: {}{}", error.what(),
                                        recorded ? "; recorded GPU storage retained" : ""), false);
+        return recorded;
+    }
+}
+
+bool RecordEarlyGuides(ID3D12Device* device, ID3D12GraphicsCommandList* list,
+                       const std::array<Texture, 3>& guides, const std::string& provenanceJson,
+                       const std::shared_ptr<void>& keepAlive) noexcept
+{
+    HMODULE module = nullptr;
+    bool recorded = false;
+    bool claimed = false;
+    try
+    {
+        auto& registry = GetRegistry();
+        {
+            std::lock_guard lock(registry.mutex);
+            if (registry.kind.load(std::memory_order_relaxed) != RequestKind::EarlyGuides ||
+                !registry.requested.exchange(false, std::memory_order_acq_rel))
+                return false;
+            claimed = true;
+            registry.status.queued = false;
+            registry.status.attempted = true;
+            registry.status.message = "Preparing standalone native early-guide readback.";
+        }
+        if (!device || !list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT || !keepAlive)
+            throw std::runtime_error("early guide capture requires direct list/device and retained dispatch owner");
+        CheckSameDevice(device, list);
+        if (provenanceJson.size() > MaxProvenanceBytes)
+            throw std::runtime_error("early guide capture provenance exceeds the size limit");
+        const auto provenance = Json::parse(provenanceJson);
+        if (!provenance.is_object())
+            throw std::runtime_error("early guide capture provenance must be a JSON object");
+
+        auto batch = std::make_shared<Batch>();
+        batch->guidesOnly = true;
+        batch->keepAlive = keepAlive;
+        constexpr const char* roles[] = { "early_diffuse_albedo", "early_specular_albedo", "early_normal_roughness" };
+        constexpr D3D12_RESOURCE_STATES GuideState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        std::array<ComPtr<IUnknown>, 3> identities;
+        UINT64 totalBytes = 0;
+        for (size_t i = 0; i < guides.size(); ++i)
+        {
+            const auto& texture = guides[i];
+            if (!texture.resource)
+                throw std::runtime_error("standalone early guide capture requires all three private outputs");
+            Check(texture.resource->QueryInterface(IID_PPV_ARGS(&identities[i])), "guide resource identity unavailable");
+            for (size_t previous = 0; previous < i; ++previous)
+                if (identities[i].Get() == identities[previous].Get())
+                    throw std::runtime_error("standalone early guides must have distinct canonical resource identities");
+            const auto desc = texture.resource->GetDesc();
+            const auto format = i < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            if (texture.subresource != 0 || texture.viewFormat != format || desc.Format != format ||
+                desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 ||
+                desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+                texture.state != GuideState)
+                throw std::runtime_error("standalone early guide layout/state does not match the native private-pass contract");
+            auto& entry = batch->entries[i];
+            entry = Entry { .role = roles[i], .source = texture };
+            PrepareEntry(device, entry, false, i < 2);
+            const auto& first = batch->entries.front().footprint.Footprint;
+            if (entry.footprint.Footprint.Width != first.Width || entry.footprint.Footprint.Height != first.Height)
+                throw std::runtime_error("standalone early guides must have identical active extents");
+            if (entry.bytes > MaxBytes - totalBytes)
+                throw std::runtime_error("standalone early guide readback exceeds the shared 256 MiB limit");
+            totalBytes += entry.bytes;
+        }
+        for (auto& entry : batch->entries)
+            AllocateReadback(device, entry);
+
+        batch->directory = Util::ExePath().parent_path() / "FSRRR-early-guide-captures" / Timestamp("early-guides");
+        const auto& extent = batch->entries.front().footprint.Footprint;
+        batch->metadata = { { "schema", "optiscaler.fsr_rr.early_guide_capture.v1" },
+            { "complete", false }, { "process_id", GetCurrentProcessId() },
+            { "capture", batch->directory.filename().string() }, { "readback_bytes", totalBytes },
+            { "render_extent", { extent.Width, extent.Height } },
+            { "value_transform", "none; native authored RGBA8_UNORM/RGBA16F guide output bytes" },
+            { "provenance_authority", "caller_supplied; source authenticity and frame association not verified by readback helper" },
+            { "completion_authority", "existing same-list submission observer and GPU fence, then all native files written" },
+            { "provenance", provenance }, { "companions", Json::array() } };
+        for (size_t i = 0; i < batch->entries.size(); ++i)
+        {
+            auto companion = Describe(batch->entries[i]);
+            companion["schema"] = "optiscaler.fsr_rr.early_guide.v1";
+            companion["uav_register"] = i;
+            companion["register_space"] = 0;
+            companion["value_transform"] = "none; native authored guide output bytes";
+            companion["input_provenance"] = "caller_supplied; not authenticated by readback helper";
+            batch->metadata["companions"].push_back(std::move(companion));
+        }
+
+        auto args = std::make_unique<WorkerArgs>();
+        args->batch = batch;
+        static const char moduleMarker = 0;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                reinterpret_cast<LPCWSTR>(&moduleMarker), &module))
+            throw std::runtime_error("early guide capture could not retain its worker module");
+        args->module = module;
+        // Same native-list observer as fog/RR capture. No callback/frame-order
+        // heuristic substitutes for observed submission and successful fencing.
+        args->ticket = FSRDSubmission::Retain(device, list, batch);
+        {
+            std::lock_guard lock(registry.mutex);
+            registry.pending = batch;
+            registry.ticket = args->ticket;
+            registry.status.directory = batch->directory.string();
+            registry.status.message = "Early-guide readback queued; waiting asynchronously for GPU submission/completion.";
+        }
+        for (const auto& entry : batch->entries)
+            RecordCopy(list, entry);
+        recorded = true;
+
+        const auto thread = CreateThread(nullptr, 0, WriterThread, args.get(), 0, nullptr);
+        if (!thread)
+            throw std::runtime_error("early guide capture could not start its background writer");
+        args.release();
+        module = nullptr;
+        CloseHandle(thread);
+        return true;
+    }
+    catch (...)
+    {
+        if (module) FreeLibrary(module);
+        // No exception escapes the original scene hook, including logging/status
+        // allocation failure. Retention already owns any partially recorded work.
+        if (claimed)
+            try
+            {
+                std::string reason = "unknown failure";
+                try { throw; }
+                catch (const std::exception& error) { reason = error.what(); }
+                catch (...) {}
+                FinishStatus(false, std::format("Early guide capture failed: {}{}", reason,
+                             recorded ? "; readback recorded, GPU storage retained" : "; no completed readback batch"), false);
+            }
+            catch (...) {}
         return recorded;
     }
 }
