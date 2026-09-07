@@ -225,6 +225,14 @@ int main()
     current["inputs"][0]["texture_registry"]["ref_status"]=8;
     current["inputs"][0]["texture_registry"]["ref_status_after"]=8;
     assert(ProducerMatches(producer,current,list,17));
+    current["inputs"][0]["texture_registry"]["ref_status_after"]=7;
+    assert(ProducerMatches(producer,current,list,17));
+    current["inputs"][0]["texture_registry"]["ref_status_after"]=9;
+    assert(ProducerMatches(producer,current,list,17));
+    for(int32_t count:{0,-1,INT32_MIN}) {
+        current["inputs"][0]["texture_registry"]["ref_status_after"]=count;
+        assert(!ProducerMatches(producer,current,list,17));
+    }
 }
 '''
         with tempfile.TemporaryDirectory(prefix="fsrd-guide-admission-") as name:

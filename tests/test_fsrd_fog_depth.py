@@ -46,6 +46,9 @@ struct Host {
    if(selected==3)Put<uint64_t>(Cache+0x70,1);
    if(selected==4)Put<uint64_t>(Cache+0x70,1ull<<63);
    if(selected==5)Put<uintptr_t>(Slot+0x68,Native+1);
+   if(selected==6)Put<int32_t>(Slot-8,1);
+   if(selected==7)Put<int32_t>(Slot-8,0);
+   if(selected==8)Put<int32_t>(Slot-8,-1);
   }return true;
  }
 };
@@ -66,8 +69,8 @@ Host Setup(){
  h.Put<uint64_t>(Cache+0x70,0);h.Put<uint64_t>(Cache+0x78,0);
  h.Put<uintptr_t>(Array,Descriptor);return h;
 }
-bool Observe(Host& h,D::Snapshot& out,D::Failure* failure=nullptr){
- return D::Observe(h,Image,Image+D::DrawReturnRva,Scope(),1,out,failure);
+bool Observe(Host& h,D::Snapshot& out,D::Failure* failure=nullptr,D::ChangedSnapshots* changed=nullptr){
+ return D::Observe(h,Image,Image+D::DrawReturnRva,Scope(),1,out,failure,changed);
 }
 int main(){
  static_assert(std::is_trivially_copyable_v<D::Snapshot>);
@@ -118,7 +121,36 @@ int main(){
  reject([](Host& t){t.Put<uintptr_t>(Array,0);},D::Failure::BindingRange);
  reject([](Host& t){t.Put<uintptr_t>(Array,Descriptor+1);},D::Failure::DescriptorMismatch);
  reject([](Host& t){t.throwing=Array;},D::Failure::ReadException);
- reject([](Host& t){t.mutate=1;},D::Failure::Changed);
+ // Positive count changes preserve identity and retain both actual sample values.
+ for(unsigned mutation:{1u,6u}) {
+  auto t=Setup();if(mutation==6)t.Put<int32_t>(Slot-8,2);t.mutate=mutation;
+  D::ChangedSnapshots changed;D::Snapshot got;
+  assert(Observe(t,got,&why,&changed)&&why==D::Failure::None&&changed.available);
+  assert(changed.first.refs==(mutation==1?1:2)&&changed.second.refs==(mutation==1?2:1));
+  assert(got==changed.second&&D::SameBindingIdentity(changed.first,changed.second));
+  const auto preservedFirst=changed.first,preservedSecond=changed.second;
+  assert(D::SameBindingIdentity(changed.first,changed.second));
+  assert(changed.first==preservedFirst&&changed.second==preservedSecond);
+  t=Setup();t.mutate=7;
+  assert(!Observe(t,got,&why,&changed)&&why==D::Failure::TextureSource&&got==empty&&!changed.available);
+  t=Setup();t.mutate=8;assert(!Observe(t,got,&why,&changed)&&!changed.available&&got==empty);
+ }
+ // Only the numeric positive count is excluded. No identity/format/range field is.
+ h=Setup();assert(Observe(h,out));
+ auto changedIdentity=[&](auto alter){auto b=out;alter(b);assert(!D::SameBindingIdentity(out,b));};
+ #define DIFFER(field) changedIdentity([](auto& s){++s.field;})
+ DIFFER(image);DIFFER(registry);DIFFER(slot);DIFFER(native);DIFFER(descriptor);DIFFER(alternateDescriptor);
+ DIFFER(residencyUnderlying);DIFFER(cache);DIFFER(layout);DIFFER(descriptorArray);DIFFER(mapAddress);
+ DIFFER(handle);DIFFER(requestedSrvState);DIFFER(descriptorIndex);DIFFER(rangeIndex);DIFFER(rootParameter);
+ DIFFER(width);DIFFER(height);DIFFER(srvFormat);DIFFER(srvDimension);DIFFER(planeSlice);DIFFER(mostDetailedMip);
+ DIFFER(srvMipLevels);DIFFER(componentMapping);DIFFER(scope.serial);DIFFER(scope.recordingGeneration);
+ DIFFER(scope.graphContext);DIFFER(scope.view);DIFFER(scope.tls);DIFFER(scope.engine);DIFFER(scope.list);DIFFER(scope.pso);
+ #undef DIFFER
+ for(size_t i=0;i<out.compact.size();++i)changedIdentity([&](auto& s){s.compact[i]^=1;});
+ for(size_t i=0;i<out.range.size();++i)changedIdentity([&](auto& s){s.range[i]^=1;});
+ for(int32_t count:{0,-1,INT32_MIN}) {
+  auto bad=out;bad.refs=count;assert(!D::SameBindingIdentity(bad,out)&&!D::SameBindingIdentity(out,bad));
+ }
  reject([](Host& t){t.mutate=2;},D::Failure::CurrentScope);
  reject([](Host& t){t.mutate=3;},D::Failure::BindingRange);
  reject([](Host& t){t.mutate=5;},D::Failure::Changed);

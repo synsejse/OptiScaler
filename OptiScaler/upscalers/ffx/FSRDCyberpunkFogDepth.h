@@ -47,6 +47,20 @@ struct Snapshot
              srvMipLevels = 0, componentMapping = 0;
     bool operator==(const Snapshot&) const = default;
 };
+struct ChangedSnapshots
+{
+    Snapshot first {}, second {};
+    bool available = false;
+};
+// Native handle retains/releases change this count without changing the binding.
+// Both samples must remain positive. All other fields are still compared exactly;
+// neither this comparison nor the counts establish ownership or GPU readiness.
+inline bool SameBindingIdentity(Snapshot first, Snapshot second) noexcept
+{
+    if (first.refs <= 0 || second.refs <= 0) return false;
+    first.refs = second.refs = 0;
+    return first == second;
+}
 enum class Failure : uint8_t
 {
     None, Caller, CurrentScope, TextureSource, UnsupportedView, BindingRange, DescriptorMismatch, Changed, ReadException
@@ -150,9 +164,10 @@ bool Current(Host& host, uintptr_t image, const Scope& scope, uint32_t handle, S
 // In particular requestedSrvState=e0 is not an observed current native state.
 template<class Host>
 bool Observe(Host& host, uintptr_t image, uintptr_t caller, const Scope& scope, uint32_t handle,
-             Snapshot& output, Failure* reason = nullptr) noexcept
+             Snapshot& output, Failure* reason = nullptr, ChangedSnapshots* changed = nullptr) noexcept
 {
     output = {};
+    if (changed) *changed = {};
     Failure failure = Failure::Caller;
     bool success = false;
     try
@@ -167,7 +182,9 @@ bool Observe(Host& host, uintptr_t image, uintptr_t caller, const Scope& scope, 
                 Detail::Current(host, image, scope, handle, second, failure))
             {
                 failure = Failure::Changed;
-                if (first == second) { output = first; failure = Failure::None; success = true; }
+                if (first != second && changed) *changed = { first, second, true };
+                if (SameBindingIdentity(first, second))
+                { output = second; failure = Failure::None; success = true; }
             }
         }
     }

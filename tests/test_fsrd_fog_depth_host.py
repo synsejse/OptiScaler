@@ -37,6 +37,79 @@ def compiled(test, harness):
 
 
 class FogDepthHost(unittest.TestCase):
+    def test_selection_identity_preserves_non_count_evidence_and_input_json(self):
+        harness = '#include <cassert>\n#include <cstdint>\n#include <json.hpp>\nusing Json=nlohmann::json;\n'
+        harness += function('SameFogDepthSelection')
+        harness += r'''
+int main(){
+ const Json source={{"handle",12},{"view",13},{"logical_interval",{{"position",14}}},
+  {"texture_registry",{{"status","borrowed_address_observed"},{"ref_status",2},{"ref_status_after",1},
+   {"borrowed_native_address",15},{"descriptor_sources",{{"ordinary_cpu_srv_handle",16},{"requested_srv_state_mask",224}}}}}};
+ for(int first:{1,2,3,INT32_MAX})for(int after:{1,2,3,INT32_MAX}) {
+  auto other=source;other["texture_registry"]["ref_status"]=first;other["texture_registry"]["ref_status_after"]=after;
+  const auto copy=other;assert(SameFogDepthSelection(source,other)&&SameFogDepthSelection(other,source));
+  assert(other==copy&&source["texture_registry"]["ref_status"]==2);
+ }
+ for(const char* key:{"ref_status","ref_status_after"}) {
+  for(const Json& bad: {Json(0),Json(-1),Json(INT32_MIN),Json(uint64_t(INT32_MAX)+1),Json(UINT64_MAX),
+                       Json(1.0),Json(true),Json("1"),Json(nullptr)}) {
+   auto other=source;other["texture_registry"][key]=bad;
+   assert(!SameFogDepthSelection(source,other)&&!SameFogDepthSelection(other,source));
+  }
+  auto missing=source;missing["texture_registry"].erase(key);assert(!SameFogDepthSelection(source,missing));
+ }
+ for(const char* path:{"/handle","/view","/logical_interval/position","/texture_registry/borrowed_native_address",
+                      "/texture_registry/descriptor_sources/ordinary_cpu_srv_handle",
+                      "/texture_registry/descriptor_sources/requested_srv_state_mask"}) {
+  auto other=source;other[Json::json_pointer(path)]=1234;assert(!SameFogDepthSelection(source,other));
+ }
+ auto unavailable=source;unavailable["texture_registry"]["status"]="unavailable";
+ assert(!SameFogDepthSelection(unavailable,unavailable));
+ auto added=source;added["unknown_field"]=0;assert(!SameFogDepthSelection(source,added));
+ assert(!SameFogDepthSelection(Json(),Json()));
+}
+'''
+        compiled(self, harness)
+
+    def test_snapshot_differences_and_first_refusal_logging_are_observational(self):
+        harness = r'''
+#include <cassert>
+#include <stdexcept>
+#include <string>
+#include <json.hpp>
+#include "FSRDCyberpunkFogDepth.h"
+using Json=nlohmann::json;
+struct CapturePlan {uint32_t depthFrame=123;Json provenance;};
+std::string detail;unsigned calls=0;bool throwLog=false;
+void LogWarning(const char*,uint32_t frame,const std::string& value) {
+ assert(frame==123);if(throwLog)throw std::runtime_error("log");++calls;detail=value;
+}
+#define LOG_WARN(...) LogWarning(__VA_ARGS__)
+'''
+        harness += function('DescribeChangedFogDepth') + '\n' + function('ReportFogDepthRefusal')
+        harness += r'''
+int main(){
+ FSRD::CyberpunkFogDepth::ChangedSnapshots changed;
+ changed.available=true;changed.first.refs=2;changed.second.refs=1;
+ auto report=DescribeChangedFogDepth(changed);
+ assert(report["first_refs"]==2&&report["second_refs"]==1&&report["same_binding_identity"]==true);
+ assert(report["changes"].size()==1&&report["changes"][0]["path"]=="/refs");
+ changed.second.native=987;report=DescribeChangedFogDepth(changed);
+ assert(report["same_binding_identity"]==false&&report["changes"].size()==2);
+ bool native=false;for(const auto& item:report["changes"])native|=item["path"]=="/native";
+ assert(native&&changed.first.refs==2&&changed.second.refs==1);
+ CapturePlan plan;plan.provenance["hardware_depth"]={{"status","refused"},{"reason","original failure"}};
+ const auto before=plan.provenance;ReportFogDepthRefusal(plan);
+ assert(calls==1&&Json::parse(detail)==before["hardware_depth"]&&plan.provenance==before);
+ throwLog=true;ReportFogDepthRefusal(plan);assert(calls==1&&plan.provenance==before);
+ plan.provenance=Json();ReportFogDepthRefusal(plan);assert(calls==1);
+}
+'''
+        compiled(self, harness)
+        record = function('RecordPrivateReset')
+        self.assertLess(record.index('ReportFogDepthRefusal(plan)'),
+                        record.index('throw std::runtime_error("private RESET requires successful native Fog hardware-depth copy")'))
+
     def test_original_scope_and_pre_detour_authentication(self):
         helper = function('HookFullscreenHelper')
         self.assertEqual(helper.count('originalFullscreenHelper(renderer, shader, flag);'), 1)
@@ -206,7 +279,7 @@ namespace FSRD::CyberpunkFogDenoiseAccess {
 struct Input{uintptr_t image=0,list=0,originalPso=0;uint64_t originalFogScope=0;
  CyberpunkEngineAccess::TextureBorrow depth;bool copySource=false;};
 enum class Outcome{Refused,PrivateFailedRestored,PrivateRecordedRestored,ScopeLostAfterMutation};
-struct Result{Outcome outcome=Outcome::Refused;unsigned requestsIssued=0;bool bindingsRestored=false;};
+struct Result{Outcome outcome=Outcome::Refused;unsigned requestsIssued=0;bool bindingsRestored=false,callbackEntered=false;};
 unsigned mode=0,calls=0;
 template<class H,class F>Result RecordPrivateCompute(H&,const Input& in,F&& fn){
  ++calls;assert(in.image==0x140000000&&in.originalPso==0x6000&&in.originalFogScope==11);

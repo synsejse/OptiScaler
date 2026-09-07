@@ -101,7 +101,7 @@ class EarlyGuides(unittest.TestCase):
                          "TextureSlotStride = 0xb0", "TextureRefOffset = 0x2f1d0",
                          "TextureNativeOffset = 0x2f1d8", "handle > TextureSlotCount", "refs <= 0",
                          '"native_address_dereferenced", false', '"lifetime", "not_established"',
-                         '"resource_state", "not_observed"', "refs != refsAfter"):
+                         '"resource_state", "not_observed"', "refsAfter <= 0"):
             self.assertIn(evidence, SOURCE)
         for forbidden in ("AddRef(", "Release(", "GetDesc(", "reinterpret_cast<decltype"):
             self.assertNotIn(forbidden, SOURCE)
@@ -720,6 +720,15 @@ int main()
     assert(result["inputs"][0]["texture_registry"]["reason"] == "native resource address unavailable");
     setup(); mutateAfterRead = refAddress; result = describe();
     assert(result["inputs"][0]["texture_registry"]["reason"] == "texture registry changed during metadata reads");
+    // The XOR memory hook exercises 2->3 and 3->2 without changing the native address.
+    for (int32_t status : {2,3})
+    {
+        setup(); put<int32_t>(refAddress,status); mutateAfterRead=refAddress; result=describe();
+        const auto& mapping=result["inputs"][0]["texture_registry"];
+        assert(mapping["status"]=="borrowed_address_observed");
+        assert(mapping["ref_status"]==status&&mapping["ref_status_after"]==(status^1));
+        assert(mapping["native_address_dereferenced"]==false&&mapping["lifetime"]=="not_established");
+    }
     setup(); mutateAfterRead = nativeAddress; result = describe();
     assert(result["inputs"][0]["texture_registry"]["status"] == "unavailable");
     setup(); mutateAfterRead = image + TextureRegistryRva; result = describe();

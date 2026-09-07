@@ -127,7 +127,9 @@ Json RegistryMapping(Reader& read, uintptr_t image, uint32_t handle)
         auto descriptors = DescriptorSources(read, nativeAddress);
         const auto refsAfter = read.Read<int32_t>(refsAddress);
         result["ref_status_after"] = refsAfter;
-        if (refs != refsAfter || native != read.Read<uintptr_t>(nativeAddress) ||
+        // Numeric positive counts are not identity: the native engine can retain
+        // or release this same handle while its original draw is being prepared.
+        if (refsAfter <= 0 || native != read.Read<uintptr_t>(nativeAddress) ||
             registry != read.Read<uintptr_t>(Address(image, TextureRegistryRva)))
             throw std::runtime_error("texture registry changed during metadata reads");
         result["borrowed_native_address"] = native;

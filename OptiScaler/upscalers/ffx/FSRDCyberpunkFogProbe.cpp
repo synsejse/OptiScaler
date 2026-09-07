@@ -1552,7 +1552,7 @@ const Json& EarlyInput(const Json& metadata, size_t index)
         !interval.at("inclusive_contains_position").get<bool>() || interval.at("end_event_relation") != "before" ||
         interval.at("graph_phase").get<unsigned>() != 2 || interval.at("record_used_flag").get<unsigned>() != 1 ||
         interval.at("record_handle") != input.at("handle") || registry.at("status") != "borrowed_address_observed" ||
-        registry.at("ref_status").get<int32_t>() <= 0 || registry.at("ref_status") != registry.at("ref_status_after"))
+        registry.at("ref_status").get<int32_t>() <= 0 || registry.at("ref_status_after").get<int32_t>() <= 0)
         throw std::runtime_error("current guide handle/reservation/registry evidence incomplete");
     const auto position = interval.at("current_position").get<uint64_t>();
     if (interval.at("holder_first_use").get<uint64_t>() > position ||
@@ -3979,6 +3979,12 @@ void RefuseCapture(const char* reason)
         LOG_WARN("[FSRRR fog capture] pending request not captured: {}", reason);
 }
 
+void ReportFogDepthRefusal(const CapturePlan& plan) noexcept
+{
+    try { LOG_WARN("[FSRRR fog depth] frame={} refused: {}", plan.depthFrame,
+                   plan.provenance.at("hardware_depth").dump()); } catch (...) {}
+}
+
 void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
                  D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
 {
@@ -4271,6 +4277,49 @@ void RecordRgbIdentity(ID3D12GraphicsCommandList* list, CapturePlan& plan)
     }
 }
 
+bool SameFogDepthSelection(const Json& original, const Json& repeated) noexcept
+{
+    try
+    {
+        auto first = original, second = repeated;
+        for (auto* source : { &first, &second })
+        {
+            auto& registry = source->at("texture_registry");
+            if (registry.at("status") != "borrowed_address_observed") return false;
+            for (const char* key : { "ref_status", "ref_status_after" })
+            {
+                auto& count = registry.at(key);
+                if (!count.is_number_integer() || count <= 0 || count > INT32_MAX) return false;
+                count = 0; // Comparison copies only; original evidence remains untouched.
+            }
+        }
+        return first == second; // Every graph, resource, descriptor and state field remains exact.
+    }
+    catch (...) { return false; }
+}
+
+Json DescribeChangedFogDepth(const FSRD::CyberpunkFogDepth::ChangedSnapshots& changed)
+{
+    const auto describe = [](const FSRD::CyberpunkFogDepth::Snapshot& s) {
+        return Json {
+            { "scope", { s.scope.serial, s.scope.recordingGeneration, s.scope.graphContext, s.scope.view,
+                           s.scope.tls, s.scope.engine, s.scope.list, s.scope.pso } },
+            { "image", s.image }, { "registry", s.registry }, { "slot", s.slot }, { "native", s.native },
+            { "descriptor", s.descriptor }, { "alternate_descriptor", s.alternateDescriptor },
+            { "residency_underlying", s.residencyUnderlying }, { "cache", s.cache }, { "layout", s.layout },
+            { "descriptor_array", s.descriptorArray }, { "map_address", s.mapAddress }, { "handle", s.handle },
+            { "requested_srv_state", s.requestedSrvState }, { "descriptor_index", s.descriptorIndex },
+            { "refs", s.refs }, { "compact", s.compact }, { "range", s.range }, { "range_index", s.rangeIndex },
+            { "root_parameter", s.rootParameter }, { "width", s.width }, { "height", s.height },
+            { "srv_format", s.srvFormat }, { "srv_dimension", s.srvDimension }, { "plane_slice", s.planeSlice },
+            { "most_detailed_mip", s.mostDetailedMip }, { "srv_mip_levels", s.srvMipLevels },
+            { "component_mapping", s.componentMapping } };
+    };
+    return { { "first_refs", changed.first.refs }, { "second_refs", changed.second.refs },
+        { "same_binding_identity", FSRD::CyberpunkFogDepth::SameBindingIdentity(changed.first, changed.second) },
+        { "changes", Json::diff(describe(changed.first), describe(changed.second)) } };
+}
+
 void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
 {
     auto& evidence = plan.provenance["hardware_depth"];
@@ -4308,9 +4357,15 @@ void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
             throw std::runtime_error("current Fog TLS unavailable");
         ExposureMemory memory;
         FSRD::CyberpunkFogDepth::Failure failure;
-        if (!FSRD::CyberpunkFogDepth::Observe(memory, authenticatedImage.load(), caller, current, scope->depthHandle,
-                                             plan.depthSnapshot, &failure))
+        FSRD::CyberpunkFogDepth::ChangedSnapshots changed;
+        const bool observed = FSRD::CyberpunkFogDepth::Observe(memory, authenticatedImage.load(), caller, current,
+                                                             scope->depthHandle, plan.depthSnapshot, &failure, &changed);
+        if (changed.available) evidence["binding_snapshot_changes"] = DescribeChangedFogDepth(changed);
+        if (!observed)
             throw std::runtime_error(std::string(FSRD::CyberpunkFogDepth::FailureName(failure)));
+        if (changed.available)
+            LOG_INFO("[FSRRR fog depth] same binding identity frame={}; positive refs changed {}->{}; not ownership proof",
+                     plan.depthFrame, changed.first.refs, changed.second.refs);
         const auto& d = plan.depthSnapshot;
         if (d.native != selected.at("texture_registry").at("borrowed_native_address").get<uintptr_t>() ||
             d.native == uintptr_t(plan.main.Get())) throw std::runtime_error("Fog depth resource/scene alias refused");
@@ -4355,9 +4410,18 @@ void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
         }
         if (!plan.depthSource.heap) throw std::runtime_error("current depth CPU heap not retained");
         const auto repeated = Json::parse(FSRDCyberpunkEarlyGuides::Describe(scope->context, authenticatedImage.load()));
-        if (repeated.at("inputs").at(5) != selected || repeated.at("camera_provenance") != plan.depthMetadata.at("camera_provenance") ||
-            repeated.at("view") != plan.depthMetadata.at("view") || !SameFogDepthSource(plan))
+        const bool selectedSame = SameFogDepthSelection(selected, repeated.at("inputs").at(5));
+        const bool cameraSame = repeated.at("camera_provenance") == plan.depthMetadata.at("camera_provenance");
+        const bool viewSame = repeated.at("view") == plan.depthMetadata.at("view");
+        const bool sourceSame = SameFogDepthSource(plan);
+        if (!selectedSame || !cameraSame || !viewSame || !sourceSame)
+        {
+            evidence["repeated_observation"] = { { "selection_same", selectedSame }, { "camera_same", cameraSame },
+                { "view_same", viewSame }, { "original_use_source_same", sourceSame },
+                { "selection_changes", Json::diff(selected, repeated.at("inputs").at(5)) },
+                { "camera_changes", Json::diff(plan.depthMetadata.at("camera_provenance"), repeated.at("camera_provenance")) } };
             throw std::runtime_error("current Fog graph/camera/depth changed during preparation");
+        }
         auto output = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_FLOAT, desc.Width, desc.Height, 1, 1);
         if (!FSRD::CyberpunkFogDepthCopy::AdmitDestination(output, dimensions[0], dimensions[1]))
             throw std::runtime_error("private native Fog depth destination descriptor refused");
@@ -4420,6 +4484,8 @@ void RecordFogDepth(ID3D12GraphicsCommandList* list, CapturePlan& plan)
     }
     auto& evidence = plan.provenance["hardware_depth"];
     evidence["state_requests"] = result.requestsIssued;
+    evidence["callback_entered"] = result.callbackEntered;
+    evidence["native_access_outcome"] = unsigned(result.outcome);
     evidence["bindings_restored"] = result.bindingsRestored;
     if (result.outcome == FSRD::CyberpunkFogDenoiseAccess::Outcome::PrivateRecordedRestored)
     {
@@ -4516,7 +4582,13 @@ void RecordPrivateReset(ID3D12GraphicsCommandList* list, CapturePlan& plan)
         ~RefuseIncomplete() { if (!complete) FailPacket(packet); }
     } attempted { packet };
     if (!plan.depthPrepared || !plan.layers.hardwareDepth.resource)
+    {
+        // This plan is abandoned before its diagnostic disk capture. Preserve
+        // the FIRST depth refusal instead of losing it behind a generic error
+        // and a later producer's already-failed packet message.
+        ReportFogDepthRefusal(plan);
         throw std::runtime_error("private RESET requires successful native Fog hardware-depth copy");
+    }
     ClaimPrivateReset(*packet, plan.depthMetadata, plan.device.Get(), packet->fogClaimed);
     const auto source = packet->temporal ? ResetSource::ParseTemporal(plan.depthMetadata, packet->delta).current :
         ResetSource::Parse(plan.depthMetadata, packet->delta);
