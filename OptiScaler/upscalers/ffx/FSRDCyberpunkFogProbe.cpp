@@ -2,6 +2,9 @@
 #include "FSRDCyberpunkFogProbe.h"
 #include "FSRDFogLayerCapture.h"
 #include "FSRDCyberpunkEarlyGuides.h"
+#include "FSRDCyberpunkEngineAccess.h"
+#include "FSRDCyberpunkGuideMatrix.h"
+#include "FSRDCyberpunkGuidePass.h"
 
 #include <Util.h>
 #include <resource_tracking/FSRDSubmission.h>
@@ -24,6 +27,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <intrin.h>
 
 namespace FSRDCyberpunkFogProbe
 {
@@ -56,6 +60,18 @@ constexpr unsigned MaxRearms = 2;
 constexpr SIZE_T FogVertexBytes = 2361;
 constexpr std::string_view FogVertexSha256 = "174ce05e0a97ce65f80358b2a01bbadea4c314fb386cfac6064940a870f91a5a";
 constexpr size_t MaxRtvHeaps = 512, MaxRtvSlots = 65536, MaxCommandLists = 2048;
+constexpr size_t MaxCpuSrvHeaps = 128;
+constexpr UINT64 MaxCpuSrvSlots = 262144, MaxCpuSrvBytes = 16ull * 1024 * 1024;
+constexpr SIZE_T GuideShaderBytes = 5824;
+constexpr std::string_view GuideShaderSha256 = "a4bcbce1667fb6f3e130a18482e6088e2835d0028582a52e5a4668f7fae1b7ee";
+constexpr uintptr_t GBufferInitializerRva = 0x771000;
+constexpr FSRD::CyberpunkEngineAccess::CodeRange ProducerCode[] = {
+    { 0x771000, 0xb0, "a6a7d1a616bd2cf6d15c57564c45a0f791d2e5d255a2a4c901269ddc44ca65fb" },
+    { 0x20ded8, 0xf5, "b1f86fee3715f5f65209c0f4a0bc51d0b2c57388047c81e483f65e2241008753" },
+    { 0x7710b0, 0x8c, "c9b8d869757aa20666bc96fac0477f0b55c5aa3a1e7dcb85920f340e35f7ddb2" },
+    { 0x7711c8, 0x41, "db8138c090761f534aadb90b66535164c94addc01561e614602626b9acbed32b" },
+    { 0x1fa1f8, 0x3c, "718d57eb7d9b01daf4c57690874faffc238620e8a978e5840263508097098666" }
+};
 constexpr unsigned MaxListEvictionLogs = 8;
 constexpr UINT64 MaxCaptureTextureBytes = 256ull * 1024 * 1024;
 constexpr unsigned MaxNgxEndpoints = 8;
@@ -175,6 +191,27 @@ struct BoundRtv
     bool known = false;
     bool documentedDefault = false;
 };
+struct CpuSrvHeap
+{
+    ComPtr<ID3D12DescriptorHeap> heap;
+    SIZE_T start = 0;
+    UINT increment = 0, count = 0;
+    uint64_t generation = 0;
+};
+struct EarlyProducer
+{
+    Json metadata;
+    std::array<FSRD::CyberpunkEngineAccess::TextureBorrow, 4> textures {};
+    std::array<SIZE_T, 4> clearDescriptors {};
+    std::array<ComPtr<ID3D12Resource>, 4> resources;
+    ComPtr<IUnknown> list;
+    uintptr_t nativeList = 0;
+    uint64_t generation = 0;
+    unsigned clearMask = 0, clearCount = 0;
+    UINT64 resourceBytes = 0;
+    std::string failure;
+    bool valid = true;
+};
 struct Query
 {
     ID3D12QueryHeap* heap;
@@ -229,6 +266,10 @@ struct Registry
     CryptoApi crypto;
     std::vector<TaggedPso> tagged;
     std::vector<RtvHeap> heaps;
+    std::vector<CpuSrvHeap> cpuSrvHeaps;
+    UINT64 cpuSrvSlots = 0, cpuSrvBytes = 0;
+    std::vector<std::byte> guideShader;
+    std::shared_ptr<EarlyProducer> earlyProducer;
     std::unordered_map<IUnknown*, ListState> lists;
     std::shared_ptr<EndpointTrace> endpoint;
     std::shared_ptr<EndpointTrace> submissionTrace;
@@ -251,6 +292,10 @@ std::atomic<bool> active { false };
 std::atomic<bool> captureEnabled { false }, captureTrackingValid { true };
 std::atomic<unsigned> captureRefusalLogs { 0 };
 std::atomic<bool> captureStarted { false };
+std::atomic<uintptr_t> authenticatedImage { 0 };
+std::atomic<bool> earlyRequested { false }, earlyAttempted { false }, earlyHeapTrackingValid { true };
+std::atomic<bool> earlyFatalRecording { false };
+std::atomic<ULONGLONG> earlyRequestedAt { 0 };
 std::atomic<bool> endpointActive { false };
 std::atomic<bool> submissionActive { false };
 std::atomic<uint64_t> submissionSerial { 0 };
@@ -261,17 +306,21 @@ std::mutex hookMutex;
 
 using FogNode = void(__fastcall*)(void* node, void* context);
 FogNode originalFogNode = nullptr;
+using GBufferInitializer = void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
+GBufferInitializer originalGBufferInitializer = nullptr;
 using SetPso = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetPipelineState)>::type;
 using SetRtv = rewrite_signature<decltype(&ID3D12GraphicsCommandList::OMSetRenderTargets)>::type;
 using Draw = rewrite_signature<decltype(&ID3D12GraphicsCommandList::DrawInstanced)>::type;
 using DrawIndexed = rewrite_signature<decltype(&ID3D12GraphicsCommandList::DrawIndexedInstanced)>::type;
 using CreateGraphics = rewrite_signature<decltype(&ID3D12Device::CreateGraphicsPipelineState)>::type;
+using CreateCompute = rewrite_signature<decltype(&ID3D12Device::CreateComputePipelineState)>::type;
 using CreateStream = rewrite_signature<decltype(&ID3D12Device2::CreatePipelineState)>::type;
 SetPso originalSetPso = nullptr;
 SetRtv originalSetRtv = nullptr;
 Draw originalDraw = nullptr;
 DrawIndexed originalDrawIndexed = nullptr;
 CreateGraphics originalCreateGraphics = nullptr;
+CreateCompute originalCreateCompute = nullptr;
 CreateStream originalCreateStream = nullptr;
 using CreateHeap = rewrite_signature<decltype(&ID3D12Device::CreateDescriptorHeap)>::type;
 using CreateRtv = rewrite_signature<decltype(&ID3D12Device::CreateRenderTargetView)>::type;
@@ -288,6 +337,8 @@ using SetViewports = rewrite_signature<decltype(&ID3D12GraphicsCommandList::RSSe
 using SetScissors = rewrite_signature<decltype(&ID3D12GraphicsCommandList::RSSetScissorRects)>::type;
 using BeginRenderPass = rewrite_signature<decltype(&ID3D12GraphicsCommandList4::BeginRenderPass)>::type;
 using EndRenderPass = rewrite_signature<decltype(&ID3D12GraphicsCommandList4::EndRenderPass)>::type;
+using ClearRtv = rewrite_signature<decltype(&ID3D12GraphicsCommandList::ClearRenderTargetView)>::type;
+using ClearDsv = rewrite_signature<decltype(&ID3D12GraphicsCommandList::ClearDepthStencilView)>::type;
 CreateHeap originalCreateHeap = nullptr;
 CreateRtv originalCreateRtv = nullptr;
 CreateList originalCreateList = nullptr;
@@ -303,6 +354,8 @@ SetViewports originalSetViewports = nullptr;
 SetScissors originalSetScissors = nullptr;
 BeginRenderPass originalBeginRenderPass = nullptr;
 EndRenderPass originalEndRenderPass = nullptr;
+ClearRtv originalClearRtv = nullptr;
+ClearDsv originalClearDsv = nullptr;
 
 struct Scope
 {
@@ -323,6 +376,49 @@ struct Scope
 };
 thread_local Scope* scope = nullptr;
 thread_local bool inMetadata = false;
+thread_local EarlyProducer* producerScope = nullptr;
+
+bool ReadExactMemory(uintptr_t address, void* destination, size_t bytes) noexcept
+{
+    if (!address || !bytes || bytes > 65536 || bytes - 1 > UINTPTR_MAX - address)
+        return false;
+    SIZE_T actual = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), destination,
+                             bytes, &actual) && actual == bytes;
+}
+template <typename T> bool ReadEarly(uintptr_t address, T& result) noexcept
+{
+    return ReadExactMemory(address, &result, sizeof(result));
+}
+bool MatchLiveCode(uintptr_t image, const FSRD::CyberpunkEngineAccess::CodeRange& code) noexcept
+{
+    try
+    {
+        if (!image || image > UINTPTR_MAX - FSRD::CyberpunkEngineAccess::ImageBytes || !code.bytes ||
+            code.bytes > 65536 || code.rva > FSRD::CyberpunkEngineAccess::ImageBytes - code.bytes)
+            return false;
+        const auto begin = image + code.rva, end = begin + code.bytes;
+        for (auto cursor = begin; cursor < end;)
+        {
+            MEMORY_BASIC_INFORMATION memory {};
+            if (!VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) ||
+                memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE ||
+                memory.AllocationBase != reinterpret_cast<void*>(image) || (memory.Protect & PAGE_GUARD) ||
+                !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                return false;
+            const auto region = uintptr_t(memory.BaseAddress);
+            if (memory.RegionSize > UINTPTR_MAX - region || region + memory.RegionSize <= cursor)
+                return false;
+            cursor = std::min(end, region + memory.RegionSize);
+        }
+        std::vector<BYTE> bytes(code.bytes);
+        if (!ReadExactMemory(begin, bytes.data(), bytes.size())) return false;
+        Hash hash(Data().crypto);
+        hash.Add(bytes.data(), ULONG(bytes.size()));
+        return hash.Finish() == code.sha256;
+    }
+    catch (...) { return false; }
+}
 
 // Diagnostics must never throw through a game/D3D entry point or suppress its call.
 template <typename Fn> void Metadata(Fn&& fn) noexcept
@@ -381,6 +477,42 @@ HRESULT WINAPI HookCreateHeap(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_
                                REFIID iid, void** result)
 {
     const HRESULT hr = originalCreateHeap(device, desc, iid, result);
+    if (SUCCEEDED(hr) && desc && result && *result && captureEnabled.load() && !inMetadata &&
+        earlyHeapTrackingValid.load() && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        desc->Flags == D3D12_DESCRIPTOR_HEAP_FLAG_NONE)
+        Metadata([&] {
+            try
+            {
+                ComPtr<ID3D12DescriptorHeap> heap;
+                if (FAILED(static_cast<IUnknown*>(*result)->QueryInterface(IID_PPV_ARGS(&heap))))
+                    throw std::runtime_error("CPU SRV heap identity unavailable");
+                const UINT increment = device->GetDescriptorHandleIncrementSize(desc->Type);
+                const auto start = heap->GetCPUDescriptorHandleForHeapStart().ptr;
+                const UINT64 bytes = UINT64(desc->NumDescriptors) * increment;
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                if (std::any_of(data.cpuSrvHeaps.begin(), data.cpuSrvHeaps.end(),
+                                [&](const auto& known) { return known.heap.Get() == heap.Get(); }))
+                    return;
+                if (!start || !increment || !desc->NumDescriptors || bytes > UINTPTR_MAX - start ||
+                    data.cpuSrvHeaps.size() >= MaxCpuSrvHeaps ||
+                    desc->NumDescriptors > MaxCpuSrvSlots - data.cpuSrvSlots || bytes > MaxCpuSrvBytes - data.cpuSrvBytes)
+                    throw std::runtime_error(std::format(
+                        "CPU SRV range budget exhausted: heaps={}/{} slots={}/{} bytes={}/{} requested_slots={} requested_bytes={}",
+                        data.cpuSrvHeaps.size(), MaxCpuSrvHeaps, data.cpuSrvSlots, MaxCpuSrvSlots,
+                        data.cpuSrvBytes, MaxCpuSrvBytes, desc->NumDescriptors, bytes));
+                data.cpuSrvHeaps.push_back({ heap, start, increment, desc->NumDescriptors, ++data.nextHeap });
+                data.cpuSrvSlots += desc->NumDescriptors;
+                data.cpuSrvBytes += bytes;
+            }
+            catch (const std::exception& error)
+            {
+                // Failure disables only the optional early-guide experiment.
+                earlyHeapTrackingValid.store(false);
+                LOG_WARN("[FSRRR private guides] CPU descriptor range tracking disabled: {}", error.what());
+            }
+            catch (...) { earlyHeapTrackingValid.store(false); }
+        });
     if (SUCCEEDED(hr) && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && result && *result)
         Track([&] {
             ComPtr<ID3D12DescriptorHeap> heap;
@@ -869,7 +1001,18 @@ void PollRearm() noexcept
                 FSRDFogLayerCapture::Request())
             {
                 if (DeleteFileW(captureRequest.c_str()))
+                {
+                    const auto earlyRequest = Util::ExePath().parent_path() / L"FSRRR-early-guides.request";
+                    const auto earlyAttributes = GetFileAttributesW(earlyRequest.c_str());
+                    if (!earlyAttempted.load() && earlyAttributes != INVALID_FILE_ATTRIBUTES &&
+                        !(earlyAttributes & FILE_ATTRIBUTE_DIRECTORY) && DeleteFileW(earlyRequest.c_str()))
+                    {
+                        earlyRequestedAt.store(GetTickCount64());
+                        earlyRequested.store(true);
+                        LOG_INFO("[FSRRR private guides] one-shot armed; waiting up to 10s for original current GBuffer clears on the Fog recording");
+                    }
                     LOG_INFO("[FSRRR fog capture] explicit one-shot request queued; waiting for fully authenticated draw/state");
+                }
                 else
                     FSRDFogLayerCapture::CancelRequest();
             }
@@ -890,6 +1033,181 @@ void PollRearm() noexcept
         LOG_INFO("[FSRRR fog probe] re-armed metadata logs arm={}/{}; global scope sequence unchanged; not a frame association",
                  generation, MaxRearms);
     });
+}
+
+const Json& EarlyInput(const Json& metadata, size_t index)
+{
+    constexpr uint32_t keys[] = { 0x63bcf380, 0x64bcf513, 0x65bcf6a6, 0x61f178d4 };
+    const auto& input = metadata.at("inputs").at(index);
+    const auto& interval = input.at("logical_interval");
+    const auto& registry = input.at("texture_registry");
+    if (input.at("base_key").get<uint32_t>() != keys[index] || input.at("status") != "handle_present" ||
+        interval.at("status") != "compiler_interval_observed" || !interval.at("repeated_metadata_equal").get<bool>() ||
+        !interval.at("inclusive_contains_position").get<bool>() || interval.at("end_event_relation") != "before" ||
+        interval.at("graph_phase").get<unsigned>() != 2 || interval.at("record_used_flag").get<unsigned>() != 1 ||
+        interval.at("record_handle") != input.at("handle") || registry.at("status") != "borrowed_address_observed" ||
+        registry.at("ref_status").get<int32_t>() <= 0 || registry.at("ref_status") != registry.at("ref_status_after"))
+        throw std::runtime_error("current guide handle/reservation/registry evidence incomplete");
+    const auto position = interval.at("current_position").get<uint64_t>();
+    if (interval.at("holder_first_use").get<uint64_t>() > position ||
+        position >= interval.at("holder_end_event_position").get<uint64_t>() ||
+        interval.at("holder_end_event_position").get<uint64_t>() > interval.at("holder_reservation_end").get<uint64_t>())
+        throw std::runtime_error("current guide is outside its pre-end-event logical reservation");
+    return input;
+}
+
+uint32_t EarlyFrameSource(const Json& metadata)
+{
+    const auto& source = metadata.at("camera_provenance").at("frame_id_virtual_route").at("explicit_frame_id_source");
+    if (source.at("status") != "CPU_value_present" || !source.at("repeated_source_fields_equal").get<bool>())
+        throw std::runtime_error("current explicit CPU frame-ID source unavailable");
+    return source.at("source_value").get<uint32_t>();
+}
+
+void __fastcall HookGBufferInitializer(void* context, uint32_t h0, uint32_t h1, uint32_t h2, uint32_t hs)
+{
+    PollRearm();
+    std::shared_ptr<EarlyProducer> candidate;
+    if (earlyRequested.load() && !earlyAttempted.load() && !inMetadata)
+        Metadata([&] {
+            try
+            {
+                auto value = std::make_shared<EarlyProducer>();
+                candidate = value;
+                value->metadata = Json::parse(FSRDCyberpunkEarlyGuides::Describe(context, authenticatedImage.load()));
+                EarlyFrameSource(value->metadata);
+                const uint32_t handles[] = { h0, h1, h2, hs };
+                uintptr_t registry = 0;
+                if (!ReadEarly(authenticatedImage.load() + FSRD::CyberpunkEngineAccess::RegistryRva, registry) || !registry)
+                    throw std::runtime_error("initializer registry unavailable");
+                for (size_t i = 0; i < 4; ++i)
+                {
+                    const auto& input = EarlyInput(value->metadata, i);
+                    if (input.at("handle").get<uint32_t>() != handles[i] || !handles[i] || handles[i] > 0x8000)
+                        throw std::runtime_error("initializer arguments differ from selected graph versions");
+                    value->textures[i] = { handles[i], input.at("texture_registry").at("borrowed_native_address").get<uintptr_t>() };
+                    const auto slot = registry + 0x2f1d8 + uintptr_t(handles[i] - 1) * 0xb0;
+                    if (i < 3)
+                    {
+                        uintptr_t perMipViews = 0;
+                        if (!ReadEarly(slot + 0x40, perMipViews) || perMipViews)
+                            throw std::runtime_error("initializer per-mip RTV route unsupported");
+                    }
+                    if (!ReadEarly(slot + (i < 3 ? 0x18 : 0x20), value->clearDescriptors[i]) || !value->clearDescriptors[i])
+                        throw std::runtime_error("initializer exact clear descriptor unavailable");
+                }
+                candidate = std::move(value);
+            }
+            catch (const std::exception& error)
+            {
+                if (candidate) { candidate->valid = false; candidate->failure = error.what(); }
+                if (captureRefusalLogs.fetch_add(1) < 8)
+                    LOG_WARN("[FSRRR private guides] original initializer evidence unavailable: {}", error.what());
+            }
+        });
+    auto* previous = producerScope;
+    producerScope = candidate.get();
+    struct RestoreProducer { EarlyProducer* previous; ~RestoreProducer() { producerScope = previous; } } restore { previous };
+    originalGBufferInitializer(context, h0, h1, h2, hs);
+    if (candidate)
+        Metadata([&] {
+            std::shared_ptr<EarlyProducer> retired;
+            auto& data = Data();
+            {
+                std::lock_guard lock(data.mutex);
+                retired = std::move(data.earlyProducer);
+                data.earlyProducer = candidate; // At most one bounded, owned original-clear observation.
+            } // Final COM releases of the old producer occur outside the registry lock.
+        });
+}
+
+// This is a valid native API use boundary, not an AddRef on a sampled last pointer.
+// The exact initializer arguments, registry descriptor route and live original
+// clear identify the resources owned by the executing graph for this operation.
+void ObserveInitializerClear(ID3D12GraphicsCommandList* list, SIZE_T descriptor, bool depthStencil,
+                             UINT rectangles, const D3D12_RECT* rects, D3D12_CLEAR_FLAGS flags)
+{
+    if (!producerScope || inMetadata) return;
+    Metadata([&] {
+        auto& producer = *producerScope;
+        try
+        {
+            if (!producer.valid || rectangles || rects ||
+                (depthStencil && flags != (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)))
+                throw std::runtime_error("initializer clear not an exact full-resource clear");
+            const auto index = producer.clearCount;
+            if (index >= 4 || depthStencil != (index == 3) || descriptor != producer.clearDescriptors[index])
+                throw std::runtime_error("initializer clear order/descriptor differs");
+            const auto identity = ListIdentity(list);
+            uint64_t generation = 0;
+            {
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                const auto found = data.lists.find(identity.Get());
+                if (found == data.lists.end() || !found->second.known || found->second.predicated ||
+                    found->second.renderPass || found->second.queryCount)
+                    throw std::runtime_error("initializer list Reset/predication/query state unknown");
+                generation = found->second.generation;
+                if (index < 3)
+                {
+                    const auto* rtv = FindRtv(data, descriptor);
+                    if (!rtv || !rtv->known || uintptr_t(rtv->resource) != producer.textures[index].native ||
+                        rtv->view.ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D || rtv->view.Texture2D.MipSlice ||
+                        rtv->view.Texture2D.PlaneSlice)
+                        throw std::runtime_error("initializer RTV creation provenance unavailable");
+                }
+            }
+            if (!index)
+            {
+                producer.list = identity;
+                producer.nativeList = uintptr_t(list);
+                producer.generation = generation;
+            }
+            else if (producer.list.Get() != identity.Get() || producer.nativeList != uintptr_t(list) ||
+                     producer.generation != generation)
+                throw std::runtime_error("initializer clears span different list recordings");
+            uintptr_t registry = 0, native = 0, clearDescriptor = 0;
+            int32_t refs = 0;
+            if (!ReadEarly(authenticatedImage.load() + FSRD::CyberpunkEngineAccess::RegistryRva, registry) || !registry)
+                throw std::runtime_error("initializer registry disappeared at original clear");
+            const auto slot = registry + 0x2f1d8 + uintptr_t(producer.textures[index].handle - 1) * 0xb0;
+            if (!ReadEarly(slot - 8, refs) || refs <= 0 || !ReadEarly(slot, native) || native != producer.textures[index].native ||
+                !ReadEarly(slot + (index < 3 ? 0x18 : 0x20), clearDescriptor) || clearDescriptor != descriptor)
+                throw std::runtime_error("initializer resource/descriptor changed at original clear");
+            ComPtr<ID3D12Resource> resource = reinterpret_cast<ID3D12Resource*>(native);
+            const auto desc = resource->GetDesc();
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+                desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.Width > 8192 || desc.Height > 8192)
+                throw std::runtime_error("initializer clear subresource layout unsupported");
+            ComPtr<ID3D12Device> device;
+            if (FAILED(resource->GetDevice(IID_PPV_ARGS(&device))))
+                throw std::runtime_error("initializer resource device unavailable");
+            const auto bytes = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+            constexpr UINT64 MaxInitializerBytes = 128ull * 1024 * 1024;
+            if (!bytes || bytes > MaxInitializerBytes - producer.resourceBytes)
+                throw std::runtime_error("initializer resource ownership exceeds 128MiB");
+            producer.resourceBytes += bytes;
+            producer.resources[index] = std::move(resource);
+            ++producer.clearCount;
+            producer.clearMask |= 1u << index;
+        }
+        catch (const std::exception& error) { producer.valid = false; producer.failure = error.what(); }
+        catch (...) { producer.valid = false; }
+    });
+}
+
+void WINAPI HookClearRtv(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+                         const FLOAT color[4], UINT rectangles, const D3D12_RECT* rects)
+{
+    ObserveInitializerClear(list, descriptor.ptr, false, rectangles, rects, D3D12_CLEAR_FLAGS(0));
+    originalClearRtv(list, descriptor, color, rectangles, rects);
+}
+void WINAPI HookClearDsv(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+                         D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT rectangles, const D3D12_RECT* rects)
+{
+    if (producerScope && stencil != 0) producerScope->valid = false;
+    ObserveInitializerClear(list, descriptor.ptr, true, rectangles, rects, flags);
+    originalClearDsv(list, descriptor, flags, depth, stencil, rectangles, rects);
 }
 
 void __fastcall HookFogNode(void* node, void* context)
@@ -1017,7 +1335,291 @@ struct CapturePlan
     Json provenance;
     std::shared_ptr<EndpointTrace> endpoint;
     ListState drawState;
+    std::shared_ptr<FSRD::CyberpunkGuidePass::Work> earlyWork;
+    bool fatalEarlyRecording = false;
 };
+
+bool SameEarlyReservation(const Json& earlier, const Json& current, size_t index)
+{
+    const auto& a = EarlyInput(earlier, index);
+    const auto& b = EarlyInput(current, index);
+    for (const auto* field : { "base_key", "namespaced_key", "handle" })
+        if (a.at(field) != b.at(field)) return false;
+    for (const auto* field : { "graph_address", "holder_address", "resource_record_address", "holder_first_use",
+                              "holder_reservation_end", "holder_end_event_position", "record_handle", "record_kind", "record_policy" })
+        if (a.at("logical_interval").at(field) != b.at("logical_interval").at(field)) return false;
+    if (a.at("logical_interval").at("current_position").get<uint64_t>() >
+        b.at("logical_interval").at("current_position").get<uint64_t>()) return false;
+    return a.at("texture_registry").at("borrowed_native_address") == b.at("texture_registry").at("borrowed_native_address");
+}
+
+bool ProducerMatches(const EarlyProducer& producer, const Json& current, ID3D12GraphicsCommandList* list,
+                     uint64_t generation) noexcept
+{
+    try
+    {
+        if (!producer.valid || producer.clearMask != 15 || producer.clearCount != 4 ||
+            producer.nativeList != uintptr_t(list) || producer.generation != generation ||
+            producer.metadata.at("view") != current.at("view") ||
+            producer.metadata.at("view_dimensions") != current.at("view_dimensions") ||
+            EarlyFrameSource(producer.metadata) != EarlyFrameSource(current))
+            return false;
+        for (size_t i = 0; i < 4; ++i)
+            if (!producer.resources[i] || !SameEarlyReservation(producer.metadata, current, i)) return false;
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+struct EarlyEngineHost
+{
+    const CapturePlan& plan;
+    const EarlyProducer& producer;
+    uintptr_t context = 0, view = 0;
+    uint64_t serial = 0;
+
+    bool Read(uintptr_t address, void* destination, size_t bytes) noexcept
+    { return ReadExactMemory(address, destination, bytes); }
+    uint32_t ThreadId() noexcept { return GetCurrentThreadId(); }
+    bool ReadTlsSlotZero(uintptr_t& result) noexcept
+    {
+        const auto slots = uintptr_t(__readgsqword(0x58));
+        return ReadEarly(slots, result) && result;
+    }
+    bool ExactImageAuthenticated(uintptr_t image, uintptr_t size, uint32_t stamp, std::string_view sha) noexcept
+    {
+        return active.load() && captureEnabled.load() && earlyRequested.load() &&
+            image == authenticatedImage.load() && image == uintptr_t(GetModuleHandleW(nullptr)) &&
+            size == 0x04efc000 && stamp == 0x68af45ea && sha == ExeSha256;
+    }
+    bool LiveCodeMatches(uintptr_t image, const FSRD::CyberpunkEngineAccess::CodeRange& code) noexcept
+    { return MatchLiveCode(image, code); }
+    bool IsAdmittedFogScope(uint64_t requested, uintptr_t list, uintptr_t pso,
+                            const std::array<FSRD::CyberpunkEngineAccess::TextureBorrow, 4>& inputs) noexcept
+    {
+        // No game calls occur inside privateWork, so the synchronous original Fog
+        // graph reservation stays active. Do not resample a global frame counter
+        // here: it may advance independently of this already-admitted recording.
+        if (!scope || scope->serial != serial || requested != serial || uintptr_t(scope->context) != context ||
+            scope->psoList != reinterpret_cast<ID3D12GraphicsCommandList*>(list) || uintptr_t(scope->pso) != pso ||
+            pso != uintptr_t(plan.originalPso.Get()) || producer.nativeList != list ||
+            producer.generation != plan.drawState.generation || !producer.valid || producer.clearMask != 15 ||
+            scope->hasDsv || scope->rtvCount != 1 || !captureTrackingValid.load())
+            return false;
+        uintptr_t currentView = 0;
+        uint8_t flags = 0;
+        if (!ReadEarly(context + 0x18, currentView) || currentView != view ||
+            !ReadEarly(context + 0x30, flags) || !(flags & 2)) return false;
+        for (size_t i = 0; i < 4; ++i)
+            if (inputs[i].handle != producer.textures[i].handle || inputs[i].native != producer.textures[i].native ||
+                inputs[i].native == uintptr_t(plan.main.Get()) || !producer.resources[i]) return false;
+        return true;
+    }
+    bool ListIsDirect(uintptr_t list) noexcept
+    { return reinterpret_cast<ID3D12GraphicsCommandList*>(list)->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT; }
+    uintptr_t CurrentNativeList(uintptr_t address) noexcept
+    { return uintptr_t(reinterpret_cast<void*(__fastcall*)()>(address)()); }
+    void RequestState(uintptr_t address, uintptr_t engine, uint32_t handle, uint32_t state, uint32_t subresource) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*, uint32_t, uint32_t, uint32_t)>(address)(reinterpret_cast<void*>(engine), handle, state, subresource); }
+    void Flush(uintptr_t address, uintptr_t engine) noexcept
+    { reinterpret_cast<void(__fastcall*)(void*)>(address)(reinterpret_cast<void*>(engine)); }
+    void Reenter(uintptr_t address, uintptr_t list) noexcept
+    { reinterpret_cast<void(__fastcall*)(ID3D12GraphicsCommandList*)>(address)(reinterpret_cast<ID3D12GraphicsCommandList*>(list)); }
+    void RestorePso(uintptr_t list, uintptr_t pso) noexcept
+    { originalSetPso(reinterpret_cast<ID3D12GraphicsCommandList*>(list), reinterpret_cast<ID3D12PipelineState*>(pso)); }
+};
+
+void PrepareAndRecordEarlyGuides(ID3D12GraphicsCommandList* list, CapturePlan& plan)
+{
+    if (!earlyRequested.load() || earlyAttempted.exchange(true)) return;
+    auto& evidence = plan.provenance["early_guides"];
+    evidence = { { "schema", "optiscaler.fsr_rr.private_early_guides.v1" }, { "status", "refused" },
+        { "original_scene_modified", false }, { "initializer_rva", GBufferInitializerRva },
+        { "transparent_input", "explicitly_pre_transparency_t3_t6_disabled" }, { "last_material_writer", "not_proven" },
+        { "GPU_completion", "requires_companion_completion_fence" }, { "SL_frame_association", "not_asserted" } };
+    try
+    {
+        if (!originalGBufferInitializer || !originalClearRtv || !originalClearDsv || !originalSetPso ||
+            !earlyHeapTrackingValid.load()) throw std::runtime_error("early producer/state/CPU descriptor tracking unavailable");
+        std::shared_ptr<EarlyProducer> producer;
+        std::vector<std::byte> shader;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            producer = data.earlyProducer;
+            shader = data.guideShader;
+        }
+        const auto& current = plan.provenance.at("early_guide_availability");
+        auto frameEvidence = [](const Json& metadata) -> Json {
+            try { return EarlyFrameSource(metadata); } catch (...) { return nullptr; }
+        };
+        evidence["fog_observation"] = { { "native_list", uintptr_t(list) }, { "recording_generation", plan.drawState.generation },
+            { "view", current.value("view", uintptr_t(0)) }, { "cpu_frame_source", frameEvidence(current) },
+            { "position", current.value("graph_position", uint32_t(0)) } };
+        if (producer)
+        {
+            evidence["initializer_observation"] = { { "native_list", producer->nativeList },
+                { "recording_generation", producer->generation }, { "clear_mask", producer->clearMask },
+                { "clear_count", producer->clearCount }, { "valid", producer->valid }, { "failure", producer->failure },
+                { "view", producer->metadata.value("view", uintptr_t(0)) },
+                { "cpu_frame_source", frameEvidence(producer->metadata) },
+                { "position", producer->metadata.value("graph_position", uint32_t(0)) },
+                { "inputs", Json::array() } };
+            if (producer->metadata.contains("inputs") && producer->metadata["inputs"].is_array())
+                for (size_t i = 0; i < std::min(size_t(4), producer->metadata["inputs"].size()); ++i)
+                    evidence["initializer_observation"]["inputs"].push_back(producer->metadata["inputs"][i]);
+        }
+        else evidence["initializer_observation"] = nullptr;
+        if (!producer || !ProducerMatches(*producer, current, list, plan.drawState.generation))
+            throw std::runtime_error("no matching four original full clears on same current view/frame-source/list Reset and reservations");
+        const auto image = authenticatedImage.load();
+        const auto view = current.at("view").get<uintptr_t>();
+        const auto dimensions = current.at("view_dimensions").get<std::array<uint32_t, 2>>();
+        const auto mainDesc = plan.main->GetDesc();
+        if (dimensions[0] != mainDesc.Width || dimensions[1] != mainDesc.Height || shader.size() != GuideShaderBytes)
+            throw std::runtime_error("current guide/scene extent or runtime authenticated guide shader unavailable");
+        FSRD::CyberpunkGuideMatrix::MatrixWords inverseProjection {}, inverseView {}, checkProjection {}, checkView {};
+        if (!ReadEarly(view + 0x1c0, inverseProjection) || !ReadEarly(view + 0x180, inverseView) ||
+            !ReadEarly(view + 0x1c0, checkProjection) || !ReadEarly(view + 0x180, checkView) ||
+            inverseProjection != checkProjection || inverseView != checkView)
+            throw std::runtime_error("current inverse native camera matrix reads unavailable/changed");
+        const auto& matrices = current.at("camera_provenance").at("matrices");
+        for (const auto& item : { std::pair { "inverse_native_projection_jittered", &inverseProjection },
+                                  std::pair { "inverse_native_view", &inverseView } })
+        {
+            const auto rows = matrices.at(item.first).at("source_uint32_rows").get<std::array<std::array<uint32_t, 4>, 4>>();
+            if (std::memcmp(rows.data(), item.second->data(), 64) != 0)
+                throw std::runtime_error("camera source changed since same-scope metadata");
+        }
+        FSRD::CyberpunkGuideConstants::ObservedSharedWords sharedWords {};
+        if (!FSRD::CyberpunkGuideMatrix::Generate(inverseProjection, inverseView, dimensions[0], dimensions[1], sharedWords))
+            throw std::runtime_error("exact authored CPU matrix arithmetic contract unavailable");
+        const auto& settings = current.at("guide_settings");
+        if (settings.at("extra_specular_enabled").get<unsigned>() != 0)
+            throw std::runtime_error("authored extra-specular branch enabled; its unavailable t5 cannot be disabled implicitly");
+        FSRD::CyberpunkGuideConstants::PassSources passSources;
+        passSources.width = dimensions[0]; passSources.height = dimensions[1];
+        passSources.transparency = FSRD::CyberpunkGuideConstants::TransparencyInput::PreTransparencySurface;
+        passSources.noVMode = settings.at("NoV_mode").get<int32_t>();
+        passSources.extraSpecularScaleBits = settings.value("extra_specular_scale_bits", uint32_t(0));
+        FSRD::CyberpunkGuideConstants::PassConstants pass {};
+        if (!FSRD::CyberpunkGuideConstants::PackPass(passSources, pass))
+            throw std::runtime_error("authored private guide pass constants invalid");
+        std::array<FSRD::CyberpunkGuidePass::SourceView, 4> sources;
+        Json views = Json::array();
+        for (size_t i = 0; i < 4; ++i)
+        {
+            const auto& source = EarlyInput(current, i);
+            const auto& descriptors = source.at("texture_registry").at("descriptor_sources");
+            if (descriptors.at("status") != "cpu_descriptor_sources_observed" ||
+                !descriptors.at("repeated_source_fields_equal").get<bool>())
+                throw std::runtime_error("exact authored CPU SRV source unavailable");
+            if (i == 3)
+            {
+                const auto formatTag = descriptors.at("raw_format_sample_bits").get<uint32_t>() & 0x3f;
+                const auto resourceFormat = producer->resources[i]->GetDesc().Format;
+                // Exact alternate stencil-view creation branch in RVA2221f4:
+                // tags0x18/0x19 -> X24_G8 / X32_G8X24, green stencil component,
+                // PlaneSlice1, mip0/count1. Never reinterpret a generic UINT2 SRV.
+                if (descriptors.at("raw_array_size").get<uint32_t>() != 1 ||
+                    (descriptors.at("raw_dimension_mip_bits").get<uint32_t>() & 0xf) != 0 ||
+                    (descriptors.at("raw_flags_bits").get<uint32_t>() & 5) != 5 ||
+                    (formatTag != 0x18 && formatTag != 0x19) ||
+                    resourceFormat != (formatTag == 0x18 ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R32G8X24_TYPELESS))
+                    throw std::runtime_error("t4 source does not satisfy authenticated alternate stencil-view factory branch");
+            }
+            const auto descriptor = descriptors.at(i == 3 ? "alternate_cpu_srv_handle" : "ordinary_cpu_srv_handle").get<SIZE_T>();
+            if (!descriptor || producer->textures[i].native == uintptr_t(plan.main.Get()))
+                throw std::runtime_error("guide source missing or aliases live scene writable target");
+            sources[i].resource = producer->resources[i];
+            sources[i].descriptor.ptr = descriptor;
+            uint64_t heapGeneration = 0;
+            {
+                auto& data = Data();
+                std::lock_guard lock(data.mutex);
+                for (const auto& heap : data.cpuSrvHeaps)
+                    if (descriptor >= heap.start && (descriptor - heap.start) % heap.increment == 0 &&
+                        (descriptor - heap.start) / heap.increment < heap.count)
+                    {
+                        if (sources[i].heap) throw std::runtime_error("CPU SRV source range ambiguous");
+                        sources[i].heap = heap.heap;
+                        heapGeneration = heap.generation;
+                    }
+            }
+            if (!sources[i].heap) throw std::runtime_error("authored CPU SRV source has no retained heap range");
+            views.push_back({ { "binding", i == 3 ? 4 : i }, { "handle", producer->textures[i].handle },
+                { "native", producer->textures[i].native }, { "cpu_srv_handle", descriptor }, { "heap_generation", heapGeneration },
+                { "route", i == 3 ? "authored_alternate_stencil_srv" : "authored_ordinary_srv" },
+                { "descriptor_transform", "none; CopyDescriptorsSimple from exact engine slot" } });
+        }
+        // Re-read the actual current graph reservation/settings after preparation,
+        // BEFORE descriptor copies or engine state mutation. Native resources are
+        // owned since the original clear; descriptor slots stay graph-owned here.
+        const auto fresh = Json::parse(FSRDCyberpunkEarlyGuides::Describe(scope->context, image));
+        if (!ProducerMatches(*producer, fresh, list, plan.drawState.generation) ||
+            fresh.at("guide_settings") != current.at("guide_settings") ||
+            fresh.at("camera_provenance").at("matrices") != matrices)
+            throw std::runtime_error("source reservation/settings/camera changed before private preparation");
+        for (size_t i = 0; i < 4; ++i)
+            if (EarlyInput(fresh, i).at("texture_registry").at("descriptor_sources") !=
+                EarlyInput(current, i).at("texture_registry").at("descriptor_sources"))
+                throw std::runtime_error("authored source descriptor fields changed before private copy");
+        const auto shared = FSRD::CyberpunkGuideConstants::PackShared(sharedWords);
+        auto work = FSRD::CyberpunkGuidePass::Prepare(plan.device.Get(), dimensions[0], dimensions[1], sources, pass, shared, shader);
+        if (!work) throw std::runtime_error("private guide PSO/resource preparation refused");
+        evidence["sources"] = std::move(views);
+        evidence["initializer_cpu_frame_source"] = EarlyFrameSource(producer->metadata);
+        evidence["fog_cpu_frame_source"] = EarlyFrameSource(current);
+        evidence["recording_generation"] = plan.drawState.generation;
+        evidence["initialization_proof"] = "four original full clear calls precede private dispatch on same native list/Reset";
+        evidence["cb12_words"] = sharedWords;
+        evidence["cb12_recipe"] = "exact authored SSE-order inverse jittered native P times rotation-only inverse native V";
+        evidence["cb6_words"] = pass;
+        evidence["shader_sha256"] = GuideShaderSha256;
+        EarlyEngineHost host { plan, *producer, uintptr_t(scope->context), view, scope->serial };
+        FSRD::CyberpunkEngineAccess::Input input;
+        input.image = image; input.list = uintptr_t(list); input.originalPso = uintptr_t(plan.originalPso.Get());
+        input.originalFogScope = scope->serial; input.textures = producer->textures;
+        const auto result = FSRD::CyberpunkEngineAccess::RecordPrivateCompute(host, input, [&] { return work->Record(list); });
+        if (result.outcome == FSRD::CyberpunkEngineAccess::Outcome::ScopeLostAfterPrivate)
+        {
+            // Set a nonthrowing global latch BEFORE any allocation/logging. It
+            // remains visible to HookDraw even if PrepareCapture cannot return its plan.
+            earlyFatalRecording.store(true);
+            plan.fatalEarlyRecording = true;
+            try { LOG_ERROR("[FSRRR private guides] FATAL research recording lost original engine scope; refusing original draw and terminating authenticated Cyberpunk only"); }
+            catch (...) {}
+            if (active.load() && captureEnabled.load() && earlyRequested.load() && image == authenticatedImage.load() &&
+                image == uintptr_t(GetModuleHandleW(nullptr)))
+            {
+                // User explicitly authorizes stopping the game. Never resume an
+                // invalid recording, kill another PID, or terminate on ordinary refusal.
+                TerminateProcess(GetCurrentProcess(), 0xf51d0001u);
+                RaiseFailFastException(nullptr, nullptr, 0);
+            }
+            return; // Defensive: HookDraw never resumes a flagged invalid recording.
+        }
+        evidence["engine_state_requests"] = result.requestsIssued;
+        evidence["callback_entered"] = result.callbackEntered;
+        evidence["bindings_restored"] = result.bindingsRestored;
+        evidence["outcome"] = unsigned(result.outcome);
+        if (result.outcome != FSRD::CyberpunkEngineAccess::Outcome::PrivateRecordedRestored)
+            throw std::runtime_error("private guide recording refused/failed; no guide companions published");
+        plan.earlyWork = std::move(work);
+        for (size_t i = 0; i < 3; ++i)
+        {
+            plan.layers.earlyGuides[i].resource = plan.earlyWork->Outputs()[i];
+            plan.layers.earlyGuides[i].viewFormat = i < 2 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            plan.layers.earlyGuides[i].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+        evidence["status"] = "private_dispatch_recorded";
+    }
+    catch (const std::exception& error)
+    {
+        evidence["reason"] = error.what();
+        LOG_WARN("[FSRRR private guides] one-shot refused: {}", error.what());
+    }
+}
 
 bool HasBoundCb12Psos(const CapturePlan& plan)
 {
@@ -1222,6 +1824,25 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
         RefuseCapture("RTV resource is not a supported single-array/single-sample RGBA16F target");
         return {};
     }
+    Json earlyAvailability;
+    if (earlyRequested.load())
+    {
+        earlyAvailability = Json::parse(FSRDCyberpunkEarlyGuides::Describe(s.context, authenticatedImage.load()));
+        std::shared_ptr<EarlyProducer> producer;
+        bool hasShader = false;
+        {
+            auto& data = Data();
+            std::lock_guard lock(data.mutex);
+            producer = data.earlyProducer;
+            hasShader = data.guideShader.size() == GuideShaderBytes;
+        }
+        if ((!producer || !ProducerMatches(*producer, earlyAvailability, list, state.generation) || !hasShader) &&
+            GetTickCount64() - earlyRequestedAt.load() < 10000)
+        {
+            RefuseCapture("waiting for current original GBuffer clears on same Fog recording and authenticated guide shader (10s maximum)");
+            return {};
+        }
+    }
     if (captureStarted.exchange(true))
         return {};
     if (FAILED(plan->main->GetDevice(IID_PPV_ARGS(&plan->device))))
@@ -1269,8 +1890,8 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     plan->provenance["endpoint_origin"] = plan->endpoint->fog;
     // One accepted, authenticated capture only. CPU table availability does not
     // establish initialized GPU contents or authorize an early denoiser dispatch.
-    plan->provenance["early_guide_availability"] = Json::parse(
-        FSRDCyberpunkEarlyGuides::Describe(s.context, uintptr_t(GetModuleHandleW(nullptr))));
+    plan->provenance["early_guide_availability"] = earlyAvailability.is_object() ? std::move(earlyAvailability) :
+        Json::parse(FSRDCyberpunkEarlyGuides::Describe(s.context, uintptr_t(GetModuleHandleW(nullptr))));
     const CD3DX12_HEAP_PROPERTIES properties(D3D12_HEAP_TYPE_DEFAULT);
     auto allocate = [&](const D3D12_RESOURCE_DESC& textureDesc, D3D12_RESOURCE_STATES initial,
                          FSRDFogLayerCapture::Texture& output) {
@@ -1304,6 +1925,7 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
     // earlier work alive even if the later readback helper refuses or throws.
     FSRDSubmission::Retain(plan->device.Get(), list, plan);
     CopyMain(list, *plan, plan->layers.before.resource.Get());
+    PrepareAndRecordEarlyGuides(list, *plan); // Optional private outputs; never writes the original scene.
     return plan;
 }
 
@@ -1418,6 +2040,8 @@ void WINAPI HookDraw(ID3D12GraphicsCommandList* list, UINT count, UINT instances
                 LOG_WARN("[FSRRR fog capture] preparation stopped: {}", error.what());
             }
         });
+    if (earlyFatalRecording.load() || (plan && plan->fatalEarlyRecording))
+        return; // Only the fatal post-private scope-loss outcome; never ordinary refusal.
     originalDraw(list, count, instances, start, firstInstance);
     if (plan)
     {
@@ -1605,6 +2229,32 @@ void RecordPso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineSta
     }
 }
 
+void RecordGuideShader(const D3D12_SHADER_BYTECODE& shader)
+{
+    if (!captureEnabled.load() || shader.BytecodeLength != GuideShaderBytes || !shader.pShaderBytecode) return;
+    std::vector<std::byte> bytes(GuideShaderBytes);
+    if (!ReadExactMemory(uintptr_t(shader.pShaderBytecode), bytes.data(), bytes.size())) return;
+    Hash hash(Data().crypto);
+    hash.Add(bytes.data(), ULONG(bytes.size()));
+    if (hash.Finish() != GuideShaderSha256) return;
+    auto& data = Data();
+    std::lock_guard lock(data.mutex);
+    if (data.guideShader.empty())
+    {
+        data.guideShader = std::move(bytes);
+        LOG_INFO("[FSRRR private guides] exact original runtime guide CS retained: {} bytes SHA256={}", GuideShaderBytes, GuideShaderSha256);
+    }
+}
+
+HRESULT WINAPI HookCreateCompute(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+                                 REFIID iid, void** result)
+{
+    const HRESULT hr = originalCreateCompute(device, desc, iid, result);
+    if (SUCCEEDED(hr) && desc && result && *result)
+        Metadata([&] { RecordGuideShader(desc->CS); });
+    return hr;
+}
+
 HRESULT WINAPI HookCreateGraphics(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                                    REFIID iid, void** result)
 {
@@ -1627,6 +2277,7 @@ HRESULT WINAPI HookCreateStream(ID3D12Device2* device, const D3D12_PIPELINE_STAT
             // The existing parser rejects unknown subobjects; do not guess their layout.
             if (FAILED(D3DX12ParsePipelineStream(*desc, &parsed)))
                 return;
+            RecordGuideShader(D3D12_SHADER_BYTECODE(parsed.PipelineStream.CS));
             ComPtr<ID3D12PipelineState> pso;
             if (SUCCEEDED(static_cast<IUnknown*>(*result)->QueryInterface(IID_PPV_ARGS(&pso))))
             {
@@ -1941,6 +2592,12 @@ void Initialize(bool enabled)
                 LOG_WARN("[FSRRR fog probe] refused: executable name/version/SHA256/live prologue authentication failed");
                 return;
             }
+            const auto image = entry - FogNodeRva;
+            authenticatedImage.store(image);
+            const bool captures = Config::Instance()->FfxDenoiserCyberpunkFogCapture.value_or_default();
+            if (captures && std::all_of(std::begin(ProducerCode), std::end(ProducerCode),
+                                       [&](const auto& code) { return MatchLiveCode(image, code); }))
+                originalGBufferInitializer = reinterpret_cast<GBufferInitializer>(image + GBufferInitializerRva);
             originalFogNode = reinterpret_cast<FogNode>(entry);
             LONG error = DetourTransactionBegin();
             if (error == NO_ERROR)
@@ -1948,6 +2605,8 @@ void Initialize(bool enabled)
                 error = DetourUpdateThread(GetCurrentThread());
                 if (error == NO_ERROR)
                     error = DetourAttach(reinterpret_cast<PVOID*>(&originalFogNode), HookFogNode);
+                if (error == NO_ERROR && originalGBufferInitializer)
+                    error = DetourAttach(reinterpret_cast<PVOID*>(&originalGBufferInitializer), HookGBufferInitializer);
                 if (error == NO_ERROR)
                     error = DetourTransactionCommit();
                 else
@@ -1956,10 +2615,12 @@ void Initialize(bool enabled)
             if (error != NO_ERROR)
             {
                 originalFogNode = nullptr;
+                originalGBufferInitializer = nullptr;
+                authenticatedImage.store(0);
                 LOG_WARN("[FSRRR fog probe] engine hook failed: {}", error);
                 return;
             }
-            captureEnabled.store(Config::Instance()->FfxDenoiserCyberpunkFogCapture.value_or_default());
+            captureEnabled.store(captures);
             active.store(true);
             LOG_INFO("[FSRRR fog probe] enabled metadata-only; authenticated Cyberpunk 2.31 file 3.0.80.51928 SHA256={} RVA={:x}; first {} draws per arm; pipeline-library loads not authenticated",
                      ExeSha256, FogNodeRva, MaxDrawLogs);
@@ -1980,6 +2641,7 @@ void HookDevice(ID3D12Device* device)
     originalCreateGraphics = reinterpret_cast<CreateGraphics>(table[10]);
     if (captureEnabled.load())
     {
+        originalCreateCompute = reinterpret_cast<CreateCompute>(table[11]);
         originalCreateList = reinterpret_cast<CreateList>(table[12]);
         originalCreateHeap = reinterpret_cast<CreateHeap>(table[14]);
         originalCreateRtv = reinterpret_cast<CreateRtv>(table[20]);
@@ -1997,6 +2659,8 @@ void HookDevice(ID3D12Device* device)
             error = DetourAttach(reinterpret_cast<PVOID*>(&originalCreateGraphics), HookCreateGraphics);
         if (error == NO_ERROR && originalCreateStream)
             error = DetourAttach(reinterpret_cast<PVOID*>(&originalCreateStream), HookCreateStream);
+        if (error == NO_ERROR && originalCreateCompute)
+            error = DetourAttach(reinterpret_cast<PVOID*>(&originalCreateCompute), HookCreateCompute);
         if (error == NO_ERROR && originalCreateList)
             error = DetourAttach(reinterpret_cast<PVOID*>(&originalCreateList), HookCreateList);
         if (error == NO_ERROR && originalCreateHeap)
@@ -2015,6 +2679,7 @@ void HookDevice(ID3D12Device* device)
     if (error != NO_ERROR)
     {
         originalCreateGraphics = nullptr;
+        originalCreateCompute = nullptr;
         originalCreateStream = nullptr;
         originalCreateList = nullptr;
         originalCreateHeap = nullptr;
@@ -2045,6 +2710,8 @@ void HookCommandList(ID3D12GraphicsCommandList* list)
         originalSetViewports = reinterpret_cast<SetViewports>(table[21]);
         originalSetScissors = reinterpret_cast<SetScissors>(table[22]);
         originalExecuteBundle = reinterpret_cast<ExecuteBundle>(table[27]);
+        originalClearDsv = reinterpret_cast<ClearDsv>(table[47]);
+        originalClearRtv = reinterpret_cast<ClearRtv>(table[48]);
         originalBeginQuery = reinterpret_cast<BeginQuery>(table[52]);
         originalEndQuery = reinterpret_cast<EndQuery>(table[53]);
         originalSetPredication = reinterpret_cast<SetPredication>(table[55]);
@@ -2078,6 +2745,10 @@ void HookCommandList(ID3D12GraphicsCommandList* list)
             error = DetourAttach(reinterpret_cast<PVOID*>(&originalSetScissors), HookSetScissors);
         if (error == NO_ERROR && originalExecuteBundle)
             error = DetourAttach(reinterpret_cast<PVOID*>(&originalExecuteBundle), HookExecuteBundle);
+        if (error == NO_ERROR && originalClearRtv)
+            error = DetourAttach(reinterpret_cast<PVOID*>(&originalClearRtv), HookClearRtv);
+        if (error == NO_ERROR && originalClearDsv)
+            error = DetourAttach(reinterpret_cast<PVOID*>(&originalClearDsv), HookClearDsv);
         if (error == NO_ERROR && originalBeginQuery)
             error = DetourAttach(reinterpret_cast<PVOID*>(&originalBeginQuery), HookBeginQuery);
         if (error == NO_ERROR && originalEndQuery)
@@ -2104,6 +2775,8 @@ void HookCommandList(ID3D12GraphicsCommandList* list)
         originalSetViewports = nullptr;
         originalSetScissors = nullptr;
         originalExecuteBundle = nullptr;
+        originalClearRtv = nullptr;
+        originalClearDsv = nullptr;
         originalBeginQuery = nullptr;
         originalEndQuery = nullptr;
         originalSetPredication = nullptr;

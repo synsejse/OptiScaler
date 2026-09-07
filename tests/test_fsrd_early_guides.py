@@ -12,9 +12,12 @@ SOURCE = CPP.read_text()
 
 
 class EarlyGuides(unittest.TestCase):
-    def test_observation_is_only_in_accepted_authenticated_capture(self):
+    def test_observation_is_only_in_authenticated_capture_or_explicit_early_request(self):
         probe = (CPP.parent / "FSRDCyberpunkFogProbe.cpp").read_text()
-        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 1)
+        self.assertEqual(probe.count("FSRDCyberpunkEarlyGuides::Describe("), 4)
+        initializer = probe.split("void __fastcall HookGBufferInitializer(", 1)[1].split("void ObserveInitializerClear(", 1)[0]
+        self.assertLess(initializer.index("earlyRequested.load() && !earlyAttempted.load() && !inMetadata"),
+                        initializer.index("FSRDCyberpunkEarlyGuides::Describe("))
         capture = probe.split("std::shared_ptr<CapturePlan> PrepareCapture(", 1)[1].split("void PublishFogEndpoint(", 1)[0]
         self.assertLess(capture.index("!FSRDFogLayerCapture::WantsCapture()"),
                         capture.index("FSRDCyberpunkEarlyGuides::Describe("))

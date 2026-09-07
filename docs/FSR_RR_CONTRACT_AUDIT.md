@@ -1,5 +1,9 @@
 # DLSS RR → FSR RR contract audit
 
+**Latest evidence:** [FSR_RR_FOG_ORDERING.md](FSR_RR_FOG_ORDERING.md) records
+the positive pre-fog AMD replay, the identity-denoiser explanation, and the
+remaining live-integration gates. The live rendering correction is not enabled.
+
 **Follow-up, 2026-09-07:** the autonomous live tests and exact game-producer
 trace are in [FSR_RR_GUIDE_PRODUCER.md](FSR_RR_GUIDE_PRODUCER.md). Native AMD
 diagnostics are now implemented and tested. Disabling the game's NoV guide
