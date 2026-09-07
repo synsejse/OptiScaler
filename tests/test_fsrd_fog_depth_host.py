@@ -53,12 +53,21 @@ class FogDepthHost(unittest.TestCase):
 
     def test_original_native_format_and_owning_plan_before_commands(self):
         prepare = function('PrepareFogDepth')
-        for gate in ('CyberpunkFogDepth::Observe(', 'DXGI_FORMAT_R32_FLOAT', 'desc.MipLevels != 1',
-                     'desc.SampleDesc.Count != 1', 'desc.DepthOrArraySize != 1',
+        for gate in ('CyberpunkFogDepth::Observe(', 'DXGI_FORMAT_R32_FLOAT',
+                     'CyberpunkFogDepthCopy::ClassifySource(desc, d.srvFormat,',
+                     'CyberpunkFogDepthCopy::AdmitDestination(output, dimensions[0], dimensions[1])',
                      'sourceDeviceId.Get() != targetDeviceId.Get()',
                      'holder_end_event_position', 'plan.retainedTextureBytes',
                      'D3D12_RESOURCE_STATE_COPY_DEST'):
             self.assertIn(gate, prepare)
+        # Extent/format admission is now the separately compiled production
+        # helper; test_fsrd_fog_depth_copy exhaustively exercises its accepted
+        # formats/flags and all whole-subresource descriptor rejection paths.
+        descriptor = (ROOT / 'OptiScaler/upscalers/ffx/FSRDCyberpunkFogDepthCopy.h').read_text()
+        for gate in ('desc.MipLevels == 1', 'desc.SampleDesc.Count == 1',
+                     'desc.DepthOrArraySize == 1', 'desc.SampleDesc.Quality == 0',
+                     'desc.Width == uint64_t(width)', 'desc.Height == height'):
+            self.assertIn(gate, descriptor)
         self.assertIn('sourceId.Get() == mainId.Get()', prepare)
         self.assertIn('plan.retainedTextureBytes += sourceBytes + outputBytes', prepare)
         refusal = prepare.split('catch (const std::exception& error)', 1)[1]

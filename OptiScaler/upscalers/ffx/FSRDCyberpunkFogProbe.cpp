@@ -13,6 +13,7 @@
 #include "FSRDCyberpunkRayBindings.h"
 #include "FSRDCyberpunkRayAccess.h"
 #include "FSRDCyberpunkFogDepth.h"
+#include "FSRDCyberpunkFogDepthCopy.h"
 #include "FSRDCyberpunkFogDenoiseAccess.h"
 #include "FSRDPrivateRayCopy.h"
 #include "FSRDCyberpunkResetCamera.h"
@@ -3635,12 +3636,15 @@ void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
             { "array", desc.DepthOrArraySize }, { "samples", desc.SampleDesc.Count } };
         const auto color = plan.main->GetDesc();
         const auto dimensions = plan.depthMetadata.at("view_dimensions").get<std::array<uint32_t, 2>>();
-        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Format != DXGI_FORMAT_R32_FLOAT ||
-            desc.Width != color.Width || desc.Height != color.Height || desc.Width != dimensions[0] ||
-            desc.Height != dimensions[1] || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
-            desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality ||
-            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+        const auto copyKind = FSRD::CyberpunkFogDepthCopy::ClassifySource(desc, d.srvFormat,
+                                                                        dimensions[0], dimensions[1]);
+        if (copyKind == FSRD::CyberpunkFogDepthCopy::SourceKind::Refused ||
+            desc.Width != color.Width || desc.Height != color.Height)
             throw std::runtime_error("native Fog depth is not the admitted scalar single-plane copy format");
+        evidence["copy_source_kind"] = copyKind == FSRD::CyberpunkFogDepthCopy::SourceKind::TypelessR32Depth
+            ? "R32_TYPELESS_depth_with_original_R32_FLOAT_SRV" : "typed_R32_FLOAT";
+        evidence["source_view_format"] = d.srvFormat;
+        evidence["copy_region"] = "whole_subresource0; destination_offsets_0; null_source_box; no_conversion";
         ComPtr<ID3D12Device> device;
         ComPtr<IUnknown> sourceDeviceId, targetDeviceId;
         if (FAILED(plan.depthSource.resource->GetDevice(IID_PPV_ARGS(&device))) ||
@@ -3664,6 +3668,8 @@ void PrepareFogDepth(CapturePlan& plan, uintptr_t caller)
             repeated.at("view") != plan.depthMetadata.at("view") || !SameFogDepthSource(plan))
             throw std::runtime_error("current Fog graph/camera/depth changed during preparation");
         auto output = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_FLOAT, desc.Width, desc.Height, 1, 1);
+        if (!FSRD::CyberpunkFogDepthCopy::AdmitDestination(output, dimensions[0], dimensions[1]))
+            throw std::runtime_error("private native Fog depth destination descriptor refused");
         const auto sourceBytes = plan.device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
         const auto outputBytes = plan.device->GetResourceAllocationInfo(0, 1, &output).SizeInBytes;
         if (!sourceBytes || !outputBytes || sourceBytes > MaxCaptureTextureBytes || outputBytes > MaxCaptureTextureBytes ||
@@ -3871,8 +3877,9 @@ std::shared_ptr<CapturePlan> PrepareCapture(ID3D12GraphicsCommandList* list, UIN
             std::lock_guard lock(data.mutex);
             source = data.lightingCaptureSource;
         }
-        if (source.is_null() && GetTickCount64() - lightingRequestedAt.load() < 10000)
-            return {}; // Wait for recording receipt, never wait for GPU completion here.
+        // Independent CPU recording can reach this frame's Fog draw before
+        // lighting publishes its receipt. Never skip that draw waiting for
+        // candidate metadata; completed captures must be paired independently.
         if (!source.is_null())
         {
             source["pairing_authority"] = "candidate metadata only; current frame/camera match not asserted";
